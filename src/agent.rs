@@ -1141,17 +1141,30 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
     let prefix = agent.inject_prefix.as_bytes();
     let submit = agent.submit_key.as_bytes();
 
+    // S54 fix: strip ANSI sequences before injection to avoid ESC conflict in typed_inject.
+    // The [AGEND-MSG] header contains colors that start with \x1b[, which some
+    // backends (Kiro) or shells interpret as a literal ESC key when typed
+    // slowly, canceling the current input line.
+    let text_str = String::from_utf8_lossy(text);
+    let stripped = strip_ansi(&text_str);
+    let text_bytes = stripped.as_bytes();
+
     if agent.typed_inject {
         // H1: collect all bytes first, then write in short lock bursts.
         // Previous pattern held pty_writer lock for 2ms × N bytes (~20s for 10KB).
-        let all_bytes: Vec<u8> = prefix.iter().chain(text.iter()).copied().collect();
+        let all_bytes: Vec<u8> = prefix.iter().chain(text_bytes.iter()).copied().collect();
         for chunk in all_bytes.chunks(64) {
             let mut w = agent.pty_writer.lock();
-            for &byte in chunk {
-                w.write_all(&[byte])?;
-                w.flush()?;
-            }
+            // Sprint 54 F1: write chunk-at-a-time and flush once. Prevents
+            // the "ESC interpreted as keypress" race by keeping ANSI-free
+            // sequences contiguous.
+            w.write_all(chunk)?;
+            w.flush()?;
             drop(w);
+            // Inter-chunk pacing: 2ms per byte (=128ms for a full 64-byte chunk).
+            // This is byte-rate-limited backpressure, not a fixed inter-chunk
+            // delay — keeps lock-burst duration proportional to payload size so
+            // small messages still feel responsive.
             std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
         }
     } else {
@@ -1160,13 +1173,16 @@ pub fn inject_to_agent(agent: &AgentHandle, text: &[u8]) -> crate::error::Result
             w.write_all(prefix)?;
             w.flush()?;
         }
-        w.write_all(text)?;
+        w.write_all(text_bytes)?;
         w.flush()?;
         drop(w);
     }
 
-    // Delay before submit
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Pre-submit delay (separate from the per-chunk pacing above). 50ms gives
+    // the TUI framework time to flush the input buffer before Enter arrives,
+    // avoiding races where the submit keystroke is consumed by the prior
+    // typed-inject paint cycle.
+    std::thread::sleep(std::time::Duration::from_millis(50));
 
     // Write submit key
     let mut w = agent.pty_writer.lock();
@@ -1262,6 +1278,37 @@ mod tests {
         assert_eq!(strip_ansi("hello"), "hello");
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
         assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
+    }
+
+    /// Regression: ESC byte (0x1B) must not survive `strip_ansi` for any of the
+    /// payload shapes `inject_to_agent` is realistically asked to deliver.
+    /// `inject_to_agent` strips `text` through `strip_ansi` before writing to
+    /// the PTY in `typed_inject` mode; if ESC bytes leak through, slow byte-by-
+    /// byte rendering can cause Ink-style TUIs (kiro-cli) to interpret the
+    /// stray ESC as the "cancel current input" keypress.
+    ///
+    /// This test pins that contract at the strip boundary so a future refactor
+    /// of `strip_ansi` (or a new colorized injector path) that lets ESC slip
+    /// through trips here, regardless of whether the subsequent chunked write
+    /// path is exercised by other tests.
+    #[test]
+    fn inject_strips_ansi_from_typed_payload() {
+        // Realistic [AGEND-MSG] header with foreground/reset color codes —
+        // matches the shape that triggered the original Sprint 54 regression.
+        let agend_header = "\x1b[1;36m[AGEND-MSG]\x1b[0m from=lead kind=task\n";
+        let stripped = strip_ansi(agend_header);
+        assert!(
+            !stripped.as_bytes().contains(&0x1B),
+            "ESC byte must not survive strip_ansi for typed inject; got {stripped:?}"
+        );
+        // Cursor-movement and OSC sequences also appear in some [AGEND-MSG]
+        // emitters; exercise both to make sure no escape category leaks.
+        let mixed = "\x1b[2K\r\x1b]0;title\x07message body \x1b[31mred\x1b[0m";
+        let stripped_mixed = strip_ansi(mixed);
+        assert!(
+            !stripped_mixed.as_bytes().contains(&0x1B),
+            "ESC byte must not survive strip_ansi for mixed CSI+OSC payload; got {stripped_mixed:?}"
+        );
     }
 
     #[test]
