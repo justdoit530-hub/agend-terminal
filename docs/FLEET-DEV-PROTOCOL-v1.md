@@ -39,6 +39,22 @@ Orchestrator posts scope decision + creates task.
 
 Every review report must include: `scope_source`, `audit_mode`, `reviewed_head`, `commands`, `files`
 
+### 3.3.1 CI Verification Gate (Sprint 61)
+Before approving merge, orchestrator/reviewer MUST independently verify CI:
+
+```
+gh pr checks <PR#>
+```
+
+**Hard rules:**
+- Exit code 0 (all checks pass) required before merge approval
+- Do NOT rely on dev's self-reported CI status or ci_watch notifications alone
+- Do NOT rely on partial check results (e.g., only LOC overrun passing)
+- If any check is `pending`, wait and re-check
+- If any check is `fail`, block merge and report to implementer
+
+**Rationale:** Sprint 61 incident — ci_watch emitted false [ci-pass] on partial completion, leading to merge of failing code.
+
 ### 3.4 Re-review (r2) Dispatch
 Must enumerate r1 findings with status: fixed / deferred / withdrawn. Missing → reviewer falls back to `full_review`.
 
@@ -80,7 +96,7 @@ Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 - (d) Removing defensive code → 4-perspective counter-example challenge; 0 compelling = safe to delete
 
 ### 3.12 Verdict Externalization (was §3.5.13)
-Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green + verdict mirror posted — all three required before merge.
+Fleet-internal verdict MUST mirror to GH PR comment (`gh pr comment`). Self-merge gate: dual VERIFIED + CI green (independently verified via `gh pr checks`) + verdict mirror posted — all three required before merge.
 
 ### 3.13 Log-level Changes (was §3.5.14)
 Must have inline rationale, otherwise `LEVEL-CHANGE-RATIONALE-ABSENT — UNVERIFIED`.
@@ -110,7 +126,7 @@ Instance names with routing semantics (`general`, `lead`, `dev`, `reviewer`) emi
 
 ## §5. Async Pipeline
 
-Impl pushes PR then immediately starts next task. Reviewer issues verdict then immediately takes next review. dev-lead maintains pending list; dual-VERIFIED + CI green → self-merge.
+Impl pushes PR then immediately starts next task. Reviewer issues verdict then immediately takes next review. dev-lead maintains pending list; dual-VERIFIED + CI green (independently verified via `gh pr checks`) → self-merge.
 
 **Key rules**:
 - Impl push must include scope statement (follows spec / deviated because)
@@ -148,7 +164,7 @@ Re-review cycles (r1, r2, …) repeat the same three milestones. The dispatcher 
 
 ## §7. CI
 
-Use `ci(action: watch)`, not manual polling. Clean up worktree + branch after merge.
+Use `ci(action: watch)` for ongoing monitoring, not manual polling. Exception: merge-gate final verification requires one-shot `gh pr checks <PR#>` per §3.3.1. Clean up worktree + branch after merge.
 
 **No manual orchestrator polling**. Orchestrators (lead, general,
 operator-in-the-loop) MUST NOT manually poll PR / CI state via
@@ -244,7 +260,8 @@ Daemon detects agent entering error state (UsageLimit/RateLimit/Hang/Crashed/Aut
 | Record decisions | `decision(action: post)` | Markdown files |
 | Assign work | `send(kind: task)` + `task(action: create)` | only one |
 | Report results | `send(kind: report)` | free-text |
-| CI | `ci(action: watch)` | `gh pr checks` |
+| CI monitoring | `ci(action: watch)` | manual `gh run list` loops |
+| CI merge gate | `gh pr checks <PR#>` | trusting dev self-report |
 | Wait state | `set_waiting_on` | prose |
 | Health check | `describe_instance` | guessing |
 | Schedule | `schedule(action: create)` | backend-specific tools |
