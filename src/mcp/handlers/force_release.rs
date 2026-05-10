@@ -162,7 +162,7 @@ pub(super) fn rebase_clean_self(
         }
     }
 
-    let binding_outcome = crate::worktree_pool::release_full(home, agent, false);
+    let binding_outcome = crate::worktree_pool::release_full(home, agent);
     Ok(RebaseCleanOutcome {
         dir_existed,
         dir_removed,
