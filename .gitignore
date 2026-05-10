@@ -26,3 +26,4 @@ statusline.json
 statusline.sh
 mcp-config.json
 *.json.lock
+.agend-managed
