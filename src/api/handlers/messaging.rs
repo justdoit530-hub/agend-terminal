@@ -265,6 +265,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use parking_lot::Mutex;
@@ -365,6 +366,13 @@ mod tests {
             shutdown: None,
         };
         crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        // Override backend_command to "codex" for ACK absorption check
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let configs: &'static crate::api::ConfigRegistry =
@@ -767,6 +775,160 @@ mod tests {
             logs_contain("task.branch checkout failed"),
             "B2 observability invariant: warn must fire on checkout failure"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── Issue #643: cross-team ACK absorption tests ─────────────────
+
+    #[test]
+    fn same_team_codex_update_absorbed() {
+        let home = tmp_home("codex-absorbed");
+        setup_team_env(
+            &home,
+            &["codex-agent", "sender"],
+            &[("dev", &["codex-agent", "sender"])],
+        );
+        // Override codex-agent backend to codex in fleet.yaml
+        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).unwrap();
+        let yaml = yaml.replace(
+            "  codex-agent:\n    backend: claude",
+            "  codex-agent:\n    backend: codex",
+        );
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "codex-agent",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        // Override backend_command to "codex" for ACK absorption check
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        let result = handle_send(
+            &json!({"from": "sender", "target": "codex-agent", "text": "status update", "kind": "update"}),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "same-team Codex update must be absorbed: {result}"
+        );
+        // Audit log must record absorption
+        assert!(
+            audit_log_contains(&home, "ack_absorbed"),
+            "ack_absorbed event must be logged"
+        );
+        let reg = agent::lock_registry(registry);
+        if let Some(h) = reg.get("codex-agent") {
+            let _ = h.child.lock().kill();
+        }
+        drop(reg);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cross_team_message_not_absorbed() {
+        let home = tmp_home("cross-team-no-absorb");
+        setup_team_env(
+            &home,
+            &["codex-agent", "general"],
+            &[("team-a", &["general"]), ("team-b", &["codex-agent"])],
+        );
+        let yaml = std::fs::read_to_string(home.join("fleet.yaml")).unwrap();
+        let yaml = yaml.replace(
+            "  codex-agent:\n    backend: claude",
+            "  codex-agent:\n    backend: codex",
+        );
+        std::fs::write(home.join("fleet.yaml"), yaml).ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "codex-agent",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        // Override backend_command to "codex" for ACK absorption check
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-agent") {
+                h.backend_command = "codex".to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        // general can send cross-team; codex update should still inject (not absorbed)
+        let result = handle_send(
+            &json!({"from": "general", "target": "codex-agent", "text": "cross-team update", "kind": "update"}),
+            &ctx,
+        );
+        assert_eq!(
+            result["ok"], true,
+            "cross-team via general must succeed: {result}"
+        );
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "cross-team message must NOT be absorbed: {result}"
+        );
+        let reg = agent::lock_registry(registry);
+        if let Some(h) = reg.get("codex-agent") {
+            let _ = h.child.lock().kill();
+        }
+        drop(reg);
         std::fs::remove_dir_all(&home).ok();
     }
 }
