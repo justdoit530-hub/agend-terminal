@@ -1010,7 +1010,7 @@ pub fn format_notification_for_inject(
             attachment_body_placeholder(attachments)
         } else if text.chars().count() > 200 {
             let truncated: String = text.chars().take(200).collect();
-            format!("{truncated}... (run: agend-terminal agent inbox)")
+            format!("{truncated}... (use the inbox MCP tool to read full message)")
         } else {
             text.to_string()
         };
@@ -2608,6 +2608,24 @@ mod tests {
         assert!(
             !out.contains('…'),
             "200-char input must not get ellipsis: {out}"
+        );
+    }
+
+    // Issue #672: inline-notification truncation hint must point at the
+    // `inbox` MCP tool, not at the (non-existent) `agend-terminal agent
+    // inbox` CLI subcommand. The CLI subcommand was never implemented;
+    // a user following the old hint hits `unrecognized subcommand`.
+    #[test]
+    fn test_inline_long_text_hint_points_at_mcp_tool_not_cli() {
+        let long: String = "x".repeat(250);
+        let out = format_notification_for_inject(false, &NotifySource::Agent("peer"), &long, &[]);
+        assert!(
+            out.contains("inbox MCP tool"),
+            "hint must direct caller to the MCP tool: {out}"
+        );
+        assert!(
+            !out.contains("agend-terminal agent"),
+            "hint must not reference the non-existent `agent` CLI subcommand: {out}"
         );
     }
 
