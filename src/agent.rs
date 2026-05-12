@@ -37,6 +37,8 @@ pub struct AgentHandle {
     pub submit_key: String,
     pub inject_prefix: String,
     pub typed_inject: bool,
+    pub spawned_at: std::time::Instant,
+    pub spawned_at_epoch_ms: u64,
 }
 
 pub type AgentRegistry = Arc<Mutex<HashMap<String, AgentHandle>>>;
@@ -529,6 +531,11 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                     .as_ref()
                     .map(|b| b.preset().typed_inject)
                     .unwrap_or(false),
+                spawned_at: std::time::Instant::now(),
+                spawned_at_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
             },
         );
     }
@@ -908,6 +915,43 @@ fn handle_pty_close(
     sweep_child_tree(name, registry);
 
     if is_user_clean_exit {
+        // Startup grace period: if the process exited within 5s of spawn
+        // AND no user input was received, treat as startup failure.
+        // If user sent input (e.g. /exit), it's a legitimate quick exit.
+        let uptime = {
+            let reg = registry.lock();
+            reg.get(name)
+                .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
+        };
+        let had_user_input_since_spawn = {
+            let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
+            uptime
+                .map(|(_, epoch_ms)| pair.last_input_at_ms >= epoch_ms)
+                .unwrap_or(false)
+        };
+        if let Some((uptime, _)) = uptime {
+            if uptime < std::time::Duration::from_secs(5) && !had_user_input_since_spawn {
+                tracing::warn!(
+                    agent = name,
+                    uptime_ms = uptime.as_millis() as u64,
+                    "startup failure (exited too quickly, no user input), skipping shell fallback"
+                );
+                if let Some(ref home) = home {
+                    crate::event_log::log(
+                        home,
+                        "startup_failure",
+                        name,
+                        &format!("exited in {}ms, no user input", uptime.as_millis()),
+                    );
+                }
+                // Mark as crashed so daemon can notify operator.
+                if let Some(ref tx) = crash_tx {
+                    let _ = tx.send(AgentExitEvent::Crash(name.to_string()));
+                }
+                return;
+            }
+        }
+
         // User-initiated clean exit (code 0 or 130): /exit, /quit, Ctrl+C.
         // Do NOT respawn the agent — spawn a shell replacement instead
         // (tmux-style: pane stays alive with a shell prompt).
@@ -1922,6 +1966,8 @@ Allow Trust All Tools mode?
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
             typed_inject: false,
+            spawned_at: std::time::Instant::now(),
+            spawned_at_epoch_ms: 0,
         };
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         registry.lock().insert("sweep-test".to_string(), handle);
@@ -2090,6 +2136,33 @@ Allow Trust All Tools mode?
         assert!(
             stripped_from.starts_with("[from:"),
             "stripped should start with [from:, got: {stripped_from}"
+        );
+    }
+
+    /// Startup grace period: agent that exits within 5s should NOT get shell fallback.
+    /// Startup failure: exit within 5s + no user input since spawn → no shell fallback.
+    #[test]
+    fn startup_failure_no_input_no_shell_fallback() {
+        // spawned_at_epoch_ms = 1000, last_input_at_ms = 500 → input before spawn
+        let spawned_at_epoch_ms: u64 = 1000;
+        let last_input_at_ms: u64 = 500;
+        let had_user_input_since_spawn = last_input_at_ms >= spawned_at_epoch_ms;
+        assert!(
+            !had_user_input_since_spawn,
+            "input before spawn should not count as user input"
+        );
+    }
+
+    /// Quick user exit: input AFTER spawn → normal clean exit, not startup failure.
+    #[test]
+    fn quick_user_exit_still_clean() {
+        // spawned_at_epoch_ms = 1000, last_input_at_ms = 1500 → input after spawn
+        let spawned_at_epoch_ms: u64 = 1000;
+        let last_input_at_ms: u64 = 1500;
+        let had_user_input_since_spawn = last_input_at_ms >= spawned_at_epoch_ms;
+        assert!(
+            had_user_input_since_spawn,
+            "input after spawn should count as user input → not startup failure"
         );
     }
 }
