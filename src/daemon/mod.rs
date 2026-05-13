@@ -529,10 +529,16 @@ fn run_core(
     // across ticks. Called at their pre-extraction sites in the main
     // loop below.
     use per_tick::PerTickHandler as _;
+    // Watchdog dry-run mode: log classifications without mutating health
+    // state. Read ONCE at daemon startup (matches pre-extraction
+    // semantics; env changes mid-runtime are not observed).
+    let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
     let snapshot_handler = per_tick::SnapshotRotationHandler::new();
     let poll_reminder_handler = per_tick::PollReminderHandler::new(30);
     let inbox_maintenance_handler = per_tick::InboxMaintenanceHandler::new(60);
     let external_liveness_handler = per_tick::ExternalLivenessHandler::new();
+    let hang_detection_handler = per_tick::HangDetectionHandler::new();
+    let watchdog_handler = per_tick::WatchdogHandler::new(watchdog_dry_run);
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -552,9 +558,6 @@ fn run_core(
             .ok();
         rx
     };
-
-    // Watchdog dry-run mode: log classifications without mutating health state.
-    let watchdog_dry_run = watchdog::watchdog_dry_run_from_env();
 
     // Main loop: event-driven via select on crash channel + periodic tick
     loop {
@@ -593,61 +596,11 @@ fn run_core(
         // (spawned earlier) so app mode gets the same behavior as daemon mode.
         // Hang detection and health decay stay here — they're daemon-only
         // concerns (hang notifications tie into crash respawn accounting).
-        {
-            let reg = agent::lock_registry(&registry);
-            for (name, handle) in reg.iter() {
-                {
-                    let mut core = handle.core.lock();
-                    core.health.maybe_decay();
-                    let agent_state = core.state.current;
-                    let silent = core.state.last_output.elapsed();
-                    // Sprint 24 P1: snapshot heartbeat_pair UNDER the
-                    // core lock (Level 1 → Level 3 top-down per Rule 1
-                    // in docs/DAEMON-LOCK-ORDERING.md). Pair lock is
-                    // acquired+released synchronously by `snapshot_for`
-                    // so it's not held during subsequent `check_hang`
-                    // execution (Rule 3 leaf-level).
-                    let pair = crate::daemon::heartbeat_pair::snapshot_for(name);
-                    if core.health.check_hang(
-                        agent_state,
-                        silent,
-                        pair.last_input_at_ms,
-                        pair.heartbeat_at_ms,
-                    ) {
-                        tracing::warn!(
-                            agent = %name,
-                            state = agent_state.display_name(),
-                            silent = ?silent,
-                            "hang detected"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Watchdog: classify PTY output → BlockedReason
-        {
-            let reg = agent::lock_registry(&registry);
-            for (name, handle) in reg.iter() {
-                let backend = match crate::backend::Backend::from_command(&handle.backend_command) {
-                    Some(b) => b,
-                    None => continue,
-                };
-                {
-                    let mut core = handle.core.lock();
-                    let rows = core.vterm.rows() as usize;
-                    let screen = core.vterm.tail_lines(rows);
-                    watchdog::run_watchdog_pass(
-                        home,
-                        name,
-                        &backend,
-                        &screen,
-                        &mut core.health,
-                        watchdog_dry_run,
-                    );
-                }
-            }
-        }
+        // #694 BLOCK 1 cohort — extracted into daemon::per_tick. Hang and
+        // Watchdog are adjacent so the same-tick `core.health` read-after-
+        // write sequence stays visibly contiguous in the select! lambda.
+        hang_detection_handler.run(&tick_ctx);
+        watchdog_handler.run(&tick_ctx);
 
         // Liveness check for external agents.
         // #694 BLOCK 1 — extracted into daemon::per_tick::ExternalLivenessHandler.
