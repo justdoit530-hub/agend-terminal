@@ -109,8 +109,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 arboard = "3.6.1"
 unicode-width = "0.2"
 which = "8"
-sysinfo = "0.32"
-
+sysinfo = "0.39"
 # Crypto-grade random for API-connection cookie (P1-10)
 getrandom = "0.3"
 iana-time-zone = "0.1.65"
