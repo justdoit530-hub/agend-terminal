@@ -56,7 +56,7 @@ pub fn collect(home: &std::path::Path, registry: &crate::agent::AgentRegistry) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
     let mut sys = System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+        RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
     );
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
