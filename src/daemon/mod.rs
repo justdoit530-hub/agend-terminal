@@ -26,8 +26,6 @@ pub(crate) mod watchdog;
 
 use crate::agent::{self, AgentRegistry};
 use crate::channel::NotifySeverity;
-use ci_watch::check_ci_watches;
-use cron_tick::check_schedules;
 pub use tui_bridge::serve_agent_tui;
 
 use parking_lot::Mutex;
@@ -539,6 +537,8 @@ fn run_core(
     let external_liveness_handler = per_tick::ExternalLivenessHandler::new();
     let hang_detection_handler = per_tick::HangDetectionHandler::new();
     let watchdog_handler = per_tick::WatchdogHandler::new(watchdog_dry_run);
+    let check_schedules_handler = per_tick::CheckSchedulesHandler::new();
+    let ci_watch_poll_handler = per_tick::CiWatchPollHandler::new();
 
     // Periodic tick channel (every 10s for health/schedule/session maintenance)
     let tick_rx = {
@@ -610,8 +610,10 @@ fn run_core(
         // #694 BLOCK 1 — extracted into daemon::per_tick::SnapshotRotationHandler.
         snapshot_handler.run(&tick_ctx);
 
-        check_schedules(home, &registry);
-        check_ci_watches(home, &registry);
+        // #694 BLOCK 1 — extracted into daemon::per_tick::CheckSchedulesHandler.
+        check_schedules_handler.run(&tick_ctx);
+        // #694 BLOCK 1 — extracted into daemon::per_tick::CiWatchPollHandler.
+        ci_watch_poll_handler.run(&tick_ctx);
 
         // Periodic inbox maintenance — every 60 ticks (≈10 min at 10s/tick).
         // #694 BLOCK 1 — extracted into daemon::per_tick::InboxMaintenanceHandler.
