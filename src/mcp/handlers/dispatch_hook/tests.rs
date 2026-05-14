@@ -25,6 +25,44 @@ fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
         .env("AGEND_GIT_BYPASS", "1")
         .output()
         .ok();
+    // #781 Phase 3 r1 (Path A — strict mode): pre-#781 fixtures relied
+    // on `worktree::create -b` for missing-branch creation. With #781's
+    // strict `ensure_branch_exists`, dispatch_auto_bind_lease creates
+    // the branch from `origin/main` BEFORE lease. Legacy local-only
+    // fixtures must register an origin URL + populate
+    // `refs/remotes/origin/main` so the fast path resolves without
+    // network I/O. `file:///dev/null/agend-fixture` chosen so
+    // `parse_github_owner_repo` returns None — preserves the pre-#781
+    // assertion in `delegate_task_without_repo_no_ci_watch` that no
+    // ci-watch fires when repo is undeterminable. Tests that need
+    // github-style ci-watch arming (e.g. `…_preserves_p0b_tail_ops`)
+    // use a separate fixture with `https://github.com/...` URL.
+    let _ = std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "file:///dev/null/agend-fixture-no-derive",
+        ])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output();
+    let main_sha = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !main_sha.is_empty() {
+        let _ = std::process::Command::new("git")
+            .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output();
+    }
     // Write fleet.yaml so resolve_instance works.
     std::fs::write(
         crate::fleet::fleet_yaml_path(home),
@@ -69,7 +107,10 @@ fn main_branch_rejects_dispatch() {
     let result = super::dispatch_auto_bind_lease(&home, "test-agent", "T-1", "main", None);
     assert!(result.is_err(), "main branch must REJECT");
     let err = result.expect_err("must be error");
-    assert!(err.contains("E4.5"), "error must mention E4.5: {err}");
+    assert!(
+        err.message.contains("E4.5"),
+        "error must mention E4.5: {err:?}"
+    );
 
     // No binding should exist.
     let binding_path = crate::paths::runtime_dir(&home)
@@ -110,8 +151,8 @@ fn lease_conflict_rejects_dispatch() {
     );
     let err = r2.expect_err("must err");
     assert!(
-        err.contains("already leased by 'agent-a'"),
-        "error must name leasing agent: {err}"
+        err.message.contains("already leased by 'agent-a'"),
+        "error must name leasing agent: {err:?}"
     );
 
     // Agent-b binding must NOT exist (Q2: REJECT = no side effects).
@@ -677,8 +718,8 @@ fn dispatch_auto_bind_lease_rejects_same_agent_different_branch_post_wave_4() {
     // across the architectural shift.
     let err = r2.unwrap_err();
     assert!(
-        err.contains("agent-y") && err.contains("feat/A"),
-        "rejection error must mention the existing binding's agent + branch: {err}"
+        err.message.contains("agent-y") && err.message.contains("feat/A"),
+        "rejection error must mention the existing binding's agent + branch: {err:?}"
     );
 
     // Binding still reflects feat/A — the rejected dispatch must
@@ -774,4 +815,534 @@ fn release_worktree_then_rebind_different_branch_succeeds_post_wave_4() {
     );
 
     std::fs::remove_dir_all(&home).ok();
+}
+
+// ----------------------------------------------------------------------
+// #781 dispatch_auto_bind_lease structural tests. Pins Piece 2 (Bug B,
+// worktree::create exit-code-128 gate too strict) + Piece 6 (source_repo
+// tier observability) + Piece 7 (structured DispatchOutcome).
+//
+// Source of truth: decision d-20260514124732379010-0 (amended) +
+// d-20260514130311646510-1 (Piece 1 micro-amend).
+//
+// Empirical anchor (§3.10 red→green): comment out the Bug B fix in
+// worktree.rs:228-230 OR revert the SourceRepoTier wiring in C4 →
+// `dispatch_auto_bind_lease_with_pre_existing_branch_in_team_source_repo_succeeds_via_fallback`
+// fails (at C3 HEAD both regressions still active: lease fails with exit
+// 255 unmatched + source_repo_tier placeholder mismatches TeamSourceRepo).
+//
+// Cross-platform: all happy-path tests `#[cfg(unix)]` per §3.7 — Windows
+// runner git-subprocess concurrency observed unstable, see #780/#778
+// fixture history. Backlog D tracks Windows CI smoke test.
+// ----------------------------------------------------------------------
+
+/// Fixture: canonical repo + fleet.yaml team source_repo + simulated
+/// `refs/remotes/origin/main`. Branch parameter pre-created on canonical
+/// so `worktree::create`'s `-b` path hits the duplicate-branch fallback
+/// (this is the Bug B trigger).
+#[cfg(unix)]
+fn p781_canonical_with_team_source_repo(
+    parent: &std::path::Path,
+    branch: &str,
+    pre_create_branch: bool,
+    team: &str,
+    members: &[&str],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let home = parent.join(format!(
+        "home-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    let canonical = parent.join(format!(
+        "canonical-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&canonical).ok();
+    let bypass = ("AGEND_GIT_BYPASS", "1");
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&canonical)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(&canonical)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    // Register origin remote with a github-style URL so
+    // `derive_repo_from_remote` resolves to `owner/repo` for the
+    // ci_watches arming downstream — mirrors production canonicals.
+    std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/owner/repo.git",
+        ])
+        .current_dir(&canonical)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    // Simulate fetched origin/main so #781 ensure_branch_exists fast path
+    // (zero network on `git branch X origin/main` where origin/main is
+    // already a valid local ref) fires without needing real network I/O.
+    let main_sha = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(&canonical)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", &main_sha])
+        .current_dir(&canonical)
+        .env(bypass.0, bypass.1)
+        .output()
+        .unwrap();
+    if pre_create_branch {
+        std::process::Command::new("git")
+            .args(["branch", branch, "main"])
+            .current_dir(&canonical)
+            .env(bypass.0, bypass.1)
+            .output()
+            .unwrap();
+    }
+    let members_yaml = members
+        .iter()
+        .map(|m| format!("      - {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let yaml = format!(
+        "instances: {{}}\nteams:\n  {team}:\n    members:\n{members_yaml}\n    source_repo: {}\n",
+        canonical.display()
+    );
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    (home, canonical)
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_with_pre_existing_branch_in_team_source_repo_succeeds_via_fallback() {
+    // ANCHOR (§3.10 red→green). Pre-C4 HEAD this FAILs on:
+    //   (a) `worktree::create` -b path returns exit 255 with stderr
+    //       "already exists"; current exit-code-128 gate misses
+    //       fallback → lease returns Err → dispatch surfaces
+    //       Err(DispatchError { stage: WorktreeLeaseConflict }).
+    //   (b) Even if lease succeeded, C2's placeholder
+    //       `SourceRepoTier::Stub` mismatches the asserted
+    //       `TeamSourceRepo` until C4 wires `resolve_source_repo`.
+    // C4 fixes both: Bug B (stderr-substring fallback) + Piece 6
+    // (tier wiring) → test PASSes.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-anchor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/p781-anchor",
+        true, // pre-create branch on canonical → triggers Bug B fallback path
+        "val",
+        &["val-dev"],
+    );
+
+    let result = super::dispatch_auto_bind_lease(&home, "val-dev", "T-1", "feat/p781-anchor", None);
+
+    let outcome = result.expect("dispatch must succeed via stderr-substring fallback");
+    assert_eq!(
+        outcome.source_repo_tier,
+        super::SourceRepoTier::TeamSourceRepo,
+        "source_repo_tier must observe Tier 2.5 (team source_repo): {outcome:?}"
+    );
+
+    // Binding written with canonical source_repo (Tier 2.5 resolution
+    // actually wins downstream — no Tier 4 stub).
+    let binding = home.join("runtime").join("val-dev").join("binding.json");
+    assert!(binding.exists(), "binding.json must be written");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
+    let observed = std::path::PathBuf::from(v["source_repo"].as_str().unwrap());
+    assert_eq!(
+        observed.canonicalize().unwrap_or(observed.clone()),
+        canonical.canonicalize().unwrap_or(canonical.clone()),
+        "binding.source_repo must be canonical (Tier 2.5), not workspace stub"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_with_team_source_repo_missing_branch_auto_creates() {
+    // Test 2: branch missing on canonical → ensure_branch_exists's fast
+    // path (zero network on `git branch feat/X origin/main` where
+    // origin/main is already locally populated) creates the branch
+    // pre-lease. Observable via DispatchOutcome.auto_created_branch.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-auto-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/p781-auto",
+        false, // branch missing → auto-create path
+        "val",
+        &["val-dev"],
+    );
+    let result = super::dispatch_auto_bind_lease(&home, "val-dev", "T-1", "feat/p781-auto", None);
+    let outcome = result.expect("dispatch must succeed");
+    assert_eq!(
+        outcome.source_repo_tier,
+        super::SourceRepoTier::TeamSourceRepo
+    );
+    assert!(
+        outcome.auto_created_branch,
+        "branch missing pre-call must surface auto_created_branch=true: {outcome:?}"
+    );
+    assert!(
+        !outcome.fetch_attempted,
+        "origin/main pre-populated → no fetch fired: {outcome:?}"
+    );
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_existing_branch_ignores_from_ref() {
+    // Test 3: pre-existing branch short-circuits ensure_branch_exists
+    // — from_ref is not consulted, neither create nor fetch fire.
+    // Pins the back-compat path so callers that pre-create branches
+    // (gh PR checkout, manual setup) get auto_created_branch=false.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-exist-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/p781-exist",
+        true, // pre-create
+        "val",
+        &["val-dev"],
+    );
+    let result = super::dispatch_auto_bind_lease(&home, "val-dev", "T-1", "feat/p781-exist", None);
+    let outcome = result.expect("dispatch must succeed");
+    assert!(
+        !outcome.auto_created_branch,
+        "pre-existing branch must NOT report auto-created: {outcome:?}"
+    );
+    assert!(
+        !outcome.fetch_attempted,
+        "pre-existing branch short-circuits before any fetch: {outcome:?}"
+    );
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_invalid_from_ref_returns_structured_error() {
+    // Test 4: ensure_branch_exists's `validate_branch(from_ref)` gate
+    // rejects option-injection / charset-illegal `from_ref` values at
+    // the daemon API boundary. The hard-coded production `from_ref` is
+    // `origin/main` which always passes, so this test drives the
+    // helper directly with a malicious value to pin the structured-
+    // error surface.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-inv-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, canonical) =
+        p781_canonical_with_team_source_repo(&parent, "feat/p781-inv", false, "val", &["val-dev"]);
+    // Drive ensure_branch_exists directly with an option-injection
+    // attempt — `--upload-pack=...` fails `validate_branch`'s leading-`-`
+    // guard.
+    let err = super::ensure_branch_exists(
+        &home,
+        &canonical,
+        "feat/p781-inv",
+        "--upload-pack=/bin/sh",
+        "val-dev",
+    )
+    .expect_err("validate_from_ref must reject option-injection");
+    assert_eq!(err.code, super::ErrorCode::InvalidFromRef);
+    assert_eq!(err.stage, super::Stage::ValidateFromRef);
+    assert!(!err.fetch_attempted);
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_concurrent_different_targets_race_idempotent() {
+    // Test 5: two concurrent dispatches on the SAME source_repo + SAME
+    // branch + DIFFERENT targets (avoids per-target BindGuard rejection
+    // which fires for same-target collisions).
+    //
+    // Race semantics being pinned (#781 Phase 3 r1, reviewer constraint #2
+    // — distinguish `CreateBranch` stage from `WorktreeLeaseConflict`
+    // stage in race-loser error path):
+    //
+    // - At least one caller succeeds (Ok). The other either also succeeds
+    //   (if it observed the branch already existing AND grabbed a distinct
+    //   worktree path) or errors. Worktree path is segmented per agent
+    //   (`<home>/worktrees/<agent>/<branch>/`) so technically both could
+    //   reuse the same branch — but `worktree::create`'s existing-branch
+    //   guard rejects a second `worktree add <branch>` since git's
+    //   per-branch single-checkout invariant holds.
+    // - The loser, if it errored, MUST surface `Stage::WorktreeLeaseConflict`
+    //   (the failure landed at the worktree-add step, after the race-
+    //   absorbed `git branch` already-exists fall-through). It must NOT
+    //   surface `Stage::CreateBranch` (= `git branch` non-`already-exists`
+    //   failure) and must NOT carry `ErrorCode::BranchCreateFailed`.
+    // - At most one Ok observes `auto_created_branch=true`. Branch
+    //   creation race winner is determined by `git branch` ordering; the
+    //   loser's `git branch` hits `already exists` stderr → fall-through
+    //   with `auto_created_branch=false`. We don't require exactly-one-
+    //   true: when the branch-create winner subsequently LOSES the
+    //   worktree-add race, its `DispatchError` does not carry
+    //   `auto_created_branch` (omitted from error shape per Piece 7
+    //   schema), so the signal is observable only from the Ok variant.
+    //   `at_most_one` is the strict invariant; `exactly_one` would flake.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-race-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) = p781_canonical_with_team_source_repo(
+        &parent,
+        "feat/p781-race",
+        false,
+        "val",
+        &["val-dev-a", "val-dev-b"],
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for target in ["val-dev-a", "val-dev-b"] {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let home_c = home.clone();
+        let target = target.to_string();
+        // fire-and-forget: test-only race harness; JoinHandle stored in
+        // `handles` and explicitly joined below.
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            super::dispatch_auto_bind_lease(&home_c, &target, "T-1", "feat/p781-race", None)
+        }));
+    }
+    let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let ok_count = outcomes.iter().filter(|o| o.is_ok()).count();
+    assert!(
+        ok_count >= 1,
+        "at least one race winner must succeed (branch-create race must absorb the loser via stderr fall-through): {outcomes:?}"
+    );
+
+    // Stage / code differentiation in error path (reviewer constraint #2):
+    // race losers MUST land on WorktreeLeaseConflict, NEVER on CreateBranch.
+    for err in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+        assert_eq!(
+            err.stage,
+            super::Stage::WorktreeLeaseConflict,
+            "race loser must fail at WorktreeLeaseConflict stage (NOT CreateBranch — race must be absorbed at git-branch layer), got stage={:?}: {err:?}",
+            err.stage
+        );
+        assert_ne!(
+            err.code,
+            super::ErrorCode::BranchCreateFailed,
+            "race must NOT surface BranchCreateFailed — already-exists stderr is the fall-through signal: {err:?}"
+        );
+    }
+
+    // At most one Ok caller observes auto_created_branch=true. When the
+    // branch-create winner subsequently loses worktree-add, its
+    // DispatchError omits auto_created_branch (per Piece 7 shape).
+    let true_count = outcomes
+        .iter()
+        .filter(|r| matches!(r, Ok(o) if o.auto_created_branch))
+        .count();
+    assert!(
+        true_count <= 1,
+        "at most one Ok caller may report auto_created_branch=true: {outcomes:?}"
+    );
+
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_stress_50_iter_branch_create_no_flaky_parse() {
+    // Test 6: stress-loop 50 iterations of the missing-branch
+    // auto-create path. Catches flaky stderr-substring matching across
+    // git versions / locales (we rely on "already exists" / "is already
+    // checked out" / "not a valid object name" — if git rewords any
+    // the failure surfaces here, not in production). Each iter is a
+    // fresh home + canonical.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-stress-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    for i in 0..50 {
+        let sub = parent.join(format!("iter-{i}"));
+        std::fs::create_dir_all(&sub).ok();
+        let branch = format!("feat/p781-stress-{i}");
+        let (home, _canonical) =
+            p781_canonical_with_team_source_repo(&sub, &branch, false, "val", &["val-dev"]);
+        let r = super::dispatch_auto_bind_lease(&home, "val-dev", "T-1", &branch, None);
+        let outcome = r.expect("each iter must succeed");
+        assert!(
+            outcome.auto_created_branch,
+            "iter {i}: fresh branch must report auto_created_branch=true"
+        );
+        assert!(
+            !outcome.fetch_attempted,
+            "iter {i}: origin/main pre-populated → no fetch"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn dispatch_auto_bind_lease_auto_create_path_preserves_p0b_tail_ops() {
+    // Test 7: regression guard. Sprint 53 P0-1+P0-2 tail-ops (binding
+    // write + ci_watches arming via derive_repo_from_remote) must STILL
+    // fire when the auto-create path runs. Easy to regress if
+    // ensure_branch_exists short-circuits the post-lease block.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-tail-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (home, _canonical) =
+        p781_canonical_with_team_source_repo(&parent, "feat/p781-tail", false, "val", &["val-dev"]);
+    // Fixture's origin is `https://github.com/owner/repo.git` so
+    // `derive_repo_from_remote_pub` resolves owner/repo for ci_watches.
+    let r = super::dispatch_auto_bind_lease(&home, "val-dev", "T-77", "feat/p781-tail", None);
+    let outcome = r.expect("dispatch must succeed");
+    assert!(outcome.auto_created_branch);
+
+    // binding.json present + branch + task_id
+    let binding = home.join("runtime").join("val-dev").join("binding.json");
+    assert!(binding.exists());
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding).unwrap()).unwrap();
+    assert_eq!(v["branch"], "feat/p781-tail");
+    assert_eq!(v["task_id"], "T-77");
+
+    // ci_watches armed via owner/repo derivation
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/p781-tail"),
+    );
+    assert!(
+        watch_path.exists(),
+        "ci_watches must be armed post-auto-create — derive_repo_from_remote produced owner/repo"
+    );
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+fn teams_json_migration_preserves_existing_fleet_yaml_source_repo() {
+    // Test 9 (invariant guard, Piece 1): the migration must NOT
+    // overwrite an existing fleet.yaml team entry — if operator hand-
+    // edited a team into fleet.yaml with source_repo set, and
+    // teams.json contains an entry with the same name (legacy holdover),
+    // the migration short-circuit (`add_team_to_yaml` returns Ok(false)
+    // on duplicate) must preserve the fleet.yaml source_repo.
+    let parent = std::env::temp_dir().join(format!(
+        "agend-p781-mig-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&parent).ok();
+
+    // Pre-existing fleet.yaml with team `val` + source_repo set.
+    let canonical = std::path::PathBuf::from("/tmp/p781-fake-canonical");
+    let yaml = format!(
+        "teams:\n  val:\n    members:\n      - val-dev\n    source_repo: {}\n",
+        canonical.display()
+    );
+    std::fs::write(crate::fleet::fleet_yaml_path(&parent), yaml).unwrap();
+
+    // Legacy teams.json with same team name, no source_repo field.
+    let teams_json = parent.join("teams.json");
+    std::fs::write(
+        &teams_json,
+        serde_json::to_string(&serde_json::json!({
+            "teams": [{
+                "name": "val",
+                "members": ["val-dev"],
+                "orchestrator": "val-dev",
+                "description": null,
+                "created_at": "2026-01-01T00:00:00Z"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    crate::fleet::migrate_teams_json_to_yaml(&parent).expect("migration");
+
+    // Verify fleet.yaml's source_repo survived.
+    let post: crate::fleet::FleetConfig =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&parent)).unwrap();
+    let team = post.teams.get("val").expect("team val present");
+    assert_eq!(
+        team.source_repo.as_ref().map(|p| p.display().to_string()),
+        Some(canonical.display().to_string()),
+        "fleet.yaml-side source_repo must survive teams.json migration"
+    );
+
+    // teams.json renamed → .migrated
+    assert!(parent.join("teams.json.migrated").exists());
+    assert!(!teams_json.exists());
+
+    std::fs::remove_dir_all(&parent).ok();
 }
