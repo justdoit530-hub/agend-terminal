@@ -648,14 +648,32 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "list" => {
             let filter_assignee = args["filter_assignee"].as_str();
             let filter_status = args["filter_status"].as_str();
+            // #806: default trim to actionable statuses unless caller
+            // opts in to history. `filtered_default=true` on the
+            // response signals callers (audit / forensics) that the
+            // trim fired so they can re-call with include_history=true.
+            let include_history = args["include_history"].as_bool().unwrap_or(false);
+            let limit = args["limit"].as_u64();
+            let filtered_default = !include_history && filter_status.is_none();
+            const ACTIONABLE: &[&str] = &["open", "claimed", "in_progress", "blocked"];
             let now = chrono::Utc::now();
             let done_ttl = chrono::Duration::days(14);
             let tasks = list_all(home);
-            let filtered: Vec<_> = tasks
+            let mut filtered: Vec<Task> = tasks
                 .iter()
                 .filter(|t| filter_assignee.is_none_or(|a| t.assignee.as_deref() == Some(a)))
                 .filter(|t| filter_status.is_none_or(|s| t.status == s))
+                // #806 default-actionable-only filter — only fires
+                // when neither include_history nor filter_status is
+                // set. Preserves zero impact on filter_status callers.
                 .filter(|t| {
+                    include_history
+                        || filter_status.is_some()
+                        || ACTIONABLE.contains(&t.status.as_str())
+                })
+                .filter(|t| {
+                    // 14d done-ttl preserved for include_history=true
+                    // path (default trim already drops done entries).
                     if filter_status.is_some() || t.status != "done" {
                         return true;
                     }
@@ -665,8 +683,17 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
                         })
                         .unwrap_or(true)
                 })
+                .cloned()
                 .collect();
-            serde_json::json!({"tasks": filtered})
+            // #806 `limit`: newest-first cap by `updated_at` desc.
+            if let Some(n) = limit {
+                filtered.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                filtered.truncate(n as usize);
+            }
+            serde_json::json!({
+                "tasks": filtered,
+                "filtered_default": filtered_default,
+            })
         }
         "claim" => {
             let id = match args["id"].as_str() {
@@ -1022,7 +1049,372 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             }
             serde_json::json!({"id": id, "status": "updated"})
         }
+        "sweep" => {
+            // #806 manual board-hygiene sweep — distinct from the
+            // daemon-ticked `task_sweep` (which auto-Dones tasks via
+            // `Closes t-XXX-N` PR markers). This action is operator-
+            // triggered, scans for 4 stale categories, returns a
+            // dry-run plan, then applies on a confirm round-trip.
+            let apply = args["apply"].as_bool().unwrap_or(false);
+            let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let audit_reason = args["audit_reason"].as_str().unwrap_or("");
+            // Repo resolution: explicit arg → SweepConfig fallback →
+            // None (shipped/superseded categories skipped without repo).
+            let repo_owned: Option<String> = args["repo"]
+                .as_str()
+                .map(String::from)
+                .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
+            let live_instances: std::collections::HashSet<String> = crate::api::call(
+                home,
+                &serde_json::json!({"method": crate::api::method::LIST}),
+            )
+            .ok()
+            .and_then(|r| {
+                r["result"]["agents"].as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a["name"].as_str().map(String::from))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+            let now = chrono::Utc::now();
+            let pr_lookup: sweep_impl::PrLookup = &sweep_impl::gh_pr_lookup;
+            let categories = sweep_impl::scan_categories(
+                home,
+                &live_instances,
+                pr_lookup,
+                repo_owned.as_deref(),
+                now,
+            );
+            if !apply {
+                return serde_json::json!({
+                    "dry_run": true,
+                    "categories": categories.as_json(),
+                    "candidate_ids": categories.all_ids(),
+                    "total_candidates": categories.total(),
+                    "to_apply_hint": "task action=sweep apply=true confirm_ids=<subset> audit_reason=<...>",
+                });
+            }
+            // Apply path — validate inputs + emit Cancelled batch.
+            if confirm_ids.is_empty() {
+                return serde_json::json!({
+                    "error": "apply=true requires non-empty 'confirm_ids' (subset of candidate_ids from a prior dry-run)"
+                });
+            }
+            if audit_reason.is_empty() {
+                return serde_json::json!({
+                    "error": "apply=true requires non-empty 'audit_reason' for the cross-board event log entry"
+                });
+            }
+            let candidate_set: std::collections::HashSet<String> =
+                categories.all_ids().into_iter().collect();
+            let unknown: Vec<String> = confirm_ids.difference(&candidate_set).cloned().collect();
+            if !unknown.is_empty() {
+                return serde_json::json!({
+                    "error": "confirm_ids contained entries not in current sweep candidates",
+                    "unknown": unknown,
+                    "hint": "re-run dry-run; candidates may have changed since last scan",
+                });
+            }
+            let applied =
+                sweep_impl::emit_cancelled_batch(home, &categories, &confirm_ids, audit_reason);
+            match applied {
+                Ok(count) => serde_json::json!({
+                    "applied": count,
+                    "audit_reason": audit_reason,
+                }),
+                Err(e) => serde_json::json!({"error": format!("sweep apply failed: {e}")}),
+            }
+        }
         _ => serde_json::json!({"error": format!("unknown action: {action}")}),
+    }
+}
+
+/// #806 manual board-hygiene sweeper. Operator-triggered, scans the
+/// task board for 4 categories of stale entries (shipped, superseded,
+/// team_disbanded, validation_leftovers), and returns a dry-run plan
+/// the operator confirms via a second call with `apply=true +
+/// confirm_ids`. Distinct from the daemon-ticked `task_sweep` which
+/// only handles `Closes t-XXX-N` PR-marker auto-Done.
+///
+/// `PrLookup` is injected as a function pointer so tests can swap
+/// `gh_pr_lookup` (production shellout) for a deterministic stub.
+mod sweep_impl {
+    use super::list_all;
+    use chrono::{DateTime, Duration, Utc};
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+
+    /// State of a PR referenced by a task title/description.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(super) enum PrState {
+        /// PR was merged; carries the `mergedAt` timestamp.
+        Merged { merged_at: String },
+        /// PR was closed without merging — task is superseded.
+        Closed,
+        /// PR is still open — task may still be in flight.
+        Open,
+        /// PR doesn't exist or query failed — skip categorization.
+        Unknown,
+    }
+
+    /// Function-pointer abstraction over `gh pr view`. Tests inject
+    /// a stub closure to bypass the shell-out. Production uses
+    /// `gh_pr_lookup` below.
+    pub(super) type PrLookup<'a> = &'a dyn Fn(&str, u32) -> Result<PrState, String>;
+
+    /// Production PR-state lookup — shells out to `gh pr view`.
+    /// Mirrors the existing precedent at
+    /// `src/mcp/handlers/sha_gate.rs::fetch_pr_head_sha`.
+    pub(super) fn gh_pr_lookup(repo: &str, num: u32) -> Result<PrState, String> {
+        let output = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "view",
+                &num.to_string(),
+                "--repo",
+                repo,
+                "--json",
+                "state,mergedAt",
+            ])
+            .output()
+            .map_err(|e| format!("gh pr view failed: {e}"))?;
+        if !output.status.success() {
+            // PR may not exist on this repo — treat as Unknown so
+            // categorization skips rather than erroring out the whole
+            // sweep over a stale PR reference.
+            return Ok(PrState::Unknown);
+        }
+        let body = String::from_utf8_lossy(&output.stdout);
+        let json: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("gh json parse: {e}"))?;
+        match json["state"].as_str() {
+            Some("MERGED") => Ok(PrState::Merged {
+                merged_at: json["mergedAt"].as_str().unwrap_or("unknown").to_string(),
+            }),
+            Some("CLOSED") => Ok(PrState::Closed),
+            Some("OPEN") => Ok(PrState::Open),
+            _ => Ok(PrState::Unknown),
+        }
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub(super) struct Candidate {
+        pub id: String,
+        pub reason: String,
+        pub owner: Option<String>,
+        pub pr: Option<u32>,
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct Categories {
+        pub shipped: Vec<Candidate>,
+        pub superseded: Vec<Candidate>,
+        pub team_disbanded: Vec<Candidate>,
+        pub validation_leftovers: Vec<Candidate>,
+    }
+
+    impl Categories {
+        pub fn all_ids(&self) -> Vec<String> {
+            let mut v: Vec<String> = self
+                .shipped
+                .iter()
+                .chain(self.superseded.iter())
+                .chain(self.team_disbanded.iter())
+                .chain(self.validation_leftovers.iter())
+                .map(|c| c.id.clone())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+
+        pub fn total(&self) -> usize {
+            self.all_ids().len()
+        }
+
+        pub fn as_json(&self) -> serde_json::Value {
+            serde_json::json!({
+                "shipped": self.shipped,
+                "superseded": self.superseded,
+                "team_disbanded": self.team_disbanded,
+                "validation_leftovers": self.validation_leftovers,
+            })
+        }
+    }
+
+    /// Scan the task board and bucket non-terminal tasks into the 4
+    /// hygiene categories. Tasks already in `done`/`cancelled`/
+    /// `verified` are skipped — they're already cleaned up. Each task
+    /// lands in at most one category (first match wins, order:
+    /// validation_leftovers → team_disbanded → shipped/superseded).
+    ///
+    /// `now` is parameterized so tests can fast-forward age thresholds
+    /// without forging event-log timestamps.
+    pub(super) fn scan_categories(
+        home: &Path,
+        live_instances: &HashSet<String>,
+        pr_lookup: PrLookup,
+        repo: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Categories {
+        let tasks = list_all(home);
+        let mut cats = Categories::default();
+        let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
+        for t in &tasks {
+            if matches!(t.status.as_str(), "done" | "cancelled" | "verified") {
+                continue;
+            }
+            let age = chrono::DateTime::parse_from_rfc3339(&t.updated_at)
+                .ok()
+                .map(|dt| now.signed_duration_since(dt.with_timezone(&Utc)));
+            // (1) validation_leftovers — title prefix match + 1d stale.
+            let title_lc = t.title.to_lowercase();
+            let is_validation = title_lc.starts_with("val-")
+                || title_lc.starts_with("canary-")
+                || title_lc.starts_with("test/")
+                || title_lc.starts_with("test_")
+                || t.branch
+                    .as_deref()
+                    .map(|b| b.starts_with("test/"))
+                    .unwrap_or(false);
+            if is_validation {
+                if let Some(a) = age {
+                    if a > Duration::days(1) {
+                        cats.validation_leftovers.push(Candidate {
+                            id: t.id.clone(),
+                            reason: format!(
+                                "validation/canary title prefix, {}d stale",
+                                a.num_days()
+                            ),
+                            owner: t.assignee.clone(),
+                            pr: None,
+                        });
+                        continue;
+                    }
+                }
+            }
+            // (2) team_disbanded — owner not in live fleet + 30d stale.
+            if let (Some(owner), Some(a)) = (t.assignee.as_ref(), age) {
+                if !live_instances.contains(owner) && a > Duration::days(30) {
+                    cats.team_disbanded.push(Candidate {
+                        id: t.id.clone(),
+                        reason: format!(
+                            "owner '{owner}' not in live fleet, {}d stale",
+                            a.num_days()
+                        ),
+                        owner: Some(owner.clone()),
+                        pr: None,
+                    });
+                    continue;
+                }
+            }
+            // (3) shipped / (4) superseded — extract PR ref + query.
+            let Some(repo) = repo else { continue };
+            let search_text = format!("{}\n{}", t.title, t.description);
+            let Some(pr_num) = extract_pr_number(&search_text) else {
+                continue;
+            };
+            let state = pr_cache
+                .entry(pr_num)
+                .or_insert_with(|| pr_lookup(repo, pr_num).unwrap_or(PrState::Unknown))
+                .clone();
+            match state {
+                PrState::Merged { merged_at } => {
+                    if let Some(a) = age {
+                        if a > Duration::days(7) {
+                            cats.shipped.push(Candidate {
+                                id: t.id.clone(),
+                                reason: format!(
+                                    "PR #{pr_num} merged at {merged_at}, task {}d stale",
+                                    a.num_days()
+                                ),
+                                owner: t.assignee.clone(),
+                                pr: Some(pr_num),
+                            });
+                        }
+                    }
+                }
+                PrState::Closed => {
+                    cats.superseded.push(Candidate {
+                        id: t.id.clone(),
+                        reason: format!("PR #{pr_num} closed without merge"),
+                        owner: t.assignee.clone(),
+                        pr: Some(pr_num),
+                    });
+                }
+                PrState::Open | PrState::Unknown => {}
+            }
+        }
+        cats
+    }
+
+    /// Extract the first `PR #<digits>` (or `PR <digits>`) reference
+    /// from a haystack. Strict `PR ` prefix avoids false positives on
+    /// standalone `#NNN` issue references.
+    fn extract_pr_number(text: &str) -> Option<u32> {
+        static PR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = PR_RE.get_or_init(|| regex::Regex::new(r"\bPR #?(\d+)\b").expect("pr regex"));
+        re.captures(text)
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+    }
+
+    /// Apply phase — emit `Cancelled` events for the `confirm_ids`
+    /// subset under the `system:task_sweep` identity (already in
+    /// `SYSTEM_IDENTITIES` bypass list). Each Cancelled carries the
+    /// audit_reason in its reason field; the event log records a
+    /// `task_sweep_apply` line per cancelled task for cross-board
+    /// audit.
+    pub(super) fn emit_cancelled_batch(
+        home: &Path,
+        categories: &Categories,
+        confirm_ids: &HashSet<String>,
+        audit_reason: &str,
+    ) -> Result<usize, String> {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let emitter = InstanceName::from("system:task_sweep");
+        let mut events: Vec<TaskEvent> = Vec::new();
+        let lookup_category = |id: &str| -> &'static str {
+            if categories.shipped.iter().any(|c| c.id == id) {
+                return "shipped";
+            }
+            if categories.superseded.iter().any(|c| c.id == id) {
+                return "superseded";
+            }
+            if categories.team_disbanded.iter().any(|c| c.id == id) {
+                return "team_disbanded";
+            }
+            "validation_leftovers"
+        };
+        for id in confirm_ids {
+            let category = lookup_category(id);
+            events.push(TaskEvent::Cancelled {
+                task_id: TaskId(id.clone()),
+                by: emitter.clone(),
+                reason: format!("sweep:{category}: {audit_reason}"),
+            });
+            crate::event_log::log(
+                home,
+                "task_sweep_apply",
+                "system:task_sweep",
+                &format!("task={id} category={category} reason={audit_reason}"),
+            );
+        }
+        let count = events.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        crate::task_events::append_batch(home, &emitter, events)
+            .map(|_| count)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -2839,6 +3231,386 @@ mod tests {
         assert!(
             log.contains("task_force_done"),
             "event-log.jsonl must record task_force_done entry, got: {log}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #806 list default filter (Part A) — RED test + scaffolding ──
+
+    #[test]
+    fn test_list_default_returns_only_actionable_statuses() {
+        // #806 RED test 1: pre-fix `task action=list` with no filter
+        // returns every status including `done` / `cancelled`,
+        // producing the 504KB / 3847-line dump the issue documents.
+        // Post-fix: default trim → {open,claimed,in_progress,blocked}.
+        // A `filtered_default` flag on the response signals callers
+        // that the trim fired so audit/forensic consumers can re-call
+        // with `include_history=true` if needed.
+        let home = tmp_home("list_default_actionable");
+        write_fleet_yaml(&home, &["agent-a"]);
+        let create_with_status = |title: &str, target_status: &str| {
+            let r = handle(
+                &home,
+                "agent-a",
+                &serde_json::json!({"action": "create", "title": title, "assignee": "agent-a"}),
+            );
+            let id = r["id"].as_str().expect("id").to_string();
+            if target_status != "open" {
+                let r = handle(
+                    &home,
+                    "agent-a",
+                    &serde_json::json!({"action": "update", "id": id, "status": target_status}),
+                );
+                assert_eq!(r["status"], "updated", "seed transition failed: {r}");
+            }
+            id
+        };
+        let open_id = create_with_status("open task", "open");
+        let in_progress_id = create_with_status("active task", "in_progress");
+        let cancelled_id = create_with_status("stale cancel", "cancelled");
+        let done_id = create_with_status("stale done", "done");
+
+        // include_history=true must surface everything (existing audit
+        // consumers opt in this way).
+        let r_history = handle(
+            &home,
+            "agent-a",
+            &serde_json::json!({"action": "list", "include_history": true}),
+        );
+        let history_ids: std::collections::HashSet<_> = r_history["tasks"]
+            .as_array()
+            .expect("tasks")
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(String::from))
+            .collect();
+        for id in [&open_id, &in_progress_id, &cancelled_id, &done_id] {
+            assert!(
+                history_ids.contains(id),
+                "include_history=true must surface {id}, got {history_ids:?}"
+            );
+        }
+        assert_eq!(
+            r_history["filtered_default"], false,
+            "include_history=true must report filtered_default=false"
+        );
+
+        // Default (no filter) — only actionable statuses.
+        let r = handle(&home, "agent-a", &serde_json::json!({"action": "list"}));
+        let tasks = r["tasks"].as_array().expect("tasks");
+        let ids: std::collections::HashSet<_> = tasks
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(String::from))
+            .collect();
+        assert!(
+            ids.contains(&open_id),
+            "open task must surface in default list, got {ids:?}"
+        );
+        assert!(
+            ids.contains(&in_progress_id),
+            "in_progress task must surface in default list, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&cancelled_id),
+            "cancelled task must NOT surface in default list, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&done_id),
+            "done task must NOT surface in default list, got {ids:?}"
+        );
+        assert_eq!(
+            r["filtered_default"], true,
+            "default list must report filtered_default=true"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_list_explicit_filter_status_overrides_default() {
+        // GREEN 1b: an explicit `filter_status=cancelled` must still
+        // return cancelled entries; the default trim only fires when
+        // neither filter_status nor include_history is supplied.
+        let home = tmp_home("list_explicit_filter");
+        write_fleet_yaml(&home, &["a"]);
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "create", "title": "to-cancel", "assignee": "a"}),
+        );
+        let id = r["id"].as_str().expect("id").to_string();
+        handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "update", "id": id, "status": "cancelled"}),
+        );
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "list", "filter_status": "cancelled"}),
+        );
+        let tasks = r["tasks"].as_array().expect("tasks");
+        assert!(
+            tasks.iter().any(|t| t["id"] == id),
+            "explicit filter_status=cancelled must surface cancelled task: {tasks:?}"
+        );
+        assert!(
+            tasks.iter().all(|t| t["status"] == "cancelled"),
+            "filter_status=cancelled must restrict to cancelled only"
+        );
+        assert_eq!(
+            r["filtered_default"], false,
+            "explicit filter_status must report filtered_default=false"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_list_limit_truncates_newest_first() {
+        // GREEN 1c: `limit=N` caps response newest-first by updated_at
+        // for caller-visible pagination without cursors.
+        let home = tmp_home("list_limit");
+        write_fleet_yaml(&home, &["a"]);
+        let mut ids = Vec::new();
+        for title in ["oldest", "middle", "newest"] {
+            let r = handle(
+                &home,
+                "a",
+                &serde_json::json!({"action": "create", "title": title, "assignee": "a"}),
+            );
+            ids.push(r["id"].as_str().expect("id").to_string());
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "list", "limit": 2}),
+        );
+        let tasks = r["tasks"].as_array().expect("tasks");
+        assert_eq!(
+            tasks.len(),
+            2,
+            "limit=2 must cap response, got {}",
+            tasks.len()
+        );
+        let returned: std::collections::HashSet<_> = tasks
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(String::from))
+            .collect();
+        assert!(
+            returned.contains(&ids[2]),
+            "newest task (idx 2) must be in newest-first cap"
+        );
+        assert!(
+            returned.contains(&ids[1]),
+            "second-newest (idx 1) must be in newest-first cap"
+        );
+        assert!(
+            !returned.contains(&ids[0]),
+            "oldest task (idx 0) must NOT be in newest-first cap"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #806 sweeper (Part B) — dry-run + apply tests ──
+
+    /// Stub PR lookup for sweep tests — bypasses `gh pr view`
+    /// shellout. Maps a static table of (repo, num) → PrState.
+    fn stub_pr_lookup(repo: &str, num: u32) -> Result<super::sweep_impl::PrState, String> {
+        match (repo, num) {
+            ("test/repo", 999) => Ok(super::sweep_impl::PrState::Merged {
+                merged_at: "2026-04-01T00:00:00Z".to_string(),
+            }),
+            ("test/repo", 998) => Ok(super::sweep_impl::PrState::Closed),
+            _ => Ok(super::sweep_impl::PrState::Unknown),
+        }
+    }
+
+    #[test]
+    fn test_sweep_scan_identifies_team_disbanded_category() {
+        // GREEN 2: scan_categories puts tasks owned by instances NOT
+        // in live_instances AND aged > 30d into the team_disbanded
+        // bucket. Fast-forward `now` 60 days into the future so the
+        // freshly-created task crosses the 30d threshold without
+        // needing event-log timestamp forgery.
+        let home = tmp_home("sweep_disband");
+        write_fleet_yaml(&home, &["alive"]);
+        let r = handle(
+            &home,
+            "alive",
+            &serde_json::json!({"action": "create", "title": "old work", "assignee": "ghost"}),
+        );
+        let task_id = r["id"].as_str().expect("id").to_string();
+        let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+        let now = chrono::Utc::now() + chrono::Duration::days(60);
+        let cats = super::sweep_impl::scan_categories(&home, &live, &stub_pr_lookup, None, now);
+        assert_eq!(
+            cats.team_disbanded.len(),
+            1,
+            "exactly one team_disbanded candidate expected, got {cats:?}"
+        );
+        assert_eq!(cats.team_disbanded[0].id, task_id);
+        assert_eq!(cats.team_disbanded[0].owner.as_deref(), Some("ghost"));
+        // No PR ref → other categories empty.
+        assert!(cats.shipped.is_empty());
+        assert!(cats.superseded.is_empty());
+        assert!(cats.validation_leftovers.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_sweep_scan_identifies_shipped_via_pr_lookup_stub() {
+        // GREEN 2a: a task whose title carries `PR #999` and whose
+        // stubbed PR state is Merged lands in the shipped bucket
+        // when aged > 7d. The PrLookup function-pointer abstraction
+        // lets the test bypass the production `gh pr view` shellout.
+        let home = tmp_home("sweep_shipped");
+        write_fleet_yaml(&home, &["alive"]);
+        let r = handle(
+            &home,
+            "alive",
+            &serde_json::json!({
+                "action": "create",
+                "title": "shipped via PR #999",
+                "assignee": "alive",
+            }),
+        );
+        let task_id = r["id"].as_str().expect("id").to_string();
+        let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+        // 14 days forward — past the 7d shipped threshold but under
+        // the 30d team_disbanded threshold (which wouldn't fire
+        // anyway because owner is alive).
+        let now = chrono::Utc::now() + chrono::Duration::days(14);
+        let cats = super::sweep_impl::scan_categories(
+            &home,
+            &live,
+            &stub_pr_lookup,
+            Some("test/repo"),
+            now,
+        );
+        assert_eq!(
+            cats.shipped.len(),
+            1,
+            "exactly one shipped candidate expected, got {cats:?}"
+        );
+        assert_eq!(cats.shipped[0].id, task_id);
+        assert_eq!(cats.shipped[0].pr, Some(999));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_sweep_handler_dry_run_returns_categorized_plan() {
+        // GREEN 2b: full handler path returns dry_run=true with
+        // categories shaped + candidate_ids list. Uses
+        // team_disbanded category which doesn't require gh shellout.
+        let home = tmp_home("sweep_handler_dryrun");
+        write_fleet_yaml(&home, &["alive"]);
+        handle(
+            &home,
+            "alive",
+            &serde_json::json!({"action": "create", "title": "stuck", "assignee": "ghost"}),
+        );
+        // Forge updated_at via direct event-log append of an
+        // OwnerAssigned older than the 30d threshold — bypass would
+        // be cleaner, but for handler test the live `now` of the
+        // task is recent. We invoke sweep but expect zero candidates
+        // (handler uses real now, task fresh). Still validates the
+        // dry-run shape contract.
+        let r = handle(&home, "alive", &serde_json::json!({"action": "sweep"}));
+        assert_eq!(r["dry_run"], true, "dry-run response shape: {r}");
+        assert!(r["categories"].is_object(), "categories must be object");
+        assert!(
+            r["categories"]["team_disbanded"].is_array(),
+            "team_disbanded slot present"
+        );
+        assert!(
+            r["categories"]["shipped"].is_array(),
+            "shipped slot present"
+        );
+        assert!(r["candidate_ids"].is_array(), "candidate_ids array present");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_sweep_apply_without_confirm_ids_rejected() {
+        // GREEN 3a: apply=true without confirm_ids must surface
+        // a validator error (NOT a silent no-op cancel of every
+        // candidate — explicit subset is the double-opt-in guard).
+        let home = tmp_home("sweep_no_confirm");
+        write_fleet_yaml(&home, &["a"]);
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({"action": "sweep", "apply": true}),
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .map(|e| e.contains("confirm_ids"))
+                .unwrap_or(false),
+            "apply=true without confirm_ids must reject: {r}"
+        );
+        // Also: apply=true with confirm_ids but no audit_reason.
+        let r = handle(
+            &home,
+            "a",
+            &serde_json::json!({
+                "action": "sweep",
+                "apply": true,
+                "confirm_ids": ["t-nonexistent"],
+            }),
+        );
+        assert!(
+            r["error"]
+                .as_str()
+                .map(|e| e.contains("audit_reason"))
+                .unwrap_or(false),
+            "apply=true without audit_reason must reject: {r}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_sweep_apply_emits_cancelled_and_logs_audit() {
+        // GREEN 3: apply path with explicit (categories, confirm_ids)
+        // emits Cancelled events under system:task_sweep + writes
+        // task_sweep_apply lines to event-log.jsonl. The sweep_impl
+        // helper is exercised directly because the handler's
+        // `categories` rebuild uses real-time `now` and we want a
+        // deterministic candidate set.
+        let home = tmp_home("sweep_apply");
+        write_fleet_yaml(&home, &["alive"]);
+        let r = handle(
+            &home,
+            "alive",
+            &serde_json::json!({"action": "create", "title": "ghost task", "assignee": "ghost"}),
+        );
+        let task_id = r["id"].as_str().expect("id").to_string();
+        let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+        let now = chrono::Utc::now() + chrono::Duration::days(60);
+        let cats = super::sweep_impl::scan_categories(&home, &live, &stub_pr_lookup, None, now);
+        assert_eq!(cats.team_disbanded.len(), 1);
+        let confirm: std::collections::HashSet<String> = [task_id.clone()].into_iter().collect();
+        let count = super::sweep_impl::emit_cancelled_batch(
+            &home,
+            &cats,
+            &confirm,
+            "post-#806 sweep test fixture",
+        )
+        .expect("emit_cancelled_batch");
+        assert_eq!(count, 1, "exactly one Cancelled must be emitted");
+        let listed = list_all(&home);
+        let after = listed.iter().find(|t| t.id == task_id).expect("task");
+        assert_eq!(
+            after.status, "cancelled",
+            "swept task must transition to cancelled"
+        );
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("task_sweep_apply"),
+            "event-log.jsonl must record task_sweep_apply entry, got: {log}"
+        );
+        assert!(
+            log.contains("post-#806 sweep test fixture"),
+            "event-log.jsonl must carry the audit_reason"
         );
         std::fs::remove_dir_all(&home).ok();
     }
