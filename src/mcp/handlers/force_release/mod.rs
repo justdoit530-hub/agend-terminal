@@ -17,7 +17,9 @@
 
 use crate::identity::Sender;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+mod gc;
 
 /// MCP tool: `force_release_worktree`.
 ///
@@ -86,13 +88,33 @@ pub(crate) fn handle_force_release_worktree(
         });
     }
 
+    // #826: optional operator-supplied `source_repo` arg. When
+    // present, L2 skips enumeration and goes straight to the named
+    // repo. When absent, L2 enumerates daemon-managed candidates.
+    let source_repo_hint = args["source_repo"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
     match rebase_clean_self(home, agent, branch) {
-        Ok(o) => json!({
-            "released": true,
-            "dir_existed": o.dir_existed,
-            "dir_removed": o.dir_removed,
-            "binding_outcome": o.binding_outcome,
-        }),
+        Ok(o) => {
+            // #826 L2 GC: when the binding-clear path short-circuited
+            // on "no binding" (the post-disband state), the
+            // `git worktree remove --force` step inside `release_full`
+            // never ran. Run it now against any source repos that
+            // still hold `.git/worktrees/<meta-dir>/` metadata for
+            // our target worktree path.
+            let gc =
+                gc::prune_git_metadata_for_agent(home, agent, branch, source_repo_hint.as_deref());
+            json!({
+                "released": true,
+                "dir_existed": o.dir_existed,
+                "dir_removed": o.dir_removed,
+                "binding_outcome": o.binding_outcome,
+                "git_metadata_pruned": gc.pruned_count,
+                "git_metadata_repos": gc.repos_touched,
+            })
+        }
         Err(e) => json!({"error": e, "code": "path_outside_pool"}),
     }
 }
