@@ -167,15 +167,96 @@ pub fn create(home: &Path, args: &Value) -> Value {
     }
 }
 
+/// #828: read the team's current member list from fleet.yaml. Used by
+/// `delete` to snapshot members before the cascade walks them through
+/// `full_delete_instance` (which itself removes each member from every
+/// team via `remove_member_from_all`, eventually auto-deleting the
+/// team being disbanded once its membership reaches zero).
+fn list_team_members(home: &Path, team_name: &str) -> Vec<String> {
+    load_fleet(home)
+        .teams
+        .get(team_name)
+        .map(|cfg| cfg.members.clone())
+        .unwrap_or_default()
+}
+
+/// #828: disband a team and cascade `full_delete_instance` per member
+/// so each member's ghost-owned tasks get orphaned via the existing
+/// `tasks::orphan_tasks_for_owner` hook (#808) and the rest of the
+/// per-instance teardown (PTY kill, telegram topic, working_dir,
+/// remove_member_from_all in any *other* teams the member belongs to)
+/// fires symmetrically.
+///
+/// Hard-cascade design (per dispatch + spike design call 1):
+/// `full_delete_instance` kills the instance entirely, so a member
+/// that's in multiple teams is removed from all of them. The
+/// `remove_member_from_all` step inside `full_delete_instance` emits
+/// the existing "Team 'X' needs new orchestrator" urgent-task signal
+/// when a multi-team member happened to be another team's
+/// orchestrator — operator gets immediate cross-team coupling
+/// surfaced at the moment it's actionable.
+///
+/// Error policy (per spike design call 2, mirrors
+/// `full_delete_instance`'s own per-step pattern): continue on
+/// per-member failure, collect into `cascade_warnings`. The
+/// final response carries:
+/// - `status: "deleted"` when the team was removed cleanly (either
+///   by the explicit `remove_team_from_yaml` below or by
+///   `remove_member_from_all`'s empty-team auto-delete during the
+///   cascade — both outcomes count as success)
+/// - `members_cleaned: N` (always emitted, even N=0)
+/// - `cascade_warnings: [..]` when any per-member cascade returned Err
 pub fn delete(home: &Path, args: &Value) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
     };
+
+    // Snapshot existence + members BEFORE cascade. The cascade itself
+    // may auto-delete the team (when `remove_member_from_all` removes
+    // the last member), so we can't rely on post-cascade fleet.yaml
+    // state to tell "team was there" from "team was never there".
+    let entry_existed = load_fleet(home).teams.contains_key(&name);
+    if !entry_existed {
+        return serde_json::json!({
+            "error": format!("team '{name}' not found"),
+            "members_cleaned": 0,
+        });
+    }
+    let members = list_team_members(home, &name);
+    let members_count = members.len();
+    let mut cascade_warnings: Vec<String> = Vec::new();
+    for member in &members {
+        if let Err(e) = crate::mcp::handlers::instance_lifecycle::full_delete_instance(home, member)
+        {
+            cascade_warnings.push(format!("{member}: {e}"));
+            tracing::warn!(
+                team = %name,
+                %member,
+                error = %e,
+                "#828: full_delete_instance failed during team disband cascade"
+            );
+        }
+    }
+
+    // After cascade, the team may already be gone (auto-deleted by
+    // `remove_member_from_all`'s empty-team rule once the last member
+    // was removed). Treat Ok(true) AND Ok(false) as success here —
+    // both mean the team is no longer in fleet.yaml, which is exactly
+    // what disband requested.
     match crate::fleet::remove_team_from_yaml(home, &name) {
-        Ok(true) => serde_json::json!({"status": "deleted", "name": name}),
-        Ok(false) => serde_json::json!({"error": format!("team '{name}' not found")}),
-        Err(e) => serde_json::json!({"error": format!("{e}")}),
+        Ok(_) => {
+            let mut result = serde_json::json!({
+                "status": "deleted",
+                "name": name,
+                "members_cleaned": members_count,
+            });
+            if !cascade_warnings.is_empty() {
+                result["cascade_warnings"] = serde_json::json!(cascade_warnings);
+            }
+            result
+        }
+        Err(e) => serde_json::json!({"error": format!("{e}"), "members_cleaned": members_count}),
     }
 }
 
@@ -623,6 +704,260 @@ mod tests {
         remove_member_from_all(&home, "lead");
         let listed = list(&home);
         assert_eq!(listed["teams"][0]["degraded"], true);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #828 teams::delete cascade full_delete_instance per member ──
+
+    /// #828 C1 RED: disbanding a team must cascade `full_delete_instance`
+    /// to each member so their owned tasks get orphaned via the existing
+    /// `tasks::orphan_tasks_for_owner` hook (#808) inside
+    /// `full_delete_instance`. Pre-fix `teams::delete` only removes the
+    /// fleet.yaml entry — members' tasks stay ghost-owned indefinitely,
+    /// the exact symptom the operator surfaced in the residual cleanup
+    /// hygiene work after #821/#822.
+    ///
+    /// Asserts the post-fix contract:
+    /// - response carries `members_cleaned` = number of cascaded members
+    /// - members are gone from fleet.yaml `instances:`
+    /// - tasks previously owned by members are now `owner = None`
+    #[test]
+    fn delete_team_cascades_full_delete_instance_per_member() {
+        let home = tmp_home("828_cascade");
+        // Seed two members so we can verify per-member cascade.
+        create(
+            &home,
+            &serde_json::json!({"name": "ops", "members": ["alice828", "bob828"], "orchestrator": "alice828"}),
+        );
+        // Also seed the instances themselves so fleet.yaml has full
+        // `instances:` entries — without those, `full_delete_instance`'s
+        // residual audit short-circuits on already-missing names.
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        let yaml = std::fs::read_to_string(&fleet_path).unwrap();
+        let yaml = format!(
+            "instances:\n  alice828:\n    backend: claude\n  bob828:\n    backend: claude\n{}",
+            yaml,
+        );
+        std::fs::write(&fleet_path, yaml).unwrap();
+
+        // Create 3 tasks claimed by alice828 (2) + bob828 (1).
+        let t1 = crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "create", "title": "task-1"}),
+        );
+        let id1 = t1["id"].as_str().unwrap().to_string();
+        crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "claim", "id": id1}),
+        );
+        let t2 = crate::tasks::handle(
+            &home,
+            "bob828",
+            &serde_json::json!({"action": "create", "title": "task-2"}),
+        );
+        let id2 = t2["id"].as_str().unwrap().to_string();
+        crate::tasks::handle(
+            &home,
+            "bob828",
+            &serde_json::json!({"action": "claim", "id": id2}),
+        );
+        let t3 = crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "create", "title": "task-3"}),
+        );
+        let id3 = t3["id"].as_str().unwrap().to_string();
+        crate::tasks::handle(
+            &home,
+            "alice828",
+            &serde_json::json!({"action": "claim", "id": id3}),
+        );
+
+        // Disband.
+        let result = delete(&home, &serde_json::json!({"name": "ops"}));
+
+        // Status + audit fields.
+        assert_eq!(
+            result["status"], "deleted",
+            "team deletion must succeed, got: {result}"
+        );
+        assert_eq!(
+            result["members_cleaned"], 2,
+            "members_cleaned must report 2 cascaded members, got: {result}"
+        );
+
+        // Members are gone from fleet.yaml `instances:`.
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert!(
+            !fleet.instances.contains_key("alice828"),
+            "alice828 must be removed from fleet.yaml instances, got: {:?}",
+            fleet.instances.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !fleet.instances.contains_key("bob828"),
+            "bob828 must be removed from fleet.yaml instances"
+        );
+
+        // All 3 previously-owned tasks are orphaned (owner = None).
+        let state = crate::task_events::replay(&home).unwrap();
+        for id in &[id1.as_str(), id2.as_str(), id3.as_str()] {
+            let task = state
+                .tasks
+                .values()
+                .find(|t| t.id.0 == *id)
+                .unwrap_or_else(|| panic!("task {id} must exist post-cascade"));
+            assert!(
+                task.owner.is_none(),
+                "task {} must be orphaned post-cascade, has owner={:?}",
+                task.id.0,
+                task.owner
+            );
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #828 C3 regression-proof: a team with zero members (operator
+    /// hand-edited fleet.yaml or post-`remove_member_from_all` edge
+    /// case) must still disband cleanly with `members_cleaned: 0`
+    /// and no cascade_warnings. Locks the "always emit
+    /// `members_cleaned`" design call from the spike.
+    #[test]
+    fn delete_team_with_zero_members_is_no_op_cascade() {
+        let home = tmp_home("828_empty_team");
+        // Seed a team with empty members list via direct fleet.yaml
+        // (the `create` API rejects this shape so we go around it).
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            "teams:\n  empty_squad:\n    members: []\n    orchestrator: null\n",
+        )
+        .unwrap();
+
+        let result = delete(&home, &serde_json::json!({"name": "empty_squad"}));
+
+        assert_eq!(result["status"], "deleted", "got: {result}");
+        assert_eq!(
+            result["members_cleaned"], 0,
+            "zero-member team must still emit `members_cleaned: 0`, got: {result}"
+        );
+        assert!(
+            result["cascade_warnings"].is_null(),
+            "no cascade warnings expected for zero-member team, got: {result}"
+        );
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert!(
+            !fleet.teams.contains_key("empty_squad"),
+            "empty team must be removed from fleet.yaml"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #828 C3 regression-proof: a team whose member doesn't exist in
+    /// `instances:` (operator hand-edited fleet.yaml, or member was
+    /// deleted via a path other than the team cascade) — cascade still
+    /// returns success because `full_delete_instance` is best-effort
+    /// and each cleanup step no-ops for a fully-missing name.
+    #[test]
+    fn delete_team_with_ghost_member_swallows_residual() {
+        let home = tmp_home("828_ghost_member");
+        // Seed fleet.yaml with a team referencing a member that has no
+        // corresponding `instances:` entry.
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            "teams:\n  ghost_squad:\n    members: [ghost_alice828]\n    orchestrator: null\n",
+        )
+        .unwrap();
+
+        let result = delete(&home, &serde_json::json!({"name": "ghost_squad"}));
+
+        assert_eq!(result["status"], "deleted", "got: {result}");
+        assert_eq!(result["members_cleaned"], 1, "got: {result}");
+        // No cascade warnings — `full_delete_instance` no-ops cleanly
+        // for a fully-missing name.
+        assert!(
+            result["cascade_warnings"].is_null(),
+            "ghost member should produce no cascade warnings, got: {result}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #828 C3 regression-proof: when a cascaded member belongs to
+    /// MULTIPLE teams, the hard-cascade semantics remove the instance
+    /// from ALL of those teams (via `full_delete_instance`'s embedded
+    /// `remove_member_from_all` step). This locks the multi-team
+    /// behavior documented in the PR body — disbanding one team
+    /// affects every other team that shared the cascaded member.
+    #[test]
+    fn delete_team_with_multi_team_member_removes_from_all_teams() {
+        let home = tmp_home("828_multi_team");
+        // Pre-seed two teams sharing the member "polyglot_alice828".
+        // Skip the `create` API because it enforces one-agent-one-team;
+        // we hand-write fleet.yaml to construct the multi-team state
+        // (which can arise via operator-edited yaml or migration
+        // history) and verify the cascade handles it gracefully.
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        std::fs::write(
+            &fleet_path,
+            "instances:\n  polyglot_alice828:\n    backend: claude\n\
+             teams:\n  ops_a:\n    members: [polyglot_alice828]\n    orchestrator: polyglot_alice828\n\
+                 \n  ops_b:\n    members: [polyglot_alice828]\n    orchestrator: polyglot_alice828\n",
+        )
+        .unwrap();
+
+        // Disband ops_a — should cascade-kill polyglot_alice828, which
+        // removes them from ops_b too (and since ops_b becomes empty,
+        // `remove_member_from_all`'s empty-team rule auto-deletes ops_b).
+        let result = delete(&home, &serde_json::json!({"name": "ops_a"}));
+
+        assert_eq!(result["status"], "deleted", "got: {result}");
+        assert_eq!(result["members_cleaned"], 1, "got: {result}");
+
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert!(
+            !fleet.instances.contains_key("polyglot_alice828"),
+            "multi-team member must be removed from instances post-cascade"
+        );
+        assert!(
+            !fleet.teams.contains_key("ops_a"),
+            "ops_a (the disbanded team) must be gone"
+        );
+        assert!(
+            !fleet.teams.contains_key("ops_b"),
+            "ops_b (the other team that shared the member) must auto-delete \
+             once its last member was cascade-removed"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #828 C3 regression-proof: a delete call for a team that doesn't
+    /// exist at all returns the `not found` error with
+    /// `members_cleaned: 0` for response-shape consistency. Locks the
+    /// `entry_existed` short-circuit guard.
+    #[test]
+    fn delete_team_returns_not_found_when_team_never_existed() {
+        let home = tmp_home("828_not_found");
+        // Empty home — no fleet.yaml at all is fine, load_fleet returns
+        // the default.
+        let result = delete(&home, &serde_json::json!({"name": "phantom_squad"}));
+
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("not found")),
+            "missing-team delete must return not-found error, got: {result}"
+        );
+        assert_eq!(
+            result["members_cleaned"], 0,
+            "not-found error must still carry members_cleaned: 0 for response shape consistency, got: {result}"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 
