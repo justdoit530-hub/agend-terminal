@@ -151,6 +151,204 @@ fn extract_fn_names(s: &str) -> Vec<String> {
     names
 }
 
+/// Cargo-test flags that consume the next positional token as their
+/// value (so the extractor must skip the following token rather than
+/// treat it as a test path). Hard-coded to the common subset because
+/// `cargo test --help` is a moving target across rustc versions and
+/// the dispatcher only sees these in practice.
+const CARGO_TEST_FLAGS_WITH_VALUE: &[&str] = &[
+    "--bin",
+    "--bins",
+    "--test",
+    "--example",
+    "--package",
+    "-p",
+    "--features",
+    "--manifest-path",
+    "--target",
+    "--profile",
+    "--config",
+    "-Z",
+];
+
+/// #812: extract `cargo test ...` test-name invocations out of free
+/// text (dispatch task bodies). Captures the trailing `::test_name`
+/// segment of each positional path argument. Skips:
+/// - flag tokens (start with `-`)
+/// - values of value-taking flags (per `CARGO_TEST_FLAGS_WITH_VALUE`)
+/// - markdown code-fenced regions (illustrative examples, not actual
+///   invocations the reviewer is supposed to run)
+/// - everything after `--` (those are runner args, not test paths)
+///
+/// Returns deduplicated bare test fn names (sorted for determinism).
+/// Mirrors the §4.3 `extract_fn_names` precedent — same predicate
+/// family ("names mentioned in claim text must exist in the repo"),
+/// different surface (test-invocation grammar vs `fn name(` grammar).
+pub fn extract_test_invocations(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let Some(after_cargo_test) = find_cargo_test_payload(line) else {
+            continue;
+        };
+        // Trim everything after `--` — those are runtime args, not
+        // test paths (e.g. `-- --exact`, `-- --nocapture`).
+        let payload = after_cargo_test
+            .split(" -- ")
+            .next()
+            .unwrap_or(after_cargo_test);
+        let tokens: Vec<&str> = payload.split_whitespace().collect();
+        let mut skip_next = false;
+        for token in tokens {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if token.starts_with('-') {
+                // `--features=tray` form: value attached, no skip
+                if !token.contains('=') && CARGO_TEST_FLAGS_WITH_VALUE.contains(&token) {
+                    skip_next = true;
+                }
+                continue;
+            }
+            // Positional — should be a test path. Trim markdown
+            // punctuation that often surrounds an inline-backtick
+            // invocation (``cargo test ... tests::test_foo``).
+            let token =
+                token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != ':');
+            // Extract the last `::`-segment as the bare fn name. To
+            // avoid capturing trailing prose tokens (e.g. `at HEAD`
+            // after the test path on the same line), require either:
+            //   - `::` separator in the token (clearly a module path)
+            //   - bare name starting with `test_` (Rust convention)
+            let has_path_separator = token.contains("::");
+            let bare = token.rsplit("::").next().unwrap_or(token);
+            if !is_valid_test_ident(bare) {
+                continue;
+            }
+            if has_path_separator || bare.starts_with("test_") {
+                names.push(bare.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Returns the substring AFTER the first `cargo test ` occurrence on
+/// a line, or `None` if the line doesn't invoke cargo test. Tolerates
+/// leading shell prefixes (`$ cargo test`, `> cargo test`, `Run:
+/// cargo test`).
+fn find_cargo_test_payload(line: &str) -> Option<&str> {
+    let idx = line.find("cargo test")?;
+    let after = &line[idx + "cargo test".len()..];
+    // Must be followed by whitespace OR end of line to count as a
+    // real invocation (avoid matching `cargo testing` etc.).
+    let next_char = after.chars().next();
+    if matches!(next_char, Some(c) if c.is_whitespace()) || next_char.is_none() {
+        Some(after.trim_start())
+    } else {
+        None
+    }
+}
+
+/// A token qualifies as a test-fn ident when it starts with a letter
+/// or underscore and only contains alphanumeric / underscore characters.
+/// Filters out things like `0.6.1` (version numbers) and `--features`
+/// fragments that the flag-value skip might miss.
+fn is_valid_test_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// #812: validate that every `cargo test ...` invocation mentioned in
+/// a dispatch task body refers to a test fn that actually exists in
+/// the PR tree. Caller is `handle_delegate_task` in comms.rs.
+///
+/// Returns `Ok(())` when no cargo-test invocations are present
+/// (nothing to validate) OR every captured name maps to a known fn.
+/// Returns `Err` with a structured message carrying
+/// `test_name_not_found` + the missing names + the tree path checked.
+///
+/// Tree-resolution caller-side: the dispatch handler resolves the
+/// tree to walk (typically sender's bound worktree) and passes it in.
+/// If no tree is resolvable, the caller should fail-open (skip the
+/// check + warn-log) rather than calling this fn with a bogus path.
+pub fn validate_dispatch_test_names(body: &str, tree_dir: &Path) -> Result<(), String> {
+    let test_names = extract_test_invocations(body);
+    if test_names.is_empty() {
+        return Ok(());
+    }
+    let known = collect_fn_names_from_repo(tree_dir);
+    let missing: Vec<String> = test_names
+        .iter()
+        .filter(|n| !known.contains(n.as_str()) && !grep_fn_exists(tree_dir, n))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "#812 dispatch rejected (code=test_name_not_found): {} test name(s) \
+         not found in PR tree at {}: [{}] — verify with `cargo test --list` \
+         or check for typos / stale copy-paste from a prior dispatch",
+        missing.len(),
+        tree_dir.display(),
+        missing.join(", ")
+    ))
+}
+
+/// #812: resolve the tree path that `validate_dispatch_test_names` should
+/// walk for a given dispatch invocation. Resolution priority:
+///   1. sender's bound worktree (most reliable — lead drove the
+///      dispatch with the PR's tree visible)
+///   2. `<home>/worktrees/<target>/<branch>` if both are provided
+///      (recipient's pre-provisioned worktree)
+///   3. None → caller fails open (skip check + warn-log)
+///
+/// Returns `Some(path)` only when the resolved path carries a `src/`
+/// subdirectory (sanity guard against pointing at an unprovisioned
+/// dir). Daemon-managed worktrees always have `src/` once checked out.
+pub fn resolve_dispatch_tree(
+    home: &Path,
+    sender: &str,
+    target: Option<&str>,
+    branch: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    // (1) sender's bound worktree
+    if let Some(wt) = crate::binding::read(home, sender)
+        .and_then(|v| v["worktree"].as_str().map(std::path::PathBuf::from))
+    {
+        if wt.join("src").exists() {
+            return Some(wt);
+        }
+    }
+    // (2) recipient's daemon-managed worktree by convention path
+    if let (Some(target), Some(branch)) = (target, branch) {
+        let candidate = home.join("worktrees").join(target).join(branch);
+        if candidate.join("src").exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Verifier — run mechanical checks against git diff
 // ---------------------------------------------------------------------------
@@ -521,14 +719,21 @@ fn check_fn_exists(repo_dir: &Path, fn_names: &[String]) -> ClaimResult {
     }
 }
 
-/// Walk all .rs files under repo_dir/src/ and extract fn names via syn AST.
+/// Walk all .rs files under repo_dir/{src,tests}/ and extract fn names
+/// via syn AST. #812: extended to walk `tests/` so integration-test
+/// names are discoverable by the dispatch-time validator (the
+/// reviewer's `cargo test --test ...` invocations target this dir).
 fn collect_fn_names_from_repo(repo_dir: &Path) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    let src_dir = repo_dir.join("src");
-    if !src_dir.exists() {
-        return names;
+    for sub in ["src", "tests"] {
+        let scan_dir = repo_dir.join(sub);
+        if scan_dir.exists() {
+            walk_dir_collecting_fn_names(&scan_dir, &mut names);
+        }
     }
-    fn walk_dir(dir: &Path, names: &mut std::collections::HashSet<String>) {
+    return names;
+
+    fn walk_dir_collecting_fn_names(dir: &Path, names: &mut std::collections::HashSet<String>) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -536,7 +741,7 @@ fn collect_fn_names_from_repo(repo_dir: &Path) -> std::collections::HashSet<Stri
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                walk_dir(&path, names);
+                walk_dir_collecting_fn_names(&path, names);
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     if let Ok(file) = syn::parse_file(&content) {
@@ -546,8 +751,6 @@ fn collect_fn_names_from_repo(repo_dir: &Path) -> std::collections::HashSet<Stri
             }
         }
     }
-    walk_dir(&src_dir, &mut names);
-    names
 }
 
 /// Extract fn names from a parsed syn File.
@@ -1182,5 +1385,185 @@ mod tests {
         assert!(r.results[0].detail.contains("missing_fn"));
         assert!(!r.results[0].detail.contains("exists_fn"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── #812 dispatch test-name validation — RED tests ──
+
+    #[test]
+    fn test_extract_test_invocations_picks_up_module_path() {
+        // RED: pre-C2 stub returns Vec::new(); post-C2 captures the
+        // trailing `::test_name` segment from a `cargo test ... <path>`
+        // invocation. Module-path forms are the dominant dispatch
+        // shape ("tasks::tests::test_force_update").
+        let body =
+            "Run: cargo test --bin agend-terminal tasks::tests::test_force_update_with_reason";
+        let names = extract_test_invocations(body);
+        assert_eq!(
+            names,
+            vec!["test_force_update_with_reason".to_string()],
+            "extractor must capture trailing :: segment, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_handles_multiple_lines() {
+        // RED: dispatch task bodies often run multiple cargo-test
+        // invocations across separate lines. Extractor must
+        // de-dup AND preserve all distinct names.
+        let body = "\
+            First run cargo test --bin agend-terminal tasks::tests::test_alpha
+            Then run cargo test --bin agend-terminal worktree_pool::tests::test_beta
+            Optionally cargo test --bin agend-terminal tasks::tests::test_alpha
+        ";
+        let mut names = extract_test_invocations(body);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["test_alpha".to_string(), "test_beta".to_string()],
+            "extractor must deduplicate and capture multi-line invocations, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_skips_non_cargo_test_text() {
+        // RED + false-positive guard: a body that mentions test names
+        // in prose but never invokes `cargo test` must NOT trigger
+        // extraction (otherwise spike-report quotes would pollute).
+        let body = "\
+            The reviewer should run tests, but I haven't written the
+            cargo invocation yet. See module tasks::tests for the
+            existing patterns (e.g. test_already_exists).
+        ";
+        let names = extract_test_invocations(body);
+        assert!(
+            names.is_empty(),
+            "prose without `cargo test ...` invocation must surface zero names, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_ignores_flags_and_features() {
+        // RED: real dispatch commonly carries `--features tray`,
+        // `--bin agend-terminal`, `--no-fail-fast`, etc. before the
+        // test name. Extractor must skip flag tokens and capture
+        // only the positional test path.
+        let body = "cargo test --features tray --bin agend-terminal --no-fail-fast tasks::tests::test_force_update_with_reason";
+        let names = extract_test_invocations(body);
+        assert_eq!(
+            names,
+            vec!["test_force_update_with_reason".to_string()],
+            "extractor must skip --flag tokens, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_test_invocations_respects_code_fences() {
+        // RED + false-positive guard: dispatch task bodies frequently
+        // include ```bash code blocks with `cargo test ...` examples.
+        // Markdown code fences carry illustrative text, NOT a literal
+        // dispatch invocation — extractor must skip fenced content
+        // so quoted examples don't trigger spurious rejection.
+        let body = "\
+            See the dispatch example below:
+            ```bash
+            cargo test --bin agend-terminal tasks::tests::test_quoted_example
+            ```
+            Actual invocation: cargo test --bin agend-terminal tasks::tests::test_real
+        ";
+        let names = extract_test_invocations(body);
+        assert_eq!(
+            names,
+            vec!["test_real".to_string()],
+            "extractor must skip code-fenced examples, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_validator_rejects_missing_test_name() {
+        // RED: pre-C3 there is no validator hook in handle_delegate_task,
+        // so a dispatch carrying a hallucinated test name reaches the
+        // recipient with no rejection. Post-C3 the validator runs
+        // dispatch-time, catches the missing name against the PR
+        // tree, and returns an error JSON with code=test_name_not_found.
+        //
+        // This test invokes the validator helper directly (not the
+        // full MCP send path) — the integration test in C3 covers
+        // the end-to-end. Helper signature (post-C3): pub fn
+        // validate_dispatch_test_names(body, tree_dir) -> Result<(), String>.
+        let dir = setup_git_repo("dispatch_validator_red");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[cfg(test)] mod tests { #[test] fn test_real_one() {} }",
+        )
+        .unwrap();
+        let body = "Run: cargo test --bin x tests::test_hallucinated_name";
+        let result = validate_dispatch_test_names(body, &dir);
+        let err = result.expect_err("missing test name must reject");
+        assert!(
+            err.contains("test_hallucinated_name"),
+            "error must name the missing test, got: {err}"
+        );
+        assert!(
+            err.contains("test_name_not_found"),
+            "error must carry the test_name_not_found code, got: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_dispatch_validator_accepts_existing_test() {
+        // GREEN: a dispatch naming a test fn that exists in the tree
+        // passes validation. Locks the happy-path contract — false
+        // positives would block legit reviewer dispatch.
+        let dir = setup_git_repo("dispatch_validator_accept");
+        let src = dir.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "#[cfg(test)] mod tests { #[test] fn test_force_update_with_reason() {} }",
+        )
+        .unwrap();
+        let body =
+            "Reviewer: run `cargo test --bin x tests::test_force_update_with_reason` at HEAD";
+        validate_dispatch_test_names(body, &dir).expect("existing test must pass validation");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_dispatch_validator_skips_when_no_cargo_test_in_body() {
+        // GREEN: a dispatch body without any `cargo test ...` invocation
+        // has nothing to validate — return Ok early so cheaper Phase 1
+        // spike-only dispatches don't pay the syn AST walk cost.
+        let dir = setup_git_repo("dispatch_validator_noop");
+        // Note: `src/` not even seeded — would fail walk if reached.
+        let body = "Phase 1 SPIKE: read-only investigation, no test invocations.";
+        validate_dispatch_test_names(body, &dir)
+            .expect("body without cargo-test invocation must pass (no-op)");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_resolve_dispatch_tree_falls_open_when_unbound() {
+        // GREEN: resolve_dispatch_tree returns None when neither
+        // sender's binding nor recipient's daemon worktree exists.
+        // Caller (comms.rs) reads None as "fail-open + warn-log".
+        let home = std::env::temp_dir().join(format!(
+            "agend-812-resolve-fail-open-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let result = resolve_dispatch_tree(
+            &home,
+            "sender-not-bound",
+            Some("target-not-bound"),
+            Some("nonexistent-branch"),
+        );
+        assert!(
+            result.is_none(),
+            "unresolvable tree must return None for fail-open path, got {result:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }
