@@ -139,9 +139,15 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
             );
             continue;
         }
-        let command = inst_val
-            .get("command")
-            .or_else(|| inst_val.get("backend"))
+        // #787: read `backend:` only — DO NOT fall back to `command:`.
+        // The pre-fix fallback let a template's `command:` value (e.g. a
+        // wrapper-script path) overwrite the durable `backend:` label
+        // field at write time below, conflating the spawn-time
+        // invocation path with the categorical preset label. The
+        // `template_command` passthrough below separately captures the
+        // `command:` value into its own YAML field.
+        let backend_label = inst_val
+            .get("backend")
             .and_then(|v| v.as_str())
             .unwrap_or("claude");
         // Accept `role:` (preferred) and `description:` (alias, mirrors
@@ -257,7 +263,7 @@ pub fn deploy(home: &Path, instance_name: &str, args: &Value) -> Value {
         yaml_entries.push((
             inst_name.clone(),
             crate::fleet::InstanceYamlEntry {
-                backend: Some(command.to_string()),
+                backend: Some(backend_label.to_string()),
                 working_directory: Some(work_dir),
                 role,
                 instructions,
@@ -1954,5 +1960,140 @@ instances: {}
 
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&custom_root).ok();
+    }
+
+    // ── #787: deploy backend/command field conflation ─────────────────
+
+    /// #787 §3.10 anchor — a template declaring BOTH `backend:` and
+    /// `command:` must preserve each field independently on deploy.
+    /// Pre-fix, the local `command` variable at deployments.rs:142
+    /// fell back to `inst_val.get("backend")` and then got written to
+    /// `InstanceYamlEntry.backend` at line 260, so the `command:` path
+    /// silently overwrote the `backend:` label.
+    ///
+    /// RED on §3.10 RED: assertion fails because `backend` is
+    /// "/tmp/fake-proxy" (the command path) instead of "claude".
+    /// GREEN once the local `command` resolution is renamed to
+    /// `backend_label` and reads only the `backend:` key.
+    #[test]
+    fn deploy_template_with_backend_and_command_preserves_both_fields() {
+        let home = tmp_home("backend_command_split");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: claude
+        command: /tmp/fake-proxy
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+        let args = serde_json::json!({
+            "template": "dev",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("reload fleet.yaml");
+        let lead = reloaded
+            .instances
+            .get("dev-lead")
+            .expect("dev-lead must be persisted");
+
+        assert_eq!(
+            lead.backend.as_ref().map(|b| b.as_str()),
+            Some("claude"),
+            "backend field must hold the label, not the command path"
+        );
+        assert_eq!(
+            lead.command.as_deref(),
+            Some("/tmp/fake-proxy"),
+            "command field must preserve the custom invocation path"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #787 back-compat invariant — a template with only `backend:`
+    /// (no `command:`) is the common case and must continue to write
+    /// the user-supplied backend label verbatim. Pins the post-fix
+    /// behavior so the rename refactor doesn't accidentally regress
+    /// the normal path.
+    #[test]
+    fn deploy_template_with_only_backend_persists_backend_label() {
+        let home = tmp_home("only_backend");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        backend: kiro-cli
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+        let args = serde_json::json!({
+            "template": "dev",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("reload fleet.yaml");
+        let lead = reloaded
+            .instances
+            .get("dev-lead")
+            .expect("dev-lead must be persisted");
+
+        assert_eq!(lead.backend.as_ref().map(|b| b.as_str()), Some("kiro-cli"));
+        assert!(
+            lead.command.is_none(),
+            "no `command:` in template ⇒ `command` field must be None"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #787 — a template with ONLY `command:` (no explicit `backend:`)
+    /// must NOT smuggle the command path into the backend field. After
+    /// the fix, backend falls back to the "claude" default (which is
+    /// the same default rustup-init users get from `fleet new`); the
+    /// custom invocation lives in the `command:` field only.
+    ///
+    /// This pins the behavior-change called out in the decision spec:
+    /// pre-fix `backend: <command-path>`, post-fix `backend: "claude"`.
+    #[test]
+    fn deploy_template_with_only_command_defaults_backend_to_claude() {
+        let home = tmp_home("only_command");
+        let yaml = r#"
+templates:
+  dev:
+    instances:
+      lead:
+        command: /tmp/fake-proxy
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+
+        let args = serde_json::json!({
+            "template": "dev",
+            "directory": home.display().to_string(),
+        });
+        let _ = deploy(&home, "caller", &args);
+
+        let reloaded = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+            .expect("reload fleet.yaml");
+        let lead = reloaded
+            .instances
+            .get("dev-lead")
+            .expect("dev-lead must be persisted");
+
+        assert_eq!(
+            lead.backend.as_ref().map(|b| b.as_str()),
+            Some("claude"),
+            "no explicit backend ⇒ default to claude (label); command path must NOT smuggle into backend"
+        );
+        assert_eq!(lead.command.as_deref(), Some("/tmp/fake-proxy"));
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
