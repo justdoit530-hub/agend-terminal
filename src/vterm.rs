@@ -231,6 +231,20 @@ impl VTerm {
                     .get(idx)
                     .unwrap_or_else(|| DEFAULT_CELL.get_or_init(Cell::default));
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    // Defensive: the WIDE_CHAR branch below skips col+1
+                    // by advancing `col += 2`, so this arm is normally
+                    // unreachable when iterating from a WIDE_CHAR's
+                    // sibling position. Kept as a guard for
+                    // partial-render edge cases (e.g. col 0 starts on
+                    // a SPACER because the WIDE_CHAR fell off the left
+                    // edge during a resize).
+                    let x = area.x + col;
+                    let y = area.y + row;
+                    if x < buf.area().x + buf.area().width && y < buf.area().y + buf.area().height {
+                        let style = cell_to_ratatui_style(cell.fg, cell.bg, cell.flags);
+                        let buf_cell = &mut buf[(x, y)];
+                        buf_cell.set_char(' ').set_style(style);
+                    }
                     col += 1;
                     continue;
                 }
@@ -245,6 +259,22 @@ impl VTerm {
                 let buf_cell = &mut buf[(x, y)];
                 buf_cell.set_char(ch).set_style(style);
                 if cell.flags.contains(Flags::WIDE_CHAR) {
+                    // #819: when writing a wide char at (x, y), the
+                    // adjacent cell at (x+1, y) is the WIDE_CHAR_SPACER
+                    // position. The outer loop `col += 2` skips it
+                    // entirely, so without an explicit blank-write here
+                    // the staging buffer retains the previous frame's
+                    // char at (x+1, y) — root cause of the "scattered
+                    // chars" operator observation (fixup-lead's CJK
+                    // prompt). Mirror the style from the wide char so
+                    // background continuity is preserved.
+                    let spacer_x = x + 1;
+                    if spacer_x < buf.area().x + buf.area().width
+                        && y < buf.area().y + buf.area().height
+                    {
+                        let spacer_cell = &mut buf[(spacer_x, y)];
+                        spacer_cell.set_char(' ').set_style(style);
+                    }
                     col += 2;
                 } else {
                     col += 1;
@@ -1146,5 +1176,139 @@ mod tests {
         vt.process(b"plain text \x1b[31mred\x1b[0m");
         assert!(!vt.wants_mouse());
         assert!(!vt.mouse_sgr());
+    }
+
+    // ── #819 WIDE_CHAR_SPACER stale-char bug ──
+
+    #[test]
+    fn test_wide_char_spacer_clears_stale_buf_cell() {
+        // #819 RED test: at Site 1 (`render_to_buffer_inner`), the
+        // WIDE_CHAR_SPACER `continue` skips writing buf[(x, y)]. The
+        // ratatui Buffer is stateful across frames — previous frame's
+        // content at the spacer position survives. This test
+        // pre-poisons the spacer cell with a sentinel char, then
+        // renders. Pre-fix: sentinel survives (BUG). Post-fix:
+        // sentinel replaced with blank (SUT writes the spacer cell).
+        let mut vt = VTerm::new(10, 1);
+        // A CJK char has display width 2 — alacritty marks col 0 as
+        // WIDE_CHAR and col 1 as WIDE_CHAR_SPACER.
+        vt.process("中".as_bytes());
+        let area = ratatui::layout::Rect::new(0, 0, 10, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        // Pre-poison col=1 (the SPACER position) with a stale sentinel
+        // simulating a previous frame's char at that position.
+        buf[(1, 0)].set_char('X');
+        // Render the current frame.
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        // SPACER position must be blanked, NOT carry the previous
+        // frame's 'X'. This is the #819 fix's invariant.
+        assert_eq!(
+            buf[(1, 0)].symbol(),
+            " ",
+            "WIDE_CHAR_SPACER position must be blanked, got: {:?}",
+            buf[(1, 0)].symbol()
+        );
+    }
+
+    #[test]
+    fn test_wide_char_spacer_preserves_wide_char_at_col_minus_one() {
+        // #819 adjacency lock: clearing the SPACER cell at (x+1, y)
+        // must NOT clobber the WIDE_CHAR cell at (x, y). Test
+        // pre-poisons NEITHER position; renders; asserts the wide
+        // char is intact at col 0 + the spacer position is blank at
+        // col 1. Without this lock a refactor that swapped the order
+        // (clearing spacer BEFORE writing wide char) would silently
+        // overwrite the wide char.
+        let mut vt = VTerm::new(10, 1);
+        vt.process("中".as_bytes());
+        let area = ratatui::layout::Rect::new(0, 0, 10, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        vt.render_to_buffer(&mut buf, area, 0, false);
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            "中",
+            "wide char must be at col 0, got: {:?}",
+            buf[(0, 0)].symbol()
+        );
+        assert_eq!(
+            buf[(1, 0)].symbol(),
+            " ",
+            "spacer position at col 1 must be blank, got: {:?}",
+            buf[(1, 0)].symbol()
+        );
+    }
+
+    #[test]
+    fn test_text_construction_paths_still_skip_spacers() {
+        // #819 regression-proof for sites 2-5 (lines 331/365/415/492).
+        // These are text/ANSI construction paths — they build fresh
+        // String/Vec<u8> per call and their WIDE_CHAR_SPACER `continue`
+        // is the CORRECT behavior (avoids inserting a placeholder space
+        // into text representations consumers expect to be
+        // WIDE_CHAR-collapsed). Locks the contract that the #819 fix
+        // ONLY touched Site 1 (ratatui rendering); sites 2-5 unchanged.
+        //
+        // If a future refactor "extrapolates" the Site 1 fix to all 5
+        // sites, the asserts below will fail (text output will gain
+        // spurious spaces after wide chars), making the regression
+        // visible. Per general's directive on the #819 dispatch.
+        let mut vt = VTerm::new(20, 2);
+        // Input: wide char + plain char + newline + plain text.
+        // Expected text shape: "中A" (no space between 中 and A —
+        // the wide char's SPACER position must NOT contribute to text).
+        vt.process("中A\r\nB".as_bytes());
+
+        // Site 4 (line 445) — tail_lines() (visible-rows text builder)
+        let tail_text = vt.tail_lines(5);
+        assert!(
+            tail_text.contains("中A"),
+            "tail_lines() must NOT insert space between wide char and next char, got: {tail_text:?}"
+        );
+        assert!(
+            !tail_text.contains("中 A"),
+            "tail_lines() must NOT insert SPACER as space, got: {tail_text:?}"
+        );
+
+        // Site 3 (line 395) — read_scrollback() (scrollback + visible)
+        let scrollback = vt.read_scrollback(10);
+        assert!(
+            scrollback.contains("中A"),
+            "read_scrollback() must NOT insert SPACER as space, got: {scrollback:?}"
+        );
+        assert!(
+            !scrollback.contains("中 A"),
+            "read_scrollback() leaked SPACER as space, got: {scrollback:?}"
+        );
+
+        // Site 2 (line 361) — extract_text() (selection text)
+        let selected = vt.extract_text((0, 0), (0, 5), 0);
+        assert!(
+            selected.contains("中A"),
+            "extract_text() must NOT insert SPACER as space, got: {selected:?}"
+        );
+        assert!(
+            !selected.contains("中 A"),
+            "extract_text() leaked SPACER as space, got: {selected:?}"
+        );
+
+        // Site 5 (line 522) — dump_screen() (ANSI escape sequence builder).
+        // ANSI codes interleave between cells, so we don't assert
+        // verbatim "中A" sequence — instead verify the SPACER never
+        // contributes a literal space between the wide char and the
+        // following char (the actual regression we're proofing).
+        let ansi = vt.dump_screen();
+        let ansi_str = String::from_utf8_lossy(&ansi);
+        assert!(
+            ansi_str.contains("中"),
+            "dump_screen() must emit the wide char, got: {ansi_str:?}"
+        );
+        assert!(
+            ansi_str.contains('A'),
+            "dump_screen() must emit the following char, got: {ansi_str:?}"
+        );
+        assert!(
+            !ansi_str.contains("中 A"),
+            "dump_screen() leaked SPACER as literal space, got: {ansi_str:?}"
+        );
     }
 }
