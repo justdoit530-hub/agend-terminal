@@ -156,14 +156,21 @@ fn proxy_tools_list(
 /// first attempt's transport failure is therefore not surfaced — the
 /// connection is dropped, reopened, and the request retried exactly once.
 /// A second failure propagates so genuine errors are not masked.
+///
+/// #842: a UUIDv4 `request_id` is injected into the envelope before the
+/// first attempt and **reused verbatim** on the retry — the retry IS the
+/// same logical request, just re-transported. The daemon dedups on
+/// `request_id` so a successful original execution whose response never
+/// reached us isn't replayed as a fresh side-effect call.
 fn proxy_request(
     home: &Path,
     conn: &mut Option<(BufReader<TcpStream>, TcpStream)>,
     envelope: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let envelope_with_id = envelope_with_request_id(envelope);
     let mut last_err: Option<Box<dyn std::error::Error>> = None;
     for attempt in 0..2 {
-        match try_proxy_once(home, conn, envelope) {
+        match try_proxy_once(home, conn, &envelope_with_id) {
             Ok(v) => return Ok(v),
             Err(e) if attempt == 0 && is_retriable_io(&*e) => {
                 *conn = None;
@@ -174,6 +181,28 @@ fn proxy_request(
         }
     }
     Err(last_err.unwrap_or_else(|| "proxy retry exhausted".into()))
+}
+
+/// Clone `envelope` with a freshly-minted `request_id` (UUIDv4) iff the
+/// caller didn't already set one. The whole point of the field is for
+/// the daemon to recognize the retry — generated once, sent twice on
+/// the retry path is exactly the right shape.
+fn envelope_with_request_id(envelope: &serde_json::Value) -> serde_json::Value {
+    if envelope
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        return envelope.clone();
+    }
+    let mut cloned = envelope.clone();
+    if let Some(obj) = cloned.as_object_mut() {
+        obj.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(uuid::Uuid::new_v4().to_string()),
+        );
+    }
+    cloned
 }
 
 fn try_proxy_once(
@@ -347,4 +376,58 @@ fn extract_id(body: &str) -> String {
         .and_then(|v| v.get("id").cloned())
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #842: `proxy_request` must inject `request_id` exactly once and
+    /// reuse it across the (up-to-2) transport attempts. The retry IS
+    /// the same logical request, just re-transported — without a stable
+    /// id the daemon can't recognize it.
+    #[test]
+    fn envelope_with_request_id_injects_when_missing() {
+        let envelope = serde_json::json!({
+            "method": "send",
+            "params": {"target": "agent-a", "text": "hello"}
+        });
+        let with_id = envelope_with_request_id(&envelope);
+        let id = with_id
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .expect("request_id must be injected when missing");
+
+        // UUIDv4 string form is 36 chars with the canonical layout.
+        assert_eq!(id.len(), 36, "UUIDv4 string length");
+        assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
+
+        // Other fields must be preserved verbatim.
+        assert_eq!(with_id["method"], "send");
+        assert_eq!(with_id["params"]["target"], "agent-a");
+    }
+
+    /// Pre-supplied `request_id` must be preserved as-is. Callers that
+    /// already manage idempotency keys (e.g. test harnesses) win.
+    #[test]
+    fn envelope_with_request_id_preserves_caller_value() {
+        let envelope = serde_json::json!({
+            "method": "send",
+            "params": {"target": "agent-b"},
+            "request_id": "caller-supplied-deadbeef"
+        });
+        let with_id = envelope_with_request_id(&envelope);
+        assert_eq!(with_id["request_id"], "caller-supplied-deadbeef");
+    }
+
+    /// Repeated calls must mint distinct ids — each `proxy_request`
+    /// invocation is a separate logical request unless the caller
+    /// pinned a value. Guards against accidental id reuse.
+    #[test]
+    fn envelope_with_request_id_mints_distinct_ids_per_call() {
+        let envelope = serde_json::json!({"method": "list", "params": {}});
+        let a = envelope_with_request_id(&envelope);
+        let b = envelope_with_request_id(&envelope);
+        assert_ne!(a["request_id"], b["request_id"]);
+    }
 }
