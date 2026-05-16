@@ -44,6 +44,17 @@ pub enum AgentState {
     /// authorization flows take precedence when both match.
     InteractivePrompt,
     PermissionPrompt,
+    /// Phase A Piece-1: git rebase/merge/cherry-pick produced a
+    /// conflict that blocks further work until the agent resolves it
+    /// (or the operator intervenes). Distinct from `PermissionPrompt`
+    /// because the resolution path is Read/Edit/Bash inside the
+    /// worktree, not a yes/no dialog. The daemon's
+    /// `conflict_notify` module observes the transition into this
+    /// state and emits a structured kind=update message to the bound
+    /// agent (op type + conflicted file paths + branch + base +
+    /// next_steps hint), plus a 30min escalation to operator if the
+    /// state persists.
+    GitConflict,
     ContextFull,
     RateLimit,
     /// Anthropic server-side temporary throttle — distinct from user usage
@@ -83,6 +94,12 @@ impl AgentState {
             Self::Thinking => 6,
             Self::InteractivePrompt => 7,
             Self::PermissionPrompt => 8,
+            // Phase A Piece-1: GitConflict shares priority 8 with
+            // PermissionPrompt — both block work and require external
+            // intervention (agent action for the conflict; operator
+            // for the permission). Priority is for display ordering;
+            // first-match wins in `detect()` is the actual gate.
+            Self::GitConflict => 8,
             Self::ContextFull => 9,
             Self::RateLimit => 10,
             Self::ServerRateLimit => 10,
@@ -123,6 +140,7 @@ impl AgentState {
             Self::Thinking => "thinking",
             Self::InteractivePrompt => "interactive_prompt",
             Self::PermissionPrompt => "permission",
+            Self::GitConflict => "git_conflict",
             Self::ContextFull => "context_full",
             Self::RateLimit => "rate_limit",
             Self::ServerRateLimit => "server_rate_limit",
@@ -240,6 +258,15 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Esc to cancel · Tab to amend|Do you want to |allow all edits during this session|Allow once|Allow always|approve",
                 ),
+                // Phase A Piece-1: git rebase/merge/cherry-pick conflict
+                // output is identical regardless of which CLI invoked git,
+                // so the same regex installs in every backend's pattern
+                // list. The 5 alternations cover the canonical conflict
+                // markers `git` emits to stdout/stderr.
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+                ),
                 // [estimated] Ink render during processing
                 // [measured] Claude spinner uses random verbs (Cogitating,
                 // Bloviating, Transmuting, etc.) — not "Thinking". The
@@ -302,6 +329,11 @@ impl StatePatterns {
                 ),
                 // [docs] Trust-based permission system
                 (AgentState::PermissionPrompt, r"Allow this action|y/n/t"),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+                ),
                 // [measured] Kiro 2.0.1 renders tool banners as
                 // `● Read .`, `● Write <path>`, etc. — `●` (U+25CF BLACK
                 // CIRCLE) + space + capitalized tool verb. Observed in
@@ -376,6 +408,11 @@ impl StatePatterns {
                     AgentState::PermissionPrompt,
                     r"Would you like to run the following command\?|Yes, proceed|No, and tell Codex|Press enter to confirm or esc to cancel|Request approval|approve|deny",
                 ),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
+                ),
                 // [measured] Codex 0.120.0 renders tool-call blocks as a
                 // two-line region — a `•` title line (`• Explored`,
                 // `• Edited`, `• Ran`) followed by a `└` continuation
@@ -437,6 +474,11 @@ impl StatePatterns {
                 (
                     AgentState::PermissionPrompt,
                     r"Permission required|Allow once|Allow always",
+                ),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
                 // [measured] OpenCode 1.4.0 prefixes tool banners with
                 // `✱` (U+2731 HEAVY ASTERISK, in-flight) or `→` (U+2192,
@@ -500,6 +542,11 @@ impl StatePatterns {
                 (
                     AgentState::PermissionPrompt,
                     r"Allow once|Allow for this session|suggest changes",
+                ),
+                // Phase A Piece-1: git conflict output (backend-independent).
+                (
+                    AgentState::GitConflict,
+                    r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
                 ),
                 // [measured] Gemini 0.38.2 renders completed tool calls as
                 // `✓  ReadFile  Cargo.toml` — `✓` (U+2713 CHECK MARK) + a
@@ -2568,6 +2615,7 @@ mod tests {
             "thinking" => AgentState::Thinking,
             "interactive_prompt" => AgentState::InteractivePrompt,
             "permission" => AgentState::PermissionPrompt,
+            "git_conflict" => AgentState::GitConflict,
             "context_full" => AgentState::ContextFull,
             "rate_limit" => AgentState::RateLimit,
             "server_rate_limit" => AgentState::ServerRateLimit,
