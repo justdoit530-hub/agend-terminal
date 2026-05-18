@@ -146,7 +146,15 @@ fn start_daemon_via_cli() {
             return;
         }
     };
-    let result = std::process::Command::new(&exe).arg("start").spawn();
+    // P0 hotfix 2026-05-18 (followup to 800f1cc): same --foreground fork-bomb
+    // rule applies here. Without it, the child re-enters main.rs Start arm's
+    // default-detach branch and recurses via spawn_detached. tray-feature-only
+    // build path, which is why operator's earlier observation was that fork
+    // bomb only triggered with `--features tray`. Same RCA as #887.
+    let result = std::process::Command::new(&exe)
+        .arg("start")
+        .arg("--foreground")
+        .spawn();
     match result {
         Ok(_child) => {
             tracing::info!(
