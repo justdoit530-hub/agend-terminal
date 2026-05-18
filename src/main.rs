@@ -73,7 +73,6 @@ mod worktree_cleanup;
 #[allow(dead_code)]
 mod worktree_pool;
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -251,14 +250,8 @@ enum Commands {
         #[arg(last = true)]
         extra_args: Vec<String>,
     },
-    /// Launch terminal TUI — multi-tab/pane interface with agent management.
-    ///
-    /// #879v3 C4: renamed from `app` to clarify the multi-pane TUI direction
-    /// (and to make room for the tray-as-future-primary framing). `app`
-    /// remains as a visible alias for one deprecation cycle; invoking it
-    /// emits a one-time stderr nudge.
-    #[command(visible_alias = "app")]
-    Tui {
+    /// Launch terminal app — multi-tab/pane TUI with agent management
+    App {
         /// Path to fleet.yaml (default: $AGEND_HOME/fleet.yaml)
         #[arg(long)]
         fleet: Option<String>,
@@ -474,10 +467,10 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // TUI mode redirects tracing to a log file (stderr is owned by ratatui).
+    // App mode redirects tracing to a log file (stderr is owned by ratatui).
     // All other commands use stderr.
-    let is_tui = matches!(cli.command, Some(Commands::Tui { .. }));
-    if !is_tui {
+    let is_app = matches!(cli.command, Some(Commands::App { .. }));
+    if !is_app {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_env("AGEND_LOG")
@@ -497,17 +490,7 @@ fn main() -> anyhow::Result<()> {
             Cli::command().print_help()?;
             println!();
         }
-        Some(Commands::Tui { fleet }) => {
-            // #879v3 C4: deprecation nudge when invoked via the `app` alias.
-            // `std::env::args` reads the raw argv so we can distinguish
-            // `agend-terminal tui ...` from `agend-terminal app ...` even
-            // after clap normalizes them to the same `Commands::Tui` variant.
-            if std::env::args().nth(1).as_deref() == Some("app") {
-                eprintln!(
-                    "agend-terminal: `app` is a deprecated alias for `tui`; \
-                     please switch — the alias will be removed in a future release."
-                );
-            }
+        Some(Commands::App { fleet }) => {
             app::run(fleet.as_deref())?;
         }
         Some(Commands::Start {
@@ -515,13 +498,6 @@ fn main() -> anyhow::Result<()> {
             fleet,
             agents,
         }) => {
-            // #879v3 C2.5: fork-bomb guard. If we entered the Start arm with
-            // AGEND_SPAWN_DEPTH already at threshold, this is the recursive-
-            // self-spawn signature (the #882 fork-bomb shape). Bail visibly
-            // before allocating any further OS resources. Foreground mode
-            // (the daemon-itself layer) is INCLUDED in the check — running
-            // a daemon at depth >= 2 is also the wrong shape.
-            bootstrap::spawn_depth::check().context("AGEND_SPAWN_DEPTH guard")?;
             // Sprint 57 Wave 3 PR-2 (#548 Q1): default-flip to detached
             // service mode. `--foreground` is the new opt-out flag.
             // `--agents` always implies foreground (no fleet.yaml path
@@ -673,49 +649,28 @@ fn main() -> anyhow::Result<()> {
             // even when the daemon API is briefly unresponsive (the
             // historical reason `list` and `status` were two commands).
             let want_detailed = detailed || json;
-            // #879v3 safeguard 3+7: surface AGEND_SPAWN_DEPTH guard fires so
-            // operators can grep `agend-terminal status --json | jq .agend_spawn_depth_guard_fires`
-            // during the 24-48hr soak. Any non-zero value triggers the
-            // documented revert criterion. The counter reads from the
-            // calling process — same-process visibility is sufficient
-            // because guard fires only happen at spawn sites, which all
-            // call into this binary.
-            let guard_fires = crate::bootstrap::spawn_depth::fire_count();
             if want_detailed {
                 match api::call(&home, &serde_json::json!({"method": api::method::LIST})) {
                     Ok(resp) => {
                         if json {
-                            // Surface guard_fires alongside the daemon's response so a
-                            // single `status --json` invocation captures everything an
-                            // operator needs for soak monitoring.
-                            let mut payload = resp["result"].clone();
-                            if let Some(obj) = payload.as_object_mut() {
-                                obj.insert(
-                                    "agend_spawn_depth_guard_fires".to_string(),
-                                    serde_json::Value::from(guard_fires),
-                                );
-                            }
                             println!(
                                 "{}",
-                                serde_json::to_string_pretty(&payload).unwrap_or_default()
+                                serde_json::to_string_pretty(&resp["result"]).unwrap_or_default()
                             );
-                        } else {
-                            if let Some(agents) = resp["result"]["agents"].as_array() {
-                                if agents.is_empty() {
-                                    println!("No agents running.");
-                                } else {
-                                    for a in agents {
-                                        println!(
-                                            "  {}: state={} health={} cmd={}",
-                                            a["name"].as_str().unwrap_or("?"),
-                                            a["agent_state"].as_str().unwrap_or("?"),
-                                            a["health_state"].as_str().unwrap_or("?"),
-                                            a["backend"].as_str().unwrap_or("?")
-                                        );
-                                    }
+                        } else if let Some(agents) = resp["result"]["agents"].as_array() {
+                            if agents.is_empty() {
+                                println!("No agents running.");
+                            } else {
+                                for a in agents {
+                                    println!(
+                                        "  {}: state={} health={} cmd={}",
+                                        a["name"].as_str().unwrap_or("?"),
+                                        a["agent_state"].as_str().unwrap_or("?"),
+                                        a["health_state"].as_str().unwrap_or("?"),
+                                        a["backend"].as_str().unwrap_or("?")
+                                    );
                                 }
                             }
-                            println!("AGEND_SPAWN_DEPTH guard fires: {guard_fires}");
                         }
                     }
                     Err(_) => daemon_not_running_hint(),
@@ -732,13 +687,8 @@ fn main() -> anyhow::Result<()> {
                 for a in &agents {
                     println!("  {a}");
                 }
-                // #879v3 safeguard 3+7: surface guard fires on the plain
-                // list output too — same soak-monitor signal regardless
-                // of which output shape the operator chose.
-                println!("AGEND_SPAWN_DEPTH guard fires: {guard_fires}");
             } else {
                 println!("No running daemon found.");
-                println!("AGEND_SPAWN_DEPTH guard fires: {guard_fires}");
             }
         }
         Some(Commands::Kill { name }) => {
