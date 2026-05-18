@@ -481,7 +481,22 @@ fn run_core(
     tracing::info!(count = agents.len(), "starting agents");
 
     for def in &agents {
-        spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)?;
+        // #896 Option D: spawn_and_register_agent now rolls back on
+        // synchronous TUI prep failure and returns Err. We log + skip
+        // the affected agent rather than aborting the entire daemon
+        // startup — operator sees `agend-terminal list` shorter than
+        // fleet.yaml expected + daemon log explains which agent failed
+        // and why. Daemon-as-a-whole stays up so the surviving agents
+        // are still usable while the operator investigates.
+        if let Err(e) =
+            spawn_and_register_agent(home, def, &registry, &configs, &crash_tx, &shutdown)
+        {
+            tracing::error!(
+                agent = %def.0,
+                error = %e,
+                "spawn_and_register_agent rolled back; agent NOT in fleet"
+            );
+        }
         if agents.len() > 1 {
             std::thread::sleep(spawn_stagger());
         }
@@ -1344,19 +1359,45 @@ fn spawn_and_register_agent(
     }
 
     let rdir = run_dir(home);
+    // #896 Option D: synchronous TUI listener prep BEFORE returning Ok.
+    // Pre-#896 this whole step happened inside the fire-and-forget
+    // accept-loop thread, so `spawn_and_register_agent` could return
+    // Ok while `.port` hadn't landed on disk yet. App-attach during
+    // the spawn loop's stagger window saw "no agents are reachable".
+    // Now we bind + write_port on the caller thread; only after the
+    // port file exists do we hand the listener to the async accept
+    // loop. On prep failure: rollback via `delete_transaction` (kill
+    // child, drop registry entry, clean configs, remove residual
+    // port file) and propagate Err.
+    let meta = match tui_bridge::prepare_tui_listener_and_publish_port(name, &rdir) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(
+                agent = %name,
+                error = %e,
+                "TUI listener prep failed — rolling back agent registration"
+            );
+            lifecycle::delete_transaction(home, name, registry, Some(configs));
+            return Err(anyhow::Error::from(e));
+        }
+    };
+
     let reg = Arc::clone(registry);
     let n = name.clone();
-    // fire-and-forget: serve_agent_tui blocks on UnixListener::accept and
-    // exits when the agent is removed from the registry. JoinHandle is
-    // discarded because shutdown is signalled implicitly by socket-file
-    // removal in delete_transaction.
+    // fire-and-forget: serve_tui_accept_loop blocks on TcpListener::accept
+    // and exits when the agent is removed from the registry. JoinHandle
+    // is discarded because shutdown is signalled implicitly by socket-
+    // file removal in `delete_transaction`.
     if let Err(e) = std::thread::Builder::new()
         .name(format!("{n}_tui_server"))
-        .spawn(move || serve_agent_tui(&n, &rdir, &reg))
+        .spawn(move || tui_bridge::serve_tui_accept_loop(&n, meta, &reg))
     {
-        // Sprint 20 F5 fix: previously a TUI server spawn failure left the
-        // agent registered + child running but with no attachable socket.
-        // Roll back the agent we just spawned so retries start clean.
+        // Sprint 20 F5 fix (preserved): a TUI server spawn failure
+        // would otherwise leave the agent registered + child running
+        // but with no accepting socket. Roll back so retries start
+        // clean. #896 update: prep step already wrote `.port`, so the
+        // rollback now also clears that residual via
+        // `delete_transaction`'s port cleanup.
         tracing::warn!(
             agent = %name,
             error = %e,
@@ -1925,5 +1966,171 @@ mod tests {
             std::time::Duration::from_secs(2),
             "Wave 3 PR-2 contract: grace = 2s exactly"
         );
+    }
+
+    // --- #896 Option D anchor (C0 RED) ---
+    //
+    // Locks the boot-time invariant Option D establishes:
+    // `spawn_and_register_agent` MUST publish the agent's `.port`
+    // synchronously before returning Ok. Pre-fix the TUI thread does
+    // the bind+write_port asynchronously after the function returns,
+    // so app probes between agent spawns see an empty / partial
+    // `*.port` set (issue #896, race-class regression widened by
+    // PR #906 daemon api::serve reorder).
+    //
+    // The "no sleep, no retry" wording is the contract — the assertion
+    // is the postcondition at return. Race timing is reviewer-confirmed
+    // via §3.20 SOP 3 (RED→GREEN protocol on three runs).
+
+    #[cfg(unix)]
+    fn make_shell_agent_def(name: &str) -> crate::bootstrap::AgentDef {
+        (
+            name.into(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "sleep 60".into()],
+            None,
+            None,
+            "\r".into(),
+        )
+    }
+
+    #[cfg(unix)]
+    fn setup_run_dir_with_cookie(home: &Path) -> PathBuf {
+        let run = home.join("run").join(std::process::id().to_string());
+        std::fs::create_dir_all(&run).expect("create run_dir");
+        crate::auth_cookie::issue(&run).expect("issue api.cookie");
+        run
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::type_complexity)] // test scaffolding tuple; struct would be over-engineering
+    fn make_test_registry() -> (
+        AgentRegistry,
+        Arc<Mutex<HashMap<String, AgentConfig>>>,
+        crossbeam_channel::Sender<crate::agent::AgentExitEvent>,
+        crossbeam_channel::Receiver<crate::agent::AgentExitEvent>,
+        Arc<AtomicBool>,
+    ) {
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let configs: Arc<Mutex<HashMap<String, AgentConfig>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (crash_tx, crash_rx) = crossbeam_channel::unbounded();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        (registry, configs, crash_tx, crash_rx, shutdown)
+    }
+
+    #[cfg(unix)]
+    fn kill_registered_child(registry: &AgentRegistry, name: &str) {
+        let reg = registry.lock();
+        if let Some(handle) = reg.get(name) {
+            let _ = handle.child.lock().kill();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_and_register_agent_publishes_port_synchronously() {
+        let home = tmp_home("publish_sync");
+        let run_dir = setup_run_dir_with_cookie(&home);
+        let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
+        let def = make_shell_agent_def("probe-1");
+
+        spawn_and_register_agent(&home, &def, &registry, &configs, &crash_tx, &shutdown)
+            .expect("spawn ok");
+
+        // CONTRACT: the agent's .port is on disk BEFORE this assertion line.
+        // Pre-fix: TUI thread is async, .port may not be written yet (race).
+        // Post-fix: prepare_tui_listener_and_publish_port ran synchronously
+        // inside spawn_and_register_agent.
+        assert!(
+            crate::ipc::read_port(&run_dir, "probe-1").is_some(),
+            "spawn_and_register_agent must publish .port synchronously before return"
+        );
+
+        kill_registered_child(&registry, "probe-1");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_and_register_agent_rollback_on_listener_prep_failure() {
+        // Force prepare-listener failure by NOT issuing api.cookie in
+        // run_dir. `prepare_tui_listener_and_publish_port` reads the
+        // cookie first (so it can hand it to the accept loop); a missing
+        // cookie file is an Err on the synchronous prep path.
+        let home = tmp_home("rollback_prep");
+        let run = home.join("run").join(std::process::id().to_string());
+        std::fs::create_dir_all(&run).expect("create run_dir");
+        // Deliberately skip `auth_cookie::issue` — prep should fail at
+        // cookie read.
+        let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
+        let def = make_shell_agent_def("rollback-probe");
+
+        let result =
+            spawn_and_register_agent(&home, &def, &registry, &configs, &crash_tx, &shutdown);
+
+        // CONTRACT (Option D rollback):
+        // 1. spawn_and_register_agent returns Err — caller can decide whether
+        //    to continue or abort.
+        assert!(
+            result.is_err(),
+            "spawn_and_register_agent must return Err when TUI listener prep fails (got Ok)"
+        );
+        // 2. Registry MUST NOT contain the agent — caller sees a clean
+        //    rollback state, no zombie entries.
+        assert!(
+            registry.lock().get("rollback-probe").is_none(),
+            "registry must NOT contain 'rollback-probe' after rollback"
+        );
+        // 3. AgentConfig MUST NOT contain the agent — configs map mirrors
+        //    registry membership.
+        assert!(
+            configs.lock().get("rollback-probe").is_none(),
+            "configs must NOT contain 'rollback-probe' after rollback"
+        );
+        // 4. .port file MUST NOT be on disk — prep failed before write_port
+        //    or the rollback removed it.
+        assert!(
+            crate::ipc::read_port(&run, "rollback-probe").is_none(),
+            "rollback must leave no .port residue"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_attach_during_stagger_window_sees_all_agents() {
+        // Behavioral RED: simulates the operator's smoke — multiple agents
+        // spawned sequentially with stagger between them. Pre-fix, an "app
+        // attach" simulated by `ipc::list_agent_ports` mid-loop sees fewer
+        // entries than the loop has produced (TUI threads race). Post-fix,
+        // every iteration's port is on disk by the time the next iteration
+        // begins, so list_agent_ports == iteration_count holds at each step.
+        let home = tmp_home("attach_during_stagger");
+        let run_dir = setup_run_dir_with_cookie(&home);
+        let (registry, configs, crash_tx, _crash_rx, shutdown) = make_test_registry();
+
+        let agent_names = ["a-1", "a-2", "a-3", "a-4"];
+        for (i, name) in agent_names.iter().enumerate() {
+            let def = make_shell_agent_def(name);
+            spawn_and_register_agent(&home, &def, &registry, &configs, &crash_tx, &shutdown)
+                .expect("spawn ok");
+            // CONTRACT: every agent spawned so far has its .port on disk.
+            // Probe is what an `app` reattach would do.
+            let visible = crate::ipc::list_agent_ports(&run_dir);
+            for prior in &agent_names[..=i] {
+                assert!(
+                    visible.contains(&prior.to_string()),
+                    "after spawning {name} (iteration {i}), agent {prior} must have .port on \
+                     disk; got {visible:?}"
+                );
+            }
+        }
+
+        for name in &agent_names {
+            kill_registered_child(&registry, name);
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }
