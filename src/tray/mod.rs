@@ -139,6 +139,16 @@ fn check_daemon_state(home: &Path) -> StatusKind {
 /// immediately. Failures surface to stderr — the tray stays usable
 /// so the operator can retry / inspect / Quit.
 fn start_daemon_via_cli() {
+    // #548 Q7: tray shells out via `current_exe()`-resolved binary path
+    // to invoke `agend-terminal start`. The separation contract pinned by
+    // `tests/issue_548_phase2_invariants` — tray must NOT import the
+    // daemon-spawn module's helpers; it must build the Command itself and
+    // invoke `start` via CLI. Preserved exactly below.
+    //
+    // #879v3 supersession at the SPEC level (NOT call-site level): tray
+    // sources args + env from the canonical recursion-guard module so the
+    // AGEND_SPAWN_DEPTH increment lands on the child env and the args
+    // shape stays in lock-step with the CLI Start + app auto-spawn paths.
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -146,16 +156,25 @@ fn start_daemon_via_cli() {
             return;
         }
     };
-    // P0 hotfix 2026-05-18 (followup to 800f1cc): same --foreground fork-bomb
-    // rule applies here. Without it, the child re-enters main.rs Start arm's
-    // default-detach branch and recurses via spawn_detached. tray-feature-only
-    // build path, which is why operator's earlier observation was that fork
-    // bomb only triggered with `--features tray`. Same RCA as #887.
-    let result = std::process::Command::new(&exe)
-        .arg("start")
-        .arg("--foreground")
-        .spawn();
-    match result {
+    let spec = match crate::bootstrap::spawn_depth::canonical_spawn_args(None) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tray: AGEND_SPAWN_DEPTH guard refused tray-side daemon spawn: {e}");
+            return;
+        }
+    };
+    let mut cmd = std::process::Command::new(&exe);
+    // Apply the canonical spec: `start --foreground` args + AGEND_SPAWN_DEPTH
+    // env. The literal `.arg("start")` shape is pinned by #548 Q7's
+    // `tray_menu_start_command_shells_out_to_cli` invariant; the canonical
+    // spec asserts the same string via `canonical_spawn_args_includes_start_and_foreground`.
+    cmd.arg("start");
+    cmd.args(&spec.args[1..]);
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    crate::bootstrap::spawn_depth::apply_detach_flags(&mut cmd);
+    match cmd.spawn() {
         Ok(_child) => {
             tracing::info!(
                 exe = %exe.display(),
