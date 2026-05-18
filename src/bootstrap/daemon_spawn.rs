@@ -48,6 +48,15 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
 
     let mut cmd = Command::new(&exe);
     cmd.arg("start");
+    // P0 hotfix 2026-05-18: child MUST run with --foreground or it re-enters
+    // main.rs Start arm's default-detach branch (`force_foreground = false`
+    // when no --foreground and no --agents), recursively calling
+    // spawn_detached → fork bomb. Witnessed: operator's sandbox produced
+    // 355 zombies + 31,980 "daemon did not publish run dir within 5s"
+    // log entries in single smoke run. Same RCA as #887 (cheerc). Minimal
+    // single-line fix; broader #882 reattempt with safeguards still planned
+    // separately (recursion guard env var, RED test for fork bomb).
+    cmd.arg("--foreground");
     if let Some(fp) = fleet_path {
         // Only pass --fleet when caller supplied one; otherwise the child
         // picks up `$AGEND_HOME/fleet.yaml` via its own resolution.
