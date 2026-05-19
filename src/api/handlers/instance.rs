@@ -723,6 +723,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("create home");
 
+        // #949 bonus: pre-issue api.cookie so the background TUI bridge
+        // thread that spawn_one fires (fire-and-forget at
+        // src/api/mod.rs:597-600 via `crate::daemon::serve_agent_tui`)
+        // can read it without the noisy "TUI listener prep failed;
+        // api.cookie unavailable" WARN. The TUI bridge isn't load-
+        // bearing for env-propagation tests — this is cosmetic log
+        // hygiene that ALSO eliminates a misleading red-herring trail
+        // that confused the original #949 RCA hypothesis (operator
+        // suspected api.cookie race; the real flake was `await_sentinel`
+        // reading from `printf > sentinel`'s empty open-truncate window).
+        let rdir = crate::daemon::run_dir(&home);
+        std::fs::create_dir_all(&rdir).ok();
+        let _ = crate::auth_cookie::issue(&rdir);
+
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let configs: &'static crate::api::ConfigRegistry =
@@ -760,22 +774,96 @@ mod tests {
         script
     }
 
-    /// Poll for the sentinel file to appear, then return its contents.
-    /// Returns `None` on timeout. Sentinel always materializes once the
-    /// shell launches (script writes unconditionally), so a `None` here
-    /// means the agent itself never ran.
+    /// Poll for the sentinel file to appear with NON-EMPTY content,
+    /// then return its contents. Returns `None` on timeout.
+    ///
+    /// #949: pre-#949 name was `await_sentinel`; the early-return on
+    /// any successful `read_to_string` (including `Ok("")`) raced
+    /// `printf > sentinel`'s open-truncate-then-write sequence and
+    /// returned `Some("")` from the empty intermediate state under
+    /// CI scheduler contention. The rename makes the non-empty
+    /// contract explicit at call sites; the body waits until content
+    /// actually commits (§3.20 SOP 1 — poll-with-deadline against
+    /// the real post-condition). Same idiom as #905/#909's
+    /// `agent::tests::wait_for_nonempty_file` for the sweep_child_tree
+    /// pid_file race.
+    ///
+    /// Sentinel always materializes once the shell launches (script
+    /// writes unconditionally), so a `None` here means the agent itself
+    /// never ran OR the post-trim content stayed empty (the script's
+    /// `${VAR:-__UNSET__}` default ensures non-empty content even when
+    /// the env var is unset).
     #[cfg(unix)]
-    fn await_sentinel(sentinel_path: &std::path::Path) -> Option<String> {
+    fn await_sentinel_nonempty(sentinel_path: &std::path::Path) -> Option<String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if sentinel_path.exists() {
-                if let Ok(c) = std::fs::read_to_string(sentinel_path) {
+            if let Ok(c) = std::fs::read_to_string(sentinel_path) {
+                // #949: wait for content commit. `printf > sentinel`
+                // creates the file empty (open-truncate) before writing,
+                // so a bare `exists() + read` polled during that window
+                // would return `Some("")` from the empty intermediate
+                // state. Continue polling until non-empty content is
+                // observed.
+                if !c.is_empty() {
                     return Some(c);
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         None
+    }
+
+    /// #949 RED: synthetic reproduction of the `await_sentinel` write-vs-read race.
+    ///
+    /// A writer thread (mimics the shell script's `printf > sentinel`):
+    ///   Phase 1: creates the sentinel file EMPTY (open-truncate).
+    ///   Phase 2: sleeps to simulate the CI-contention write-flush gap.
+    ///   Phase 3: writes the actual content.
+    ///
+    /// Under the pre-#949 `await_sentinel` logic, the poll observes
+    /// `exists() + read_to_string == Ok("")` during Phase 1, takes the
+    /// `return Some(c)` early-return, and yields `Some("")` BEFORE
+    /// content commits. The fix (#949 GREEN) polls until non-empty.
+    ///
+    /// This test FAILS against the pre-fix logic deterministically
+    /// (Phase 1's empty window is engineered to overlap the 50ms poll
+    /// cadence). Post-fix it PASSES.
+    #[cfg(unix)]
+    #[test]
+    fn await_sentinel_waits_for_nonempty_content_949() {
+        let sentinel = std::env::temp_dir().join(format!(
+            "agend-949-await-test-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&sentinel);
+
+        let writer_path = sentinel.clone();
+        let writer = std::thread::spawn(move || {
+            // Phase 1: create empty (printf's open-truncate stage).
+            std::fs::write(&writer_path, "").expect("create empty");
+            // Phase 2: simulate CI-contention write-flush gap. 200ms
+            // is 4× the poll cadence (50ms) — guarantees the reader
+            // polls into the empty window at least once.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Phase 3: commit content.
+            std::fs::write(&writer_path, "value-from-params").expect("commit");
+        });
+
+        let result = await_sentinel_nonempty(&sentinel);
+        writer.join().expect("writer joined");
+
+        assert_eq!(
+            result.as_deref(),
+            Some("value-from-params"),
+            "await_sentinel must wait for non-empty content commit, not \
+             early-return on the open-truncate empty window. Got {result:?}"
+        );
+
+        let _ = std::fs::remove_file(&sentinel);
     }
 
     /// #900 ingress 1 — `handle_spawn` MUST extract `env` from `params`
@@ -801,7 +889,7 @@ mod tests {
         );
         assert_eq!(result["ok"], true, "spawn must succeed: {result}");
 
-        let actual = await_sentinel(&sentinel);
+        let actual = await_sentinel_nonempty(&sentinel);
         cleanup_agent(&ctx, "env-params-test");
         let _ = std::fs::remove_dir_all(&home);
 
@@ -842,7 +930,7 @@ mod tests {
         );
         assert_eq!(result["ok"], true, "spawn must succeed: {result}");
 
-        let actual = await_sentinel(&sentinel);
+        let actual = await_sentinel_nonempty(&sentinel);
         cleanup_agent(&ctx, "env-fleet-test");
         let _ = std::fs::remove_dir_all(&home);
 
@@ -880,7 +968,7 @@ mod tests {
         );
         assert_eq!(result["ok"], true, "spawn must succeed: {result}");
 
-        let actual = await_sentinel(&sentinel);
+        let actual = await_sentinel_nonempty(&sentinel);
         cleanup_agent(&ctx, "env-precedence-test");
         let _ = std::fs::remove_dir_all(&home);
 
