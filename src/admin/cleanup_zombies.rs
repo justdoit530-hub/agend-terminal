@@ -178,7 +178,34 @@ pub fn cleanup_zombie_daemon(pid: u32, term_grace: Duration, kill_grace: Duratio
 /// Poll `is_alive(pid)` every 100ms until it returns false or `timeout`
 /// elapses. Returns true if the PID died within the window. Used as the
 /// grace-loop primitive for both SIGTERM and SIGKILL stages.
-fn poll_until_dead(pid: u32, timeout: Duration) -> bool {
+///
+/// #934: promoted from `fn` to `pub(crate) fn` so consumers OUTSIDE
+/// `admin::cleanup_zombies` can reuse the deadline-poll idiom. Current
+/// in-crate consumers (added in the same PR):
+/// - `src/agent.rs::sweep_child_tree_body` test — replaces bare
+///   `assert!(!is_pid_alive(_pid))` post-kill assertions
+/// - `src/process.rs::test_kill_process_tree_kills_child_subprocess` —
+///   sibling test with identical race shape
+///
+/// ### Deadline guidance (OS-conditional)
+///
+/// Callers killing a process whose PID they CAN `waitpid` on (it's their
+/// own child) → typically <1s deadline; `wait()` reaps synchronously
+/// and `kill(pid, 0)` returns ESRCH immediately after.
+///
+/// Callers killing a process whose PID is re-parented to init / launchd
+/// upon parent death (orphaned grandchild scenario) → MUST use longer
+/// deadline because reap is asynchronous in the new parent:
+/// - **Linux init / systemd**: reaper runs on scheduler tick, typically
+///   reaps within <1s
+/// - **macOS launchd**: longer cycle observed; ~3s under nominal load,
+///   ~10s under heavily contended CI runners
+/// - **Heavily-loaded CI** (e.g. ubuntu-latest with parallel tests on
+///   2 vCPUs): 5-10s worst case for either platform
+///
+/// Recommend 5s for self-reaped children, 10s for orphaned grandchildren.
+/// The 100ms poll cadence balances responsiveness vs CPU waste.
+pub(crate) fn poll_until_dead(pid: u32, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if !is_alive(pid) {
@@ -439,5 +466,146 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #934 direct poll_until_dead tests ─────────────────────────────────
+    //
+    // These exercise the primitive directly so a future regression that
+    // (e.g.) inverts the deadline check, drops the early-return on dead
+    // PID, or changes the poll cadence will fail visibly. The primitive
+    // is consumed by both cleanup_zombies (its original site) and #934's
+    // sweep_child_tree post-kill assertions; direct tests pin the
+    // contract once instead of relying on consumer-side coverage.
+    //
+    // §3.20 SOP 1 deterministic: each test uses a deadline + observable
+    // state. No sleep-based assertions. The "timeout on undying zombie"
+    // test uses python3 SIG_IGN (same pattern as
+    // `cleanup_zombie_daemon_sigterm_ignored_returns_force_killed`) so
+    // the unkillable behavior is forced, not racy.
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_until_dead_returns_immediately_when_already_dead() {
+        // Spawn `true` (exits instantly), `.wait()` to fully reap, then
+        // use that PID. Post-wait the kernel has cleared the entry so
+        // `kill(pid, 0)` returns ESRCH ("no such process") and
+        // `is_alive` returns false.
+        //
+        // (Naïve `u32::MAX` doesn't work: cast to i32 = -1, and
+        // `kill(-1, 0)` is the POSIX "send to every process you can
+        // signal" semantic — always succeeds, so `is_alive(u32::MAX)`
+        // returns true on Unix.)
+        //
+        // PID-recycling caveat: on busy systems the kernel can reassign
+        // the PID to a new process within microseconds. The test takes
+        // ~ms total wall-clock so recycling is statistically unlikely
+        // but not impossible. If observed flaky on real CI, gate via
+        // the same skip-on-recycle pattern below.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        // If the kernel recycled the PID between wait() and is_alive()
+        // (microsecond race on a busy host), skip rather than emit a
+        // misleading red. Production code never sees this race because
+        // `cleanup_zombie_daemon` calls `poll_until_dead` synchronously
+        // after `libc::kill(_, SIGKILL)` — the target PID is reaped by
+        // its real parent, not the cleanup process.
+        if is_alive(dead_pid) {
+            eprintln!("test fixture: PID {dead_pid} recycled in wait()→is_alive() gap — skipping");
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        let result = poll_until_dead(dead_pid, Duration::from_secs(10));
+        let elapsed = start.elapsed();
+
+        assert!(
+            result,
+            "poll_until_dead must return true for already-dead PID"
+        );
+        // Returns BEFORE the first 100ms sleep tick (early-return path).
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "early-return path must not sleep; got {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_until_dead_returns_after_kill_completes() {
+        // Spawn cooperative child (no SIG_IGN). SIGKILL it. Poll should
+        // observe death within the window.
+        let (pid, reaper) = spawn_with_reaper("sh", &["-c", "sleep 30"]);
+        assert!(is_alive(pid), "child must be alive pre-kill");
+
+        // SIGKILL — immediate kernel-side process exit.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+
+        let result = poll_until_dead(pid, Duration::from_secs(5));
+        let _ = reaper.join();
+
+        assert!(
+            result,
+            "poll_until_dead must observe child death within 5s after SIGKILL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_until_dead_returns_timeout_on_undying_zombie() {
+        // python3 SIG_IGN — process survives SIGTERM. We send SIGTERM
+        // (which is ignored), then poll with a short deadline. Since
+        // we DON'T escalate to SIGKILL here, the process stays alive
+        // and poll_until_dead must return false on timeout.
+        //
+        // Pattern matches `cleanup_zombie_daemon_sigterm_ignored_returns_force_killed`
+        // (line ~374) for SIG_IGN-disposition reliability across macOS +
+        // Linux. python3 is universally available on `#[cfg(unix)]`-gated
+        // CI runners.
+        let (pid, reaper) = spawn_with_reaper(
+            "python3",
+            &[
+                "-c",
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+            ],
+        );
+
+        // Give python3 ~300ms to install the SIG_IGN handler (otherwise
+        // SIGTERM lands during interpreter startup before the handler is
+        // in place; python's default SIGTERM disposition terminates,
+        // which would make poll_until_dead succeed prematurely).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Send SIGTERM — ignored by the child.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+
+        // Poll for ONLY 500ms. SIG_IGN child stays alive → return false.
+        let start = std::time::Instant::now();
+        let result = poll_until_dead(pid, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+
+        // Cleanup: SIGKILL the surviving child + reap.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        let _ = reaper.join();
+
+        assert!(
+            !result,
+            "poll_until_dead must return false (timeout) for SIG_IGN-armed child"
+        );
+        // Timing: must have polled for AT LEAST the timeout window.
+        // We give 50ms tolerance for scheduler jitter.
+        assert!(
+            elapsed >= Duration::from_millis(450),
+            "must wait the full timeout; got {elapsed:?}"
+        );
     }
 }
