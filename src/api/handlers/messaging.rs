@@ -190,71 +190,82 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         }
     }
 
-    let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
-
-    let inject_msg = if crate::inbox::pointer_only_inject()
-        || text.chars().count() > crate::inbox::HEADER_SIZE_THRESHOLD
-    {
-        format!("{} (use inbox tool)", crate::inbox::format_header(&msg))
-    } else {
-        format!("[from:{from}] {text}")
-    };
-
+    // #1065 unified routing: decide whether the recipient needs a PTY wake
+    // hint, then route through either `enqueue` (inbox-only) or
+    // `enqueue_with_idle_hint` (durable enqueue + short `[AGEND-MSG-PENDING]`
+    // hint emit). Pre-#1065 the inject site here was `compose_aware_send`
+    // which wrote the full `[AGEND-MSG]` header (or `[from:lead] body`
+    // inline) — content-size pressure extended codex's typed-inject write
+    // window past the 50ms pre-submit delay, race-condition on the `\r`.
+    // Daemon-emitted auto-wake (`[ci-ready-for-action]`) already used
+    // `enqueue_with_idle_hint` and was empirically reliable (4/4 fire +
+    // execute); routing kind=task through the same path closes the
+    // divergence. See /tmp/dialectic-1065-primary-dev.md §2 + §4.1.
     let reg = agent::lock_registry(ctx.registry);
-    let delivery_mode = if reg.contains_key(target) {
-        // Issue #603: Codex is one-shot — skip PTY inject for messages that
-        // don't require a reply (update/report), avoiding wasted turns.
-        // Issue #612: Cross-team messages are NEVER silently absorbed.
-        let is_codex = reg
-            .get(target)
-            .map(|h| h.backend_command == "codex")
-            .unwrap_or(false);
-        let kind = params["kind"].as_str().unwrap_or("");
-        drop(reg);
-        let is_cross_team = {
-            let sender_team = crate::teams::find_team_for(ctx.home, from);
-            let target_team = crate::teams::find_team_for(ctx.home, target);
-            match (sender_team, target_team) {
-                (Some(s), Some(t)) => s.name != t.name,
-                _ => true, // no team = treat as cross-team (safe default)
-            }
-        };
-        // Issue #656: orchestrators must always receive PTY inject so they
-        // can react to status updates from team members.
-        let is_orchestrator = crate::teams::find_team_for(ctx.home, target)
-            .and_then(|t| t.orchestrator)
-            .is_some_and(|orch| orch == target);
-        // #982 B-narrow: override codex ack-absorption when the inbound
-        // message replies to a blocking dispatch the recipient already
-        // drained. Without this override, lead → codex query/task replies
-        // strand silently while the codex one-shot waits for a wake.
-        let is_reply_to_drained_blocker = matches!(kind, "update" | "report")
-            && params["correlation_id"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .is_some_and(|corr| {
-                    crate::inbox::has_drained_blocker_for_correlation(ctx.home, target, corr)
-                });
-        let skip_inject = is_codex
-            && matches!(kind, "update" | "report")
-            && !is_cross_team
-            && !is_orchestrator
-            && !is_reply_to_drained_blocker;
-        if skip_inject {
-            crate::event_log::log(
-                ctx.home,
-                "ack_absorbed",
-                target,
-                &format!("from={from} kind={kind}"),
-            );
-            "inbox_only"
-        } else {
-            crate::inbox::compose_aware_send(ctx.home, target, &inject_msg);
-            "pty"
+    let target_in_registry = reg.contains_key(target);
+    let is_codex = reg
+        .get(target)
+        .map(|h| h.backend_command == "codex")
+        .unwrap_or(false);
+    drop(reg);
+    let kind = params["kind"].as_str().unwrap_or("");
+    let is_cross_team = {
+        let sender_team = crate::teams::find_team_for(ctx.home, from);
+        let target_team = crate::teams::find_team_for(ctx.home, target);
+        match (sender_team, target_team) {
+            (Some(s), Some(t)) => s.name != t.name,
+            _ => true, // no team = treat as cross-team (safe default)
         }
-    } else {
-        drop(reg);
+    };
+    // Issue #656: orchestrators must always receive PTY inject so they
+    // can react to status updates from team members.
+    let is_orchestrator = crate::teams::find_team_for(ctx.home, target)
+        .and_then(|t| t.orchestrator)
+        .is_some_and(|orch| orch == target);
+    // #982 B-narrow: override codex ack-absorption when the inbound
+    // message replies to a blocking dispatch the recipient already
+    // drained. Without this override, lead → codex query/task replies
+    // strand silently while the codex one-shot waits for a wake.
+    let is_reply_to_drained_blocker = matches!(kind, "update" | "report")
+        && params["correlation_id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .is_some_and(|corr| {
+                crate::inbox::has_drained_blocker_for_correlation(ctx.home, target, corr)
+            });
+    // Issue #603: Codex is one-shot — skip PTY inject for messages that
+    // don't require a reply (update/report), avoiding wasted turns.
+    // Issue #612: Cross-team messages are NEVER silently absorbed.
+    let skip_inject = is_codex
+        && matches!(kind, "update" | "report")
+        && !is_cross_team
+        && !is_orchestrator
+        && !is_reply_to_drained_blocker;
+
+    let delivery_mode = if !target_in_registry {
+        // Absent target — fleet-defined but no live registry entry; enqueue
+        // to inbox JSONL only. dev-2 nit T6: PTY wake hint would be a
+        // no-op anyway (no handle to inject into).
+        let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
         "inbox_only"
+    } else if skip_inject {
+        // #982 ack absorption — inbox JSONL gets the entry, no PTY hint
+        // so codex one-shots avoid a wasted turn.
+        let _ = crate::inbox::enqueue(ctx.home, target, msg.clone());
+        crate::event_log::log(
+            ctx.home,
+            "ack_absorbed",
+            target,
+            &format!("from={from} kind={kind}"),
+        );
+        "inbox_only"
+    } else {
+        // #1065 unified path — enqueue_with_idle_hint persists to inbox
+        // AND emits the short `[AGEND-MSG-PENDING]` PTY hint via
+        // `compose_aware_inject`. Same wake signal as the daemon-emit
+        // auto-wake at `daemon::ci_watch::poller::ci_check_repo`.
+        let _ = crate::inbox::enqueue_with_idle_hint(ctx.home, target, msg.clone());
+        "pty"
     };
 
     // B1 boundary: provenance injection pushed from MCP comms to API SEND.
@@ -1893,6 +1904,260 @@ mod tests {
             "non-codex backend always PTY regardless of correlation predicate: {result}"
         );
         cleanup_registry(registry, "claude-agent");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1065 unified routing tests (kind=task → enqueue_with_idle_hint) ──
+    //
+    // Before #1065: handle_send used `enqueue` + `compose_aware_send(inject_msg)`
+    // where inject_msg was the full `[AGEND-MSG] header (use inbox tool)` form
+    // (or `[from:lead] body` for short messages). Operator-observed pattern:
+    // ~10% reviewer dispatches via kind=task land but the agent never
+    // executes — content-size pressure extends codex's typed-inject write
+    // window past the 50ms pre-submit delay, race-condition on the `\r`.
+    //
+    // After #1065: handle_send routes through `enqueue_with_idle_hint`
+    // (same path as daemon-emitted [ci-ready-for-action] auto-wake which has
+    // empirically reliable 4/4 fire+execute). Both paths emit the SAME short
+    // `[AGEND-MSG-PENDING]` hint. Body stays in inbox JSONL (durable).
+
+    /// T1 (#1065 RED): structural pin — handle_send must route the PTY
+    /// delivery path through `enqueue_with_idle_hint` (NOT
+    /// `compose_aware_send`). Pre-fix code contains `compose_aware_send(`
+    /// at the inject site; post-fix code uses `enqueue_with_idle_hint`.
+    #[test]
+    fn handle_send_routes_through_enqueue_with_idle_hint() {
+        let source = include_str!("messaging.rs");
+        // Strip the test module so we only inspect the production handler.
+        // Tests pin the GREEN-side wiring; the structural-pin assertion
+        // applies to handle_send's body, not to test fixture code.
+        let prod_end = source
+            .find("#[cfg(test)]")
+            .expect("messaging.rs must have a #[cfg(test)] tests module");
+        let prod_src = &source[..prod_end];
+        assert!(
+            prod_src.contains("enqueue_with_idle_hint"),
+            "#1065 invariant: handle_send must route kind=task through \
+             enqueue_with_idle_hint (same path as daemon auto-wake)"
+        );
+        assert!(
+            !prod_src.contains("compose_aware_send("),
+            "#1065 invariant: handle_send must NOT use compose_aware_send \
+             for the inject site post-#1065 — the unified routing emits \
+             [AGEND-MSG-PENDING] hint instead of [AGEND-MSG] header"
+        );
+    }
+
+    /// T2 (#1065): kind=task body persists in inbox JSONL regardless of
+    /// the routing path. Sanity guard: the durable inbox entry must
+    /// survive the refactor.
+    #[test]
+    fn kind_task_body_persisted_in_inbox_jsonl() {
+        let home = tmp_home("1065-t2-body");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  reviewer:\n    backend: claude\n  lead:\n    backend: claude\n",
+        )
+        .ok();
+        let ctx = test_ctx(&home);
+        let body = "[delegate_task] long task body".repeat(20);
+        let result = handle_send(
+            &json!({
+                "from": "lead",
+                "target": "reviewer",
+                "text": body,
+                "kind": "task",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "send must succeed: {result}");
+
+        // Read whatever JSONL was written under <home>/inbox/. The path is
+        // either name-based or id-based depending on whether fleet.yaml has
+        // backfilled an InstanceId — collapse both into one read.
+        let inbox_dir = home.join("inbox");
+        let mut combined = String::new();
+        if let Ok(rd) = std::fs::read_dir(&inbox_dir) {
+            for e in rd.flatten() {
+                if let Ok(c) = std::fs::read_to_string(e.path()) {
+                    combined.push_str(&c);
+                }
+            }
+        }
+        assert!(
+            combined.contains("delegate_task"),
+            "kind=task body must persist in inbox JSONL post-#1065: {combined:?}"
+        );
+        assert!(
+            combined.contains("\"kind\":\"task\""),
+            "kind=task tag must be preserved in JSONL: {combined:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T3 (#1065 + #982 preservation): codex same-team kind=update
+    /// remains ack-absorbed (inbox_only + ack_absorbed event log).
+    /// The #982 contract must survive the routing refactor.
+    #[test]
+    fn kind_update_codex_same_team_remains_ack_absorbed() {
+        let home = tmp_home("1065-t3-codex-update");
+        let (registry, ctx, home_path) = make_codex_ctx(&home, "codex-rev", "lead");
+        let result = handle_send(
+            &json!({
+                "from": "lead",
+                "target": "codex-rev",
+                "text": "status update",
+                "kind": "update",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "codex same-team kind=update must remain ack-absorbed (#982): {result}"
+        );
+        assert!(
+            audit_log_contains(&home_path, "ack_absorbed"),
+            "ack_absorbed event must be logged"
+        );
+        cleanup_registry(registry, "codex-rev");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T4 (#1065 + #612 preservation): codex kind=report from "general"
+    /// bus to a different-team codex target still injects (delivery_mode=pty).
+    /// Cross-team unicast is blocked at Rule 3 (line 78+) so the only way
+    /// to exercise the cross-team-codex-not-absorbed semantics is via the
+    /// general bus (Rule 2). The #612 invariant must survive the routing
+    /// refactor — `enqueue_with_idle_hint` must run, NOT ack-absorb.
+    #[test]
+    fn kind_report_cross_team_codex_via_general_still_injects() {
+        let home = tmp_home("1065-t4-general");
+        let yaml = "instances:\n  general:\n    backend: claude\n  \
+                    codex-rev:\n    backend: codex\nteams:\n  \
+                    team-a:\n    members:\n      - general\n    \
+                    created_at: \"2026-01-01T00:00:00Z\"\n  \
+                    team-b:\n    members:\n      - codex-rev\n    \
+                    created_at: \"2026-01-01T00:00:00Z\"\n";
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let spawn_cfg = crate::agent::SpawnConfig {
+            name: "codex-rev",
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        crate::agent::spawn_agent(&spawn_cfg, registry).expect("spawn");
+        {
+            let mut reg = agent::lock_registry(registry);
+            if let Some(h) = reg.get_mut("codex-rev") {
+                h.backend_command = "codex".to_string();
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let home_ref: &'static std::path::Path = Box::leak(Box::new(home.clone()));
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+        };
+        let result = handle_send(
+            &json!({
+                "from": "general",
+                "target": "codex-rev",
+                "text": "cross-team report via general",
+                "kind": "report",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "general → cross-team send: {result}");
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("pty"),
+            "cross-team codex kind=report must still inject (#612): {result}"
+        );
+        assert!(
+            !audit_log_contains(&home, "ack_absorbed"),
+            "ack_absorbed must NOT be logged for cross-team report"
+        );
+        cleanup_registry(registry, "codex-rev");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// T5 (#1065): probabilistic race regression — pinned at the unit-test
+    /// level requires a real codex backend. Kept as documentation that an
+    /// empirical reproduce protocol exists; runs only under `--ignored`.
+    /// See /tmp/dialectic-1065-primary-dev.md §6 for the operator-side
+    /// 10-trial reproduce plan.
+    #[test]
+    #[ignore = "requires real codex backend; runs on operator-side empirical protocol"]
+    fn submit_race_regression_under_long_inject_documented() {
+        // Placeholder: pin protocol via doc-comment + ignored marker. The
+        // refactor is structurally GREEN per T1; the race regression is
+        // observable only through real backend reproduce.
+    }
+
+    /// T6 (#1065 + dev-2 nit): absent target (fleet-defined but not in
+    /// registry) → inbox_only with no PTY emit. Preserves the original
+    /// fallback at messaging.rs's `else` branch.
+    #[test]
+    fn absent_target_falls_back_to_inbox_only() {
+        let home = tmp_home("1065-t6-absent");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  offline-rev:\n    backend: claude\n  lead:\n    backend: claude\n",
+        )
+        .ok();
+        let ctx = test_ctx(&home);
+        let result = handle_send(
+            &json!({
+                "from": "lead",
+                "target": "offline-rev",
+                "text": "[delegate_task] do X",
+                "kind": "task",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            result["delivery_mode"].as_str(),
+            Some("inbox_only"),
+            "absent target must receive inbox_only delivery: {result}"
+        );
+        // Inbox JSONL still gets the entry — durable path preserved.
+        // Read whatever JSONL was written; path may be name- or id-based.
+        let inbox_dir = home.join("inbox");
+        let mut combined = String::new();
+        if let Ok(rd) = std::fs::read_dir(&inbox_dir) {
+            for e in rd.flatten() {
+                if let Ok(c) = std::fs::read_to_string(e.path()) {
+                    combined.push_str(&c);
+                }
+            }
+        }
+        assert!(
+            combined.contains("\"kind\":\"task\""),
+            "inbox JSONL must persist the task entry for absent target: {combined:?}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }
