@@ -116,18 +116,34 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
             };
             match crate::task_events::append(home, &emitter, event) {
                 Ok(_) => {
-                    // #807 Item 1: response shape consistency. `event`
-                    // names the action verb; `task` carries the full
-                    // Task object so callers can read lifecycle status
-                    // (`task.status == "open"` after create, NOT the
-                    // event name "created"). Legacy `status` field
-                    // kept as back-compat alias.
                     let task = read_task_record(home, &id).map(|r| record_to_task(&r));
+                    let dispatch_target = routed_to.as_ref().or(assignee.as_ref());
+                    if let Some(target) = dispatch_target {
+                        if target != instance_name {
+                            let branch_str = args["branch"]
+                                .as_str()
+                                .map(|b| format!("\nBranch: {b}"))
+                                .unwrap_or_default();
+                            let msg_text =
+                                format!("[delegate_task] {title}{branch_str} (task id: {id})");
+                            let inbox_msg = crate::inbox::InboxMessage {
+                                from: format!("from:{instance_name}"),
+                                text: msg_text.clone(),
+                                kind: Some("task".to_string()),
+                                task_id: Some(id.clone()),
+                                correlation_id: Some(id.clone()),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                ..Default::default()
+                            };
+                            let _ = crate::inbox::storage::enqueue(home, target, inbox_msg);
+                            let source = crate::inbox::NotifySource::Agent(instance_name);
+                            crate::inbox::notify::notify_agent(home, target, &source, &msg_text);
+                        }
+                    }
                     serde_json::json!({
                         "id": id,
                         "event": "created",
                         "task": task,
-                        // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
                         "status": "created",
                     })
                 }
@@ -879,6 +895,54 @@ fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String
     }
 }
 
+fn cascade_cancel_children(
+    home: &Path,
+    parent_id: &str,
+    emitter: &crate::task_events::InstanceName,
+) {
+    let Ok(state) = crate::task_events::replay(home) else {
+        return;
+    };
+    let parent_tid = crate::task_events::TaskId(parent_id.to_string());
+    let mut cancel_events = Vec::new();
+    let mut notify_ids = Vec::new();
+    for (child_id, child) in &state.tasks {
+        if child.parent_id.as_ref() != Some(&parent_tid) {
+            continue;
+        }
+        match child.status {
+            crate::task_events::TaskStatus::Open | crate::task_events::TaskStatus::Claimed => {
+                cancel_events.push(crate::task_events::TaskEvent::Cancelled {
+                    task_id: child_id.clone(),
+                    by: emitter.clone(),
+                    reason: format!("cascade: parent {parent_id} cancelled"),
+                });
+            }
+            crate::task_events::TaskStatus::InProgress => {
+                notify_ids.push((child_id.clone(), child.owner.clone()));
+            }
+            _ => {}
+        }
+    }
+    if !cancel_events.is_empty() {
+        let _ = crate::task_events::append_batch(home, emitter, cancel_events);
+    }
+    for (child_id, owner) in notify_ids {
+        if let Some(ref owner_name) = owner {
+            let msg = crate::inbox::message::InboxMessage {
+                text: format!(
+                    "[parent-cancelled] Parent task {parent_id} was cancelled. \
+                     Your in-progress subtask {} may need attention.",
+                    child_id.0
+                ),
+                kind: Some("parent_cancelled".to_string()),
+                ..Default::default()
+            };
+            let _ = crate::inbox::storage::enqueue(home, &owner_name.0, msg);
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -921,6 +985,7 @@ mod tests {
                 bind: None,
                 eta_secs: None,
                 tags: vec![],
+                parent_id: None,
             },
         )
         .expect("create task");
@@ -1110,52 +1175,146 @@ mod tests {
         );
         assert!(result["error"].as_str().unwrap().contains("not found"));
     }
-}
 
-fn cascade_cancel_children(
-    home: &Path,
-    parent_id: &str,
-    emitter: &crate::task_events::InstanceName,
-) {
-    let Ok(state) = crate::task_events::replay(home) else {
-        return;
-    };
-    let parent_tid = crate::task_events::TaskId(parent_id.to_string());
-    let mut cancel_events = Vec::new();
-    let mut notify_ids = Vec::new();
-    for (child_id, child) in &state.tasks {
-        if child.parent_id.as_ref() != Some(&parent_tid) {
-            continue;
-        }
-        match child.status {
-            crate::task_events::TaskStatus::Open | crate::task_events::TaskStatus::Claimed => {
-                cancel_events.push(crate::task_events::TaskEvent::Cancelled {
-                    task_id: child_id.clone(),
-                    by: emitter.clone(),
-                    reason: format!("cascade: parent {parent_id} cancelled"),
-                });
-            }
-            crate::task_events::TaskStatus::InProgress => {
-                notify_ids.push((child_id.clone(), child.owner.clone()));
-            }
-            _ => {}
-        }
+    fn drain_inbox(home: &std::path::Path, agent: &str) -> Vec<crate::inbox::InboxMessage> {
+        crate::inbox::storage::drain(home, agent)
     }
-    if !cancel_events.is_empty() {
-        let _ = crate::task_events::append_batch(home, emitter, cancel_events);
+
+    #[test]
+    fn create_with_assignee_sends_task_to_inbox() {
+        let home = tmp_home("assign_inbox");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "implement feature X",
+                "assignee": "dev-agent",
+                "branch": "fix/feature-x",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+        let task_id = result["id"].as_str().unwrap();
+
+        let msgs = drain_inbox(&home, "dev-agent");
+        assert!(!msgs.is_empty(), "assignee should receive inbox message");
+        let msg = &msgs[0];
+        assert_eq!(msg.kind.as_deref(), Some("task"));
+        assert_eq!(msg.task_id.as_deref(), Some(task_id));
+        assert!(msg.text.contains("implement feature X"));
+        assert!(msg.text.contains("fix/feature-x"));
     }
-    for (child_id, owner) in notify_ids {
-        if let Some(ref owner_name) = owner {
-            let msg = crate::inbox::message::InboxMessage {
-                text: format!(
-                    "[parent-cancelled] Parent task {parent_id} was cancelled. \
-                     Your in-progress subtask {} may need attention.",
-                    child_id.0
-                ),
-                kind: Some("parent_cancelled".to_string()),
-                ..Default::default()
-            };
-            let _ = crate::inbox::storage::enqueue(home, &owner_name.0, msg);
-        }
+
+    #[test]
+    fn create_without_assignee_sends_no_message() {
+        let home = tmp_home("no_assign");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "unassigned task",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+
+        let msgs = drain_inbox(&home, "lead-agent");
+        assert!(msgs.is_empty(), "no inbox message without assignee");
+    }
+
+    #[test]
+    fn create_self_assign_sends_no_message() {
+        let home = tmp_home("self_assign");
+        let result = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "self-assigned task",
+                "assignee": "dev-agent",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+
+        let msgs = drain_inbox(&home, "dev-agent");
+        assert!(msgs.is_empty(), "self-assign should not send inbox message");
+    }
+
+    #[test]
+    fn create_with_assignee_task_status_is_open() {
+        let home = tmp_home("status_open");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "test task",
+                "assignee": "dev-agent",
+            }),
+        );
+        let task = &result["task"];
+        assert_eq!(task["status"], "open");
+        assert_eq!(task["assignee"], "dev-agent");
+    }
+
+    #[test]
+    fn create_with_assignee_correlation_id_matches_task_id() {
+        let home = tmp_home("corr_id");
+        let result = handle(
+            &home,
+            "lead-agent",
+            &serde_json::json!({
+                "action": "create",
+                "title": "correlated task",
+                "assignee": "dev-agent",
+            }),
+        );
+        let task_id = result["id"].as_str().unwrap();
+
+        let msgs = drain_inbox(&home, "dev-agent");
+        let msg = &msgs[0];
+        assert_eq!(
+            msg.correlation_id.as_deref(),
+            Some(task_id),
+            "correlation_id should match task_id for auto-close"
+        );
+    }
+
+    fn write_fleet_yaml_with_team(home: &std::path::Path, team: &str, orchestrator: &str) {
+        let yaml = format!(
+            "teams:\n  {team}:\n    orchestrator: {orchestrator}\n    members:\n      - dev-a\n      - dev-b\n"
+        );
+        std::fs::write(home.join("fleet.yaml"), yaml).unwrap();
+    }
+
+    #[test]
+    fn create_with_team_assignee_routes_to_orchestrator() {
+        let home = tmp_home("team_route");
+        write_fleet_yaml_with_team(&home, "my-team", "team-lead");
+
+        let result = handle(
+            &home,
+            "operator",
+            &serde_json::json!({
+                "action": "create",
+                "title": "team task",
+                "assignee": "my-team",
+            }),
+        );
+        assert_eq!(result["event"], "created");
+
+        let orch_msgs = drain_inbox(&home, "team-lead");
+        assert!(
+            !orch_msgs.is_empty(),
+            "orchestrator should receive inbox message when team is assignee"
+        );
+        assert_eq!(orch_msgs[0].kind.as_deref(), Some("task"));
+        assert!(orch_msgs[0].text.contains("team task"));
+
+        let team_msgs = drain_inbox(&home, "my-team");
+        assert!(
+            team_msgs.is_empty(),
+            "raw team name should NOT receive inbox message"
+        );
     }
 }
