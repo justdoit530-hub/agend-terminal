@@ -73,6 +73,7 @@ pub(super) fn start_api_server(
         .ok();
 
     tracing::info!(path = %run_dir.display(), "in-process API server started");
+
     ApiGuard {
         run_dir: Some(run_dir),
         _owned: Some(prepared),

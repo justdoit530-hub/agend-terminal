@@ -230,6 +230,15 @@ pub fn serve(
     };
     tracing::info!(port, "API listening");
 
+    // #1189: write `.ready` in app (TUI) mode after confirmed bind success.
+    // Daemon mode writes `.ready` later (after spawn loop) with richer semantics.
+    if notifier.is_some() {
+        let ready_path = run_dir.join(".ready");
+        if let Err(e) = std::fs::write(&ready_path, chrono::Utc::now().to_rfc3339()) {
+            tracing::warn!(path = %ready_path.display(), error = %e, "failed to write .ready marker");
+        }
+    }
+
     // #680: connection counter — limits concurrent API sessions.
     let max_conns: usize = std::env::var("AGEND_API_MAX_CONNS")
         .ok()
