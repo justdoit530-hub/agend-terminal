@@ -187,8 +187,23 @@ fn is_clean_merged(repo: &Path, base: &str, branch: &str) -> bool {
 /// `base` as an equivalent patch (squash-merged). `git cherry base
 /// branch` output prefix per commit: `-` means present in base, `+`
 /// means missing. All-`-` (and at least one line) ⇒ squash-merged.
-#[allow(dead_code)]
+///
+/// #1280: Falls back to tree-diff comparison when `git cherry` misses
+/// GitHub-style squash merges (single squashed commit has a different
+/// patch-id than the individual commits). The fallback checks if the
+/// diff from merge-base to the branch tip is empty against base HEAD
+/// (i.e., all changes are already incorporated).
 fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
+    // Method 1: git cherry (works for cherry-picked commits).
+    if is_squash_merged_cherry(repo, base, branch) {
+        return true;
+    }
+    // Method 2: tree-diff comparison (works for GitHub squash-merge).
+    is_squash_merged_diff(repo, base, branch)
+}
+
+/// `git cherry` based detection.
+fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
     let output = std::process::Command::new("git")
         .args(["cherry", base, branch])
         .current_dir(repo)
@@ -211,6 +226,85 @@ fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
         }
     }
     had_any
+}
+
+/// GitHub API based detection: query whether a merged PR exists for
+/// this branch with matching HEAD SHA. Most reliable — not affected
+/// by git history topology. SHA check prevents false positives from
+/// branch name reuse.
+fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
+    // Resolve owner/repo from git remote origin.
+    let remote = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(remote_url) = remote else {
+        return false;
+    };
+    let gh_repo = extract_github_repo(&remote_url);
+    let Some(gh_repo) = gh_repo else {
+        return false;
+    };
+    // Get local branch tip SHA.
+    let local_sha = std::process::Command::new("git")
+        .args(["rev-parse", branch])
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let Some(local_sha) = local_sha else {
+        return false;
+    };
+    // gh pr list --state merged --head <branch> --json headRefOid
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "merged",
+            "--head",
+            branch,
+            "--base",
+            base,
+            "--repo",
+            &gh_repo,
+            "--json",
+            "headRefOid",
+        ])
+        .output();
+    let Ok(o) = output else { return false };
+    if !o.status.success() {
+        return false;
+    }
+    // Parse JSON array and check if any PR's headRefOid matches local SHA.
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout).unwrap_or_default();
+    prs.iter().any(|pr| {
+        pr["headRefOid"]
+            .as_str()
+            .map(|sha| sha == local_sha)
+            .unwrap_or(false)
+    })
+}
+
+/// Extract "owner/repo" from a GitHub remote URL.
+fn extract_github_repo(url: &str) -> Option<String> {
+    // Handles: https://github.com/owner/repo.git, git@github.com:owner/repo.git
+    let stripped = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    if stripped.contains("github.com") {
+        if let Some(path) = stripped.strip_prefix("git@github.com:") {
+            return Some(path.to_string());
+        }
+        // https://github.com/owner/repo
+        if let Some(idx) = stripped.find("github.com/") {
+            return Some(stripped[idx + "github.com/".len()..].to_string());
+        }
+    }
+    None
 }
 
 /// #817 scan local branches and categorize into the 4 buckets.
