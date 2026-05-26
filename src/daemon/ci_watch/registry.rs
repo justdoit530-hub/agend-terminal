@@ -94,15 +94,19 @@ pub fn watch_filename(repo: &str, branch: &str) -> String {
 }
 
 /// Persist updated tracking state (last_run_id + head_sha) to the watch file.
+/// Retained for tests that exercise the legacy per-field write path.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn update_watch_state(watch_path: &Path, run_id: Option<u64>, head_sha: &str) {
     update_watch_state_with_notify(watch_path, run_id, head_sha, None, None, None);
 }
 
 /// Persist tracking state including last_notified_head_sha,
 /// last_notified_conclusion (#786), and last_stale_emitted_sha
-/// (#1026). All optional fields are written only when caller
-/// supplies them — preserves the "no state churn when no
-/// notification fires" invariant.
+/// (#1026). Retained for tests; production path uses
+/// `flush_watch_state` after in-memory mutation.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn update_watch_state_with_notify(
     watch_path: &Path,
     run_id: Option<u64>,
@@ -146,6 +150,53 @@ pub(super) fn update_watch_state_with_notify(
                 tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch state write failed");
             }
         }
+    }
+}
+
+/// Flush an in-memory WatchState to disk under the ci-watch flock.
+/// Merge-safe: starts from the on-disk state (preserving all
+/// control-plane fields) and only applies poll-owned deltas from
+/// the in-memory snapshot.
+pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::WatchState) {
+    let lock_path = watch_path.with_extension("lock");
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(path = %lock_path.display(), error = %e, "failed to acquire ci-watch lock, skipping flush");
+            return;
+        }
+    };
+    let mut merged = match std::fs::read_to_string(watch_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<super::watch_state::WatchState>(&c).ok())
+    {
+        Some(c) => c,
+        None => return, // file deleted by concurrent unwatch — respect deletion
+    };
+    // Apply only poll-owned fields from in-memory state.
+    merged.last_run_id = state.last_run_id;
+    merged.head_sha = state.head_sha.clone();
+    merged.last_polled_at = state.last_polled_at;
+    merged.effective_interval_secs = state.effective_interval_secs;
+    merged.last_terminal_seen_at = state.last_terminal_seen_at.clone();
+    merged.last_notified_head_sha = state.last_notified_head_sha.clone();
+    merged.last_notified_conclusion = state.last_notified_conclusion.clone();
+    merged.last_stale_emitted_sha = state.last_stale_emitted_sha.clone();
+    merged.last_mergeable_state = state.last_mergeable_state.clone();
+    merged.last_mergeable_check_at = state.last_mergeable_check_at.clone();
+    merged.rate_limit_until = state.rate_limit_until;
+    merged.rate_limit_remaining = state.rate_limit_remaining;
+    merged.rate_limit_limit = state.rate_limit_limit;
+    merged.consecutive_skips = state.consecutive_skips;
+    merged.stalled_notified = state.stalled_notified;
+    merged.stalled_since_ms = state.stalled_since_ms;
+    if let Err(e) = crate::store::atomic_write(
+        watch_path,
+        serde_json::to_string_pretty(&merged)
+            .unwrap_or_default()
+            .as_bytes(),
+    ) {
+        tracing::warn!(path = %watch_path.display(), error = %e, "ci-watch state flush failed");
     }
 }
 
@@ -202,5 +253,157 @@ mod tests {
             f.len() > 21,
             "post-#943 filename length must exceed legacy DefaultHasher length (21): got {f}"
         );
+    }
+
+    #[test]
+    fn flush_preserves_concurrent_unwatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-flush-merge-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let watch_path = dir.join("test.json");
+
+        let initial = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            subscribers: Some(vec![
+                super::super::watch_state::Subscriber {
+                    instance: "A".into(),
+                    subscribed_at: None,
+                },
+                super::super::watch_state::Subscriber {
+                    instance: "B".into(),
+                    subscribed_at: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        std::fs::write(
+            &watch_path,
+            serde_json::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+
+        let mut stale = initial.clone();
+        stale.last_run_id = Some(42);
+        stale.head_sha = Some("abc123".into());
+
+        let mut on_disk = initial;
+        on_disk.subscribers = Some(vec![super::super::watch_state::Subscriber {
+            instance: "A".into(),
+            subscribed_at: None,
+        }]);
+        std::fs::write(
+            &watch_path,
+            serde_json::to_string_pretty(&on_disk).unwrap(),
+        )
+        .unwrap();
+
+        flush_watch_state(&watch_path, &stale);
+
+        let result: super::super::watch_state::WatchState =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(result.last_run_id, Some(42), "poll fields must be applied");
+        assert_eq!(result.head_sha.as_deref(), Some("abc123"));
+        let subs: Vec<String> = result.subscriber_names();
+        assert_eq!(
+            subs,
+            vec!["A"],
+            "concurrent unwatch of B must be preserved, not overwritten"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flush_respects_concurrent_deletion() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-flush-delete-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let watch_path = dir.join("deleted.json");
+
+        let stale = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            last_run_id: Some(99),
+            ..Default::default()
+        };
+
+        // File does not exist (concurrent unwatch deleted it).
+        assert!(!watch_path.exists());
+        flush_watch_state(&watch_path, &stale);
+        assert!(
+            !watch_path.exists(),
+            "flush must not resurrect a deleted watch file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn flush_preserves_concurrent_metadata_update() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-flush-meta-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let watch_path = dir.join("meta.json");
+
+        let initial = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            expires_at: Some("2026-01-01T00:00:00Z".into()),
+            task_id: Some("t-old".into()),
+            required_checks: None,
+            ..Default::default()
+        };
+        std::fs::write(
+            &watch_path,
+            serde_json::to_string_pretty(&initial).unwrap(),
+        )
+        .unwrap();
+
+        // Poller snapshot taken at tick start (stale metadata).
+        let mut stale = initial.clone();
+        stale.last_run_id = Some(42);
+        stale.head_sha = Some("abc".into());
+
+        // Concurrent `ci watch` updates metadata on disk.
+        let mut updated = initial;
+        updated.expires_at = Some("2026-06-01T00:00:00Z".into());
+        updated.task_id = Some("t-new".into());
+        updated.required_checks = Some(vec!["build".into()]);
+        std::fs::write(
+            &watch_path,
+            serde_json::to_string_pretty(&updated).unwrap(),
+        )
+        .unwrap();
+
+        flush_watch_state(&watch_path, &stale);
+
+        let result: super::super::watch_state::WatchState =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(result.last_run_id, Some(42), "poll field must be applied");
+        assert_eq!(result.head_sha.as_deref(), Some("abc"));
+        assert_eq!(
+            result.expires_at.as_deref(),
+            Some("2026-06-01T00:00:00Z"),
+            "concurrent expires_at update must survive flush"
+        );
+        assert_eq!(
+            result.task_id.as_deref(),
+            Some("t-new"),
+            "concurrent task_id update must survive flush"
+        );
+        assert_eq!(
+            result.required_checks.as_deref(),
+            Some(&["build".to_string()][..]),
+            "concurrent required_checks update must survive flush"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
