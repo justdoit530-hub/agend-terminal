@@ -990,6 +990,136 @@ pub(crate) fn handle_cleanup_merged_branches(
     }
 }
 
+pub(super) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
+    let pr = match args["pr"].as_u64() {
+        Some(n) => n,
+        None => return json!({"error": "missing 'pr' (PR number)"}),
+    };
+    let repo = args["repo"]
+        .as_str()
+        .unwrap_or("suzuke/agend-terminal")
+        .to_string();
+    let force = args["force"].as_bool().unwrap_or(false);
+    let force_reason = args["force_reason"].as_str().unwrap_or("");
+
+    if force && force_reason.is_empty() {
+        return json!({"error": "force=true requires non-empty force_reason"});
+    }
+
+    if !force {
+        let checks_output = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "checks",
+                &pr.to_string(),
+                "--repo",
+                &repo,
+                "--json",
+                "name,state",
+            ])
+            .output();
+        match checks_output {
+            Ok(o) if o.status.success() => {
+                let checks: Vec<serde_json::Value> = match serde_json::from_slice(&o.stdout) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return json!({
+                            "error": format!("failed to parse CI checks response: {e}"),
+                            "hint": "merge refused (fail-closed)"
+                        });
+                    }
+                };
+                let failing: Vec<_> = checks
+                    .iter()
+                    .filter(|c| {
+                        let st = c["state"].as_str().unwrap_or("");
+                        st != "SUCCESS" && st != "SKIPPED"
+                    })
+                    .collect();
+                if !failing.is_empty() {
+                    let summary: Vec<String> = failing
+                        .iter()
+                        .map(|c| {
+                            format!(
+                                "{}: {}",
+                                c["name"].as_str().unwrap_or("?"),
+                                c["state"].as_str().unwrap_or("?")
+                            )
+                        })
+                        .collect();
+                    return json!({
+                        "error": "CI checks not all passed — merge refused",
+                        "failing_checks": summary,
+                        "hint": "Wait for CI to pass, or use force=true with force_reason for emergency bypass"
+                    });
+                }
+            }
+            _ => {
+                return json!({
+                    "error": "failed to query CI checks — merge refused",
+                    "hint": "Verify PR number and repo, or use force=true with force_reason"
+                });
+            }
+        }
+    }
+
+    if force {
+        let event = serde_json::json!({
+            "kind": "merge_force_bypass",
+            "agent": instance_name,
+            "pr": pr,
+            "repo": repo,
+            "force_reason": force_reason,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+        let events_path = home.join("fleet_events.jsonl");
+        let audit_written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(events_path)?;
+            writeln!(f, "{event}")?;
+            Ok(())
+        })();
+        if let Err(e) = audit_written {
+            return json!({
+                "error": format!("force-merge refused: audit log write failed: {e}"),
+                "hint": "fix fleet_events.jsonl permissions or disk space, then retry"
+            });
+        }
+    }
+
+    let merge_output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "merge",
+            &pr.to_string(),
+            "--repo",
+            &repo,
+            "--admin",
+            "--squash",
+            "--delete-branch",
+        ])
+        .output();
+    match merge_output {
+        Ok(o) if o.status.success() => {
+            json!({
+                "merged": true,
+                "pr": pr,
+                "forced": force,
+            })
+        }
+        Ok(o) => {
+            json!({
+                "error": "gh pr merge failed",
+                "stderr": String::from_utf8_lossy(&o.stderr).to_string(),
+            })
+        }
+        Err(e) => json!({"error": format!("failed to run gh: {e}")}),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

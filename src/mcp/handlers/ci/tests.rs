@@ -1993,3 +1993,43 @@ fn handle_watch_ci_rejects_invalid_repo_format() {
         "GitLab URL must be rejected as invalid_repo_format: {r}"
     );
 }
+
+// ----- #1244 PR-B: merge preflight CI gate -----
+
+#[test]
+fn merge_missing_pr_returns_error() {
+    let home = std::env::temp_dir().join(format!("agend-merge-test-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let result = super::handle_merge_repo(&home, &json!({}), "dev");
+    assert!(result["error"].as_str().unwrap().contains("pr"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn merge_force_without_reason_returns_error() {
+    let home = std::env::temp_dir().join(format!("agend-merge-force-test-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let result = super::handle_merge_repo(&home, &json!({"pr": 1234, "force": true}), "dev");
+    assert!(result["error"].as_str().unwrap().contains("force_reason"));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn merge_force_audit_write_failure_refuses_merge() {
+    let home = std::env::temp_dir().join(format!("agend-merge-audit-fail-{}", std::process::id()));
+    std::fs::create_dir_all(&home).unwrap();
+    let events_path = home.join("fleet_events.jsonl");
+    std::fs::create_dir_all(&events_path).unwrap();
+
+    let result = super::handle_merge_repo(
+        &home,
+        &json!({"pr": 9999, "force": true, "force_reason": "test emergency"}),
+        "dev",
+    );
+    let err = result["error"].as_str().unwrap();
+    assert!(
+        err.contains("audit log write failed"),
+        "expected audit failure error, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
