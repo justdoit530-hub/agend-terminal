@@ -4989,3 +4989,163 @@ fn aggregate_required_checks_ignores_non_required_failure() {
         Some("success"),
     );
 }
+
+// ── per-tick CachedCiProvider dedup tests ──
+
+struct CountingProvider {
+    call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    runs: Vec<CiRun>,
+}
+
+#[async_trait::async_trait]
+impl CiProvider for CountingProvider {
+    async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiPollResult> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(CiPollResult::Runs {
+            runs: self.runs.clone(),
+            rate_limit_remaining: None,
+            rate_limit_limit: None,
+        })
+    }
+    async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
+        PrState::Open
+    }
+    async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
+        String::new()
+    }
+    fn token_warning(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+fn new_tick_cache() -> super::TickCache {
+    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[test]
+fn tick_cache_dedup_same_repo_branch_single_api_call() {
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cache = new_tick_cache();
+    let provider = super::CachedCiProvider {
+        inner: Box::new(CountingProvider {
+            call_count: std::sync::Arc::clone(&call_count),
+            runs: vec![CiRun {
+                id: 1,
+                conclusion: Some("success".into()),
+                head_sha: "aaa".into(),
+                url: String::new(),
+                name: "CI".into(),
+            }],
+        }),
+        poll_cache: std::sync::Arc::clone(&cache),
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let r1 = provider.poll_runs("owner/repo", "feat/x").await.unwrap();
+        let r2 = provider.poll_runs("owner/repo", "feat/x").await.unwrap();
+        assert!(matches!(r1, CiPollResult::Runs { .. }));
+        assert!(matches!(r2, CiPollResult::Runs { .. }));
+    });
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "same repo@branch must hit cache on second call"
+    );
+}
+
+#[test]
+fn tick_cache_different_repo_branch_independent_calls() {
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let cache = new_tick_cache();
+    let provider = super::CachedCiProvider {
+        inner: Box::new(CountingProvider {
+            call_count: std::sync::Arc::clone(&call_count),
+            runs: vec![],
+        }),
+        poll_cache: std::sync::Arc::clone(&cache),
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let _ = provider.poll_runs("owner/repo", "feat/a").await;
+        let _ = provider.poll_runs("owner/repo", "feat/b").await;
+    });
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "different branches must each call the API independently"
+    );
+}
+
+#[test]
+fn tick_cache_does_not_persist_across_ticks() {
+    let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Tick 1
+    {
+        let provider = super::CachedCiProvider {
+            inner: Box::new(CountingProvider {
+                call_count: std::sync::Arc::clone(&call_count),
+                runs: vec![],
+            }),
+            poll_cache: new_tick_cache(),
+        };
+        rt.block_on(async {
+            let _ = provider.poll_runs("owner/repo", "main").await;
+        });
+    }
+    // Tick 2 — fresh cache
+    {
+        let provider = super::CachedCiProvider {
+            inner: Box::new(CountingProvider {
+                call_count: std::sync::Arc::clone(&call_count),
+                runs: vec![],
+            }),
+            poll_cache: new_tick_cache(),
+        };
+        rt.block_on(async {
+            let _ = provider.poll_runs("owner/repo", "main").await;
+        });
+    }
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "each tick must create a fresh cache — no cross-tick sharing"
+    );
+}
+
+#[tokio::test]
+async fn tick_cache_concurrent_same_key_single_api_call() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let call_count = Arc::new(AtomicU32::new(0));
+    let cache = new_tick_cache();
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let cc = Arc::clone(&call_count);
+        let c = Arc::clone(&cache);
+        let b = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            let provider = super::CachedCiProvider {
+                inner: Box::new(CountingProvider {
+                    call_count: cc,
+                    runs: vec![],
+                }),
+                poll_cache: c,
+            };
+            b.wait().await;
+            provider.poll_runs("owner/repo", "feat/x").await.unwrap();
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert_eq!(
+        call_count.load(Ordering::Relaxed),
+        1,
+        "4 concurrent tasks with same key must coalesce to 1 API call"
+    );
+}
