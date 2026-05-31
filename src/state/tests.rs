@@ -751,22 +751,40 @@ fn claude_permission_prompt_dialog_match() {
 }
 
 #[test]
-fn permission_prompt_legacy_wording_still_matches() {
-    // #1546: Claude's legacy bare wording (`Allow once|Allow always|approve`) was
-    // CUT — it false-positived on prose. Claude now keys on the chrome footer
-    // (see claude_permission_footer_anchor_1546). Codex/other backends are
-    // untouched and still match their own wording.
-    let cases: &[(Backend, &[&str])] =
-        &[(Backend::Codex, &["Request approval", "approve", "deny"])];
-    for (backend, samples) in cases {
-        let patterns = StatePatterns::for_backend(backend);
-        for sample in *samples {
-            assert_eq!(
-                patterns.detect(sample),
-                Some(AgentState::PermissionPrompt),
-                "{backend:?} legacy wording {sample:?} must still fire PermissionPrompt",
-            );
-        }
+fn codex_permission_chrome_anchor_1559() {
+    // #1559 (cross-backend of #1546): codex PermissionPrompt keys on the
+    // live-dialog CHROME (header + footer) + the one distinctive, non-prose
+    // option (`No, and tell Codex what to do differently`) — each fires alone.
+    // The prose-echoable bare words (`Request approval`, `approve`, `deny`, bare
+    // `Yes, proceed`) were CUT: they content-FP'd on a reviewer's prose /
+    // quoted approval discussion (and `approve|deny|Request approval` never
+    // matched real codex anyway — fixture commit e0716ec).
+    let patterns = StatePatterns::for_backend(&Backend::Codex);
+    // The three real-dialog anchors — each must fire on its own (FN-safety:
+    // an approval frame is caught even if one line is off-screen).
+    for anchor in [
+        "Would you like to run the following command?",
+        "Press enter to confirm or esc to cancel",
+        "› 3. No, and tell Codex what to do differently (esc)",
+    ] {
+        assert_eq!(
+            patterns.detect(anchor),
+            Some(AgentState::PermissionPrompt),
+            "codex dialog anchor {anchor:?} must fire PermissionPrompt",
+        );
+    }
+    // FP-block: bare approval words in prose (NOT a live dialog) must NOT fire.
+    for prose in [
+        "I'll approve this PR once CI is green",
+        "Yes, proceed with the merge",
+        "the reviewer will deny the request",
+        "Request approval from the lead before merging",
+    ] {
+        assert_ne!(
+            patterns.detect(prose),
+            Some(AgentState::PermissionPrompt),
+            "#1559: bare approval prose {prose:?} must NOT fire PermissionPrompt",
+        );
     }
 }
 
@@ -1293,22 +1311,29 @@ fn codex_tooluse_does_not_false_positive_on_spinner_or_narration() {
 
 #[test]
 fn codex_permission_prompt_dialog_match() {
-    // Codex 0.120.0 approval dialog — header, every option, and
-    // footer must all fire PermissionPrompt. Observed in
-    // codex-perm.raw byte ~68K-90K.
+    // Codex 0.120.0 approval dialog. #1559: anchor on the live-dialog CHROME
+    // (header + footer) + the one distinctive option (`No, and tell Codex what
+    // to do differently`) — all three present in the real box (codex-perm.raw),
+    // each fires alone. The prose-echoable rows are NOT anchors.
     let patterns = StatePatterns::for_backend(&Backend::Codex);
-    for sample in [
+    for anchor in [
         "  Would you like to run the following command?",
-        "  1. Yes, proceed (y)",
-        "› 3. No, and tell Codex what to do differently (esc)",
         "  Press enter to confirm or esc to cancel",
+        "› 3. No, and tell Codex what to do differently (esc)",
     ] {
         assert_eq!(
-            patterns.detect(sample),
+            patterns.detect(anchor),
             Some(AgentState::PermissionPrompt),
-            "expected PermissionPrompt for {sample:?}"
+            "expected PermissionPrompt for anchor {anchor:?}"
         );
     }
+    // The prose-echoable option row alone (no chrome / no distinctive option)
+    // must NOT fire — `Yes, proceed` is dropped.
+    assert_ne!(
+        patterns.detect("  1. Yes, proceed (y)"),
+        Some(AgentState::PermissionPrompt),
+        "#1559: bare `Yes, proceed` option row must NOT fire PermissionPrompt on its own"
+    );
 }
 
 #[test]
