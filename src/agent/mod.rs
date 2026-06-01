@@ -876,6 +876,35 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         }
     }
 
+    // #1547 (A): agy rejects a workspace whose path has a dot-prefixed (hidden)
+    // ancestor — and every daemon workspace lives under `$AGEND_HOME`
+    // (`~/.agend-terminal`, hidden). agy reads the workspace path from `$PWD`
+    // (not getcwd/realpath; operator e2e-verified), so we keep the CWD at the
+    // real hidden workspace (the validated allowed root set via `cmd.cwd` above)
+    // but point `$PWD` at a NON-hidden link to it. Done LAST — after the
+    // fleet.yaml user-env loop — so the daemon-derived value is authoritative
+    // (mirrors the opencode XDG_DATA_HOME placement rationale above). Link
+    // failure is non-fatal: agy still spawns, just without fleet MCP (the
+    // pre-#1547 behavior), and the boot invariant in `spawn_agent` warns.
+    if matches!(detected_backend, Some(Backend::Agy)) {
+        if let (Some(dir), Some(home_path)) = (working_dir, home) {
+            match crate::agy_workspace::ensure_link(home_path, name, dir) {
+                Ok(link) => {
+                    cmd.env("PWD", &link);
+                    tracing::debug!(
+                        instance = %name, pwd = %link.display(),
+                        "agy: $PWD set to non-hidden workspace link"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    instance = %name, error = %e,
+                    "agy: could not create non-hidden workspace link — agy will \
+                     reject the hidden workspace and load no fleet MCP"
+                ),
+            }
+        }
+    }
+
     // #708: strip AGEND_GIT_BYPASS from child env — agents must use the
     // git shim (which checks the var), not inherit a blanket bypass.
     cmd.env_remove("AGEND_GIT_BYPASS");
@@ -922,6 +951,29 @@ pub fn spawn_agent(config: &SpawnConfig, registry: &AgentRegistry) -> anyhow::Re
                  unavailable in this instance. Awaiting upstream fix. Use this \
                  instance for manual / non-fleet work only."
             );
+        }
+    }
+
+    // #1547 M2(c): agy boot invariant. agy loads fleet MCP from
+    // `<workdir>/.agents/mcp_config.json` (written by `configure_agy` BEFORE
+    // spawn). If it's absent at spawn, agy boots without fleet tools AND caches
+    // "no MCP" in its HOME discovery cache — the recovery-failure class #1547
+    // fixes. Verify + WARN (not fatal: a bare agy is still usable manually, and
+    // configure_agy already errors on its own write failure).
+    if matches!(detected_backend, Some(Backend::Agy)) {
+        if let Some(dir) = working_dir {
+            let cfg = dir.join(".agents").join("mcp_config.json");
+            if !cfg.exists() {
+                tracing::warn!(
+                    target: "fleet_mcp_unsupported",
+                    agent = %name,
+                    path = %cfg.display(),
+                    "⚠️  [agy-mcp-config-missing] spawning agy but \
+                     .agents/mcp_config.json is absent — fleet tools will not load \
+                     and agy will cache 'no MCP'. configure_agy should have written \
+                     it pre-spawn; check earlier warnings."
+                );
+            }
         }
     }
 
