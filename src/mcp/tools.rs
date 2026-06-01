@@ -298,6 +298,13 @@ pub(crate) fn def_config() -> Value {
     }, "required": ["action"]}})
 }
 
+pub(crate) fn def_mode() -> Value {
+    json!({"name": "mode", "description": "#1339: Read the operator availability/authority mode (READ-ONLY for agents). `get` → current mode (active|away|sleep) + delegate. Agents observe this to back off when the operator is away/asleep. SETTING the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI — never available to agents.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["get"], "default": "get"}
+        }, "required": ["action"]}})
+}
+
 pub(crate) fn def_health() -> Value {
     json!({"name": "health", "description": "Manage health state. Actions: report, clear.",
         "inputSchema": {"type": "object", "properties": {
@@ -503,8 +510,8 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            35,
-            "#1400: 34 + tokens (#1077 Phase 1) = 35. \
+            36,
+            "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36. \
              Current tools: {:?}",
             tools
                 .iter()
