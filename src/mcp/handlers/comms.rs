@@ -486,6 +486,16 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             if let Err(e) = super::evidence_gate::check_evidence_gate(&evidence_body, verdict) {
                 return json!({"error": e});
             }
+
+            // #1666 Phase B (WARN-first): cross-check the checkable evidence and
+            // LOG (never reject) — measures the false-positive rate. See the fn.
+            super::evidence_gate::cross_check_and_log(
+                home,
+                sender.as_str(),
+                summary,
+                &evidence_body,
+                verdict,
+            );
         }
 
         match crate::api::call(
