@@ -374,6 +374,11 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     if let Err(e) = crate::fleet::migrate_teams_json_to_yaml(&home) {
         tracing::warn!(error = %e, "teams.json migration failed at daemon startup");
     }
+    // #1688: intentionally NO startup binding re-sign pass — see `binding.rs`.
+    // It was a wash-white hole: "no sidecar" can't distinguish a legit unsigned
+    // binding from a tampered-then-sidecar-deleted one, and the daemon has no
+    // trusted source at startup to tell them apart. Unsigned bindings fail closed
+    // (unbound) and re-sign on their next dispatch / bind_self.
     let _owned = prepared;
     run_core(&home, agents, telegram)
 }
