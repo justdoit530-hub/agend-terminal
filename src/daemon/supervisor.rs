@@ -427,6 +427,15 @@ fn idle_expectation_for(home: &std::path::Path, agent: &str) -> crate::fleet::Id
         .unwrap_or_default()
 }
 
+/// #1595 Step 2 (pure): which states warrant escalating a self-orchestrator
+/// (the orchestrator IS the affected agent → no peer can relay) straight to
+/// operator Telegram? Only `AuthError` — terminal with operator-only resolution
+/// (re-auth). Transient states (RateLimit/UsageLimit) recover and the agent
+/// relays then; Crashed/Hang are not live AgentStates via this hook (#1701).
+fn self_orchestrator_escalates(new_state: crate::state::AgentState) -> bool {
+    new_state == crate::state::AgentState::AuthError
+}
+
 /// Decide and dispatch member-state-change notify. Returns true if notify sent.
 /// Production-path-coupled per §3.5.10 — tests call this same function.
 pub(crate) fn maybe_notify_member_state_change(
@@ -455,7 +464,39 @@ pub(crate) fn maybe_notify_member_state_change(
         return false;
     };
     if orch == name {
-        return false; // D3: skip self-notify
+        // #1595 Step 2: the orchestrator IS the affected agent — no peer can relay
+        // its inbox P0. For a state only the operator can resolve (AuthError: only
+        // the operator can re-authenticate), escalate straight to operator Telegram
+        // via gated_notify(Error) — the same Sleep-penetrating path #1594 allows
+        // through. Cooldown-stamped so a persistent AuthError escalates at most
+        // once per NOTIFY_COOLDOWN, not every tick. Other states keep the D3
+        // self-notify skip (transient / the agent reads its own inbox).
+        // NOTE: Crashed/Hang are NOT live AgentStates via this hook (never assigned
+        // to `state.current`); real crash/hang self-orchestrator escalation is a
+        // follow-up (#1701) using the process-exit / HealthState::Hung paths (the
+        // latter strong-gated for the known 348-FP).
+        if self_orchestrator_escalates(new_state) {
+            let track = tracks.entry(name.to_string()).or_insert(NotifyTrack {
+                last_at: now,
+                consecutive: 0,
+            });
+            track.consecutive += 1;
+            track.last_at = now;
+            if let Some(ch) = crate::channel::active_channel() {
+                let msg = format!(
+                    "🔑 {name} (team orchestrator) hit AuthError — only the operator can re-authenticate, and no peer can relay this. Check credentials / re-auth the agent."
+                );
+                let _ = crate::channel::gated_notify(
+                    ch.as_ref(),
+                    name,
+                    NotifySeverity::Error,
+                    &msg,
+                    false,
+                );
+            }
+            tracing::info!(agent = %name, "#1595: self-orchestrator AuthError escalated to operator Telegram (no peer to relay)");
+        }
+        return false; // D3: still skip the inbox self-notify (no peer reads it)
     }
     let unlock_at = if new_state == crate::state::AgentState::UsageLimit {
         parse_unlock_at(pane_tail)
@@ -1287,10 +1328,17 @@ pub(crate) fn process_error_recovery(
                     "⚠️ {name} transient upstream error auto-retry exhausted ({} retries). Manual intervention required.",
                     SERVER_RATE_LIMIT_MAX_RETRIES
                 );
+                // #1595 Step 1: `Error`, not `Warn`. Exhaustion of the #1696 tiered
+                // retry (the full ~75min budget burned) means the agent is stuck
+                // and auto-recovery has given up — a genuine P0 that MUST break
+                // through `Sleep`/`Away` to wake the operator (the #1594 gate
+                // suppresses `Warn` in Sleep, so at `Warn` this alert was silently
+                // dropped exactly when the operator most needs it). Severity is
+                // routing-only (the Telegram adapter ignores it for rendering).
                 let _ = crate::channel::gated_notify(
                     ch.as_ref(),
                     name,
-                    NotifySeverity::Warn,
+                    NotifySeverity::Error,
                     &msg,
                     false,
                 );
@@ -2200,6 +2248,100 @@ instances:
             content.lines().filter(|l| !l.is_empty()).count(),
             0,
             "orch-a=0"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1595 Step 2 (pure): only AuthError escalates a self-orchestrator.
+    #[test]
+    fn self_orchestrator_escalates_only_on_autherror_1595() {
+        use crate::state::AgentState;
+        assert!(super::self_orchestrator_escalates(AgentState::AuthError));
+        for s in [
+            AgentState::UsageLimit,
+            AgentState::RateLimit,
+            AgentState::Hang,
+            AgentState::Crashed,
+            AgentState::PermissionPrompt,
+            AgentState::Ready,
+            AgentState::Idle,
+        ] {
+            assert!(
+                !super::self_orchestrator_escalates(s),
+                "{s:?} must NOT escalate (only AuthError is terminal + operator-only)"
+            );
+        }
+    }
+
+    /// #1595 Step 2: a self-orchestrator (orch==name) hitting AuthError escalates
+    /// (Telegram path + cooldown-track stamp) but still skips the inbox self-notify;
+    /// a non-terminal state stays a plain drop (no stamp). Telegram is a no-op here
+    /// (no active channel in tests) — the cooldown-track stamp is the observable
+    /// signal that the escalation branch ran. Cooldown prevents re-escalation.
+    #[test]
+    fn self_orchestrator_autherror_escalates_others_drop_1595() {
+        let home = std::env::temp_dir().join(format!("agend-1595-selforch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("inbox")).ok();
+        crate::teams::create(
+            &home,
+            &serde_json::json!({"name": "t", "members": ["solo"], "orchestrator": "solo"}),
+        );
+
+        // Non-terminal (RateLimit) self-orchestrator → plain drop, no escalation.
+        let mut tracks = std::collections::HashMap::new();
+        let sent = super::maybe_notify_member_state_change(
+            &home,
+            "solo",
+            crate::state::AgentState::Ready,
+            crate::state::AgentState::RateLimit,
+            "",
+            &mut tracks,
+        );
+        assert!(!sent, "self-notify skipped");
+        assert!(
+            !tracks.contains_key("solo"),
+            "#1595: a non-AuthError self-orchestrator must NOT escalate (no track stamp)"
+        );
+
+        // AuthError self-orchestrator → escalation branch runs (stamps cooldown
+        // track), still returns false (the escalation is Telegram, not inbox).
+        let mut tracks = std::collections::HashMap::new();
+        let sent = super::maybe_notify_member_state_change(
+            &home,
+            "solo",
+            crate::state::AgentState::Ready,
+            crate::state::AgentState::AuthError,
+            "",
+            &mut tracks,
+        );
+        assert!(!sent, "inbox self-notify still skipped");
+        let t = tracks
+            .get("solo")
+            .expect("#1595: AuthError self-orchestrator must escalate → cooldown track stamped");
+        assert_eq!(t.consecutive, 1, "escalation counted once");
+        let inbox =
+            std::fs::read_to_string(home.join("inbox").join("solo.jsonl")).unwrap_or_default();
+        assert_eq!(
+            inbox.lines().filter(|l| !l.is_empty()).count(),
+            0,
+            "escalation is Telegram, not an inbox self-notify"
+        );
+
+        // Cooldown: a second immediate AuthError must NOT re-escalate.
+        let sent2 = super::maybe_notify_member_state_change(
+            &home,
+            "solo",
+            crate::state::AgentState::Ready,
+            crate::state::AgentState::AuthError,
+            "",
+            &mut tracks,
+        );
+        assert!(!sent2);
+        assert_eq!(
+            tracks["solo"].consecutive, 1,
+            "#1595: NOTIFY_COOLDOWN must prevent re-escalation within the window"
         );
 
         std::fs::remove_dir_all(&home).ok();
@@ -3166,6 +3308,30 @@ instances:
         assert!(
             !src.contains(&force_true),
             "#1680: no force=true continue-inject may remain"
+        );
+    }
+
+    /// #1595 Step 1 (source guard): the ServerRateLimit retry-exhausted Telegram
+    /// notify MUST be `Error` (not Warn) so it breaks through the #1594 Sleep-mode
+    /// gate. The gate's Error-passes-Sleep / Warn-suppressed policy is pinned by
+    /// `channel::tests::should_notify_in_mode_policy_grid`; this pins the producer
+    /// side — that exhaustion (the full #1696 tiered budget burned) escalates to a
+    /// P0 that wakes a sleeping operator instead of being silently dropped.
+    #[test]
+    fn server_rate_limit_exhausted_notify_is_error_severity_1595() {
+        let src = include_str!("supervisor.rs");
+        // Window the exhaust branch (production), well away from this test body.
+        let idx = src
+            .find("auto-retry exhausted")
+            .expect("exhaust notice present in source");
+        let window = &src[idx..(idx + 1200).min(src.len())];
+        assert!(
+            window.contains("NotifySeverity::Error"),
+            "#1595: the ServerRateLimit-exhausted gated_notify must use Error severity"
+        );
+        assert!(
+            !window.contains("NotifySeverity::Warn"),
+            "#1595: the exhaust notify must not remain Warn (suppressed in Sleep)"
         );
     }
 }
