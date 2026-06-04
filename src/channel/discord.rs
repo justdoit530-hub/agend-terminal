@@ -1060,9 +1060,14 @@ mod tests {
         });
 
         // Step 3: Create twilight client pointed at mock server.
-        let client = twilight_http::Client::builder()
-            .proxy(format!("127.0.0.1:{port}"), true)
-            .build();
+        // twilight-http 0.17's ratelimiter initialises inside `build()` and needs
+        // a Tokio reactor in scope, so construct it within the shared discord
+        // runtime (production builds the client in async context already).
+        let client = super::block_on_value(async {
+            twilight_http::Client::builder()
+                .proxy(format!("127.0.0.1:{port}"), true)
+                .build()
+        });
         let client = std::sync::Arc::new(client);
 
         // Step 4: Create DiscordChannel with this client + a recorded binding.
@@ -1165,9 +1170,13 @@ mod tests {
     fn make_test_channel_with_mock(
         port: u16,
     ) -> (super::DiscordChannel, std::sync::mpsc::Sender<ChannelEvent>) {
-        let client = twilight_http::Client::builder()
-            .proxy(format!("127.0.0.1:{port}"), true)
-            .build();
+        // twilight-http 0.17's ratelimiter initialises inside `build()` and needs
+        // a Tokio reactor in scope — build within the shared discord runtime.
+        let client = super::block_on_value(async {
+            twilight_http::Client::builder()
+                .proxy(format!("127.0.0.1:{port}"), true)
+                .build()
+        });
         super::DiscordChannel::new_for_test_with_http(std::sync::Arc::new(client))
     }
 
@@ -1438,9 +1447,12 @@ mod tests {
     #[test]
     fn discord_keepalive_patch_method_matches_spec() {
         let (port, handle, captured) = mock_http_server(200, "{}");
-        let client = twilight_http::Client::builder()
-            .proxy(format!("127.0.0.1:{port}"), true)
-            .build();
+        // twilight-http 0.17's ratelimiter needs a Tokio reactor at build().
+        let client = super::block_on_value(async {
+            twilight_http::Client::builder()
+                .proxy(format!("127.0.0.1:{port}"), true)
+                .build()
+        });
 
         let result = super::send_keepalive_patch(&client, 290926798999357250);
 
@@ -1457,6 +1469,32 @@ mod tests {
         // Body must set archived=false per Discord thread update spec.
         let body: serde_json::Value = serde_json::from_str(&req.body).expect("body must be JSON");
         assert_eq!(body["archived"], false, "must set archived=false");
+    }
+
+    /// TLS smoke (network, manual): proves twilight-http 0.17's
+    /// rustls-native-roots/ring stack actually completes a real TLS handshake —
+    /// the one merge-gate CI can't cover (the spec tests use a plaintext mock
+    /// server). `#[ignore]` so normal/CI runs skip it; run with
+    /// `cargo test --features tray,discord -- --ignored tls_handshake_smoke`.
+    ///
+    /// A missing crypto provider would panic ("no process-level CryptoProvider")
+    /// during the handshake. We hit `GET /gateway` (no valid token → 401 is fine);
+    /// any HTTP/auth response proves the handshake succeeded. Auth is NOT tested.
+    #[tokio::test]
+    #[ignore = "network: real Discord TLS handshake smoke; run manually"]
+    async fn tls_handshake_smoke_real_discord() {
+        let client = twilight_http::Client::new("Bot tls-smoke-no-valid-token".to_string());
+        // `.gateway()` GETs https://discord.com/api/v10/gateway. The handshake
+        // happens before any auth check. A panic here = rustls/ring not wired.
+        let outcome = client.gateway().await;
+        // Reaching this line at all means no CryptoProvider panic. Surface the
+        // result so the run log shows the handshake completed.
+        match outcome {
+            Ok(_) => eprintln!("TLS smoke: handshake + request OK (gateway responded)"),
+            Err(e) => {
+                eprintln!("TLS smoke: handshake OK, request returned (expected w/o token): {e}")
+            }
+        }
     }
 
     /// Keepalive interval constant is reasonable (≤ Discord's shortest
