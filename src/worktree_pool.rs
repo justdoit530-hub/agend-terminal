@@ -527,38 +527,144 @@ pub fn reconcile_orphan_leases(home: &Path) {
 /// Grace period before a released worktree becomes a GC candidate.
 const GC_GRACE_HOURS: i64 = 24;
 
+/// t-worktree-leak PR-2: hard age cap for the force-reclaim backstop. A
+/// never-released lease whose agent shows NO liveness AND whose `leased_at` is
+/// older than this is force-reclaimed. Configurable (`AGEND_WORKTREE_FORCE_RECLAIM_DAYS`).
+fn force_reclaim_age_days() -> i64 {
+    std::env::var("AGEND_WORKTREE_FORCE_RECLAIM_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .unwrap_or(7)
+}
+
+/// reviewer-2 #5: force-reclaim post-boot grace (seconds). After a daemon restart
+/// the live-agent registry (the process-liveness signal) is empty until agents
+/// re-spawn; suspend force-reclaim for this window so a mid-respawn agent is not
+/// reclaimed during the liveness blind spot. Configurable
+/// (`AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS`).
+fn force_reclaim_boot_grace_secs() -> u64 {
+    std::env::var("AGEND_WORKTREE_FORCE_RECLAIM_BOOT_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600) // 10 min
+}
+
+/// Pure boot-grace predicate: is `now_unix` within `grace_secs` of `boot_unix`?
+/// Unknown boot time → conservative `true` (suspend reclaim — never reclaim when
+/// we cannot tell how long the daemon has been up).
+fn within_boot_grace(boot_unix: Option<u64>, now_unix: u64, grace_secs: u64) -> bool {
+    match boot_unix {
+        Some(b) => now_unix.saturating_sub(b) < grace_secs,
+        None => true,
+    }
+}
+
+/// reviewer-2 #5: is the running daemon still inside its post-boot grace window?
+/// No active daemon run dir → NOT in grace (tests / non-daemon contexts — GC only
+/// runs inside the daemon). Daemon present but boot time unreadable → conservative
+/// in-grace (suspend).
+fn daemon_within_boot_grace(home: &Path) -> bool {
+    let Some(run_dir) = crate::daemon::find_active_run_dir(home) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    within_boot_grace(
+        crate::daemon::read_daemon_boot_unix(&run_dir),
+        now,
+        force_reclaim_boot_grace_secs(),
+    )
+}
+
+/// PR-2: liveness recency window (mirrors the binding-reconcile heartbeat window,
+/// binding.rs:380). A heartbeat / PTY input within this counts as alive.
+const LIVENESS_WINDOW_MS: u64 = 3_600_000; // 1h
+
+/// PR-2: per-agent jitter ceiling (hours) added to the age cap, so a fleet whose
+/// leases all crossed the cap together (e.g. after a long daemon outage) is
+/// reclaimed spread across ticks rather than in a single thundering-herd archive.
+const FORCE_RECLAIM_JITTER_HOURS: i64 = 6;
+
+/// t-worktree-leak PR-2: how a candidate was selected — drives the retention
+/// sweep's action (clean releases just archive; force-reclaims also emit a LOUD
+/// confidence-classified ALERT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcKind {
+    /// Released past the grace TTL — the normal, expected path.
+    CleanRelease,
+    /// Never released, agent abandoned (no liveness) AND past the age cap — the
+    /// force-reclaim backstop tail (no-event abandonment / dead agent).
+    ForceReclaim,
+}
+
 /// A worktree identified as a GC candidate.
 #[derive(Debug, Clone)]
 pub struct GcCandidate {
     pub path: PathBuf,
     pub agent: String,
     pub reason: String,
+    /// t-worktree-leak PR-2: selection kind (clean-release vs force-reclaim).
+    pub kind: GcKind,
 }
 
 /// Scan for GC candidates: daemon-tagged, past grace TTL, not pinned, no active binding.
+/// Max directory depth the marker-walk descends under the worktree root. Covers
+/// flat (`<agent>-<enc>/` = depth 1), nested (`<agent>/<branch>/` = depth 2), and
+/// slash-branch (`<agent>/fix/xxx/` = depth 3) layouts with headroom; bounded so a
+/// pathological tree can't make the walk unbounded.
+const MARKER_WALK_MAX_DEPTH: usize = 5;
+
+/// t-worktree-leak (reviewer-2 #4): recursively collect daemon-managed worktree
+/// dirs (those holding a `.agend-managed` marker) under `root`, to any depth up to
+/// `max_depth`. Once a dir carries the marker it IS a worktree → collected and NOT
+/// descended into (so we never walk a worktree's own working tree). This replaces
+/// the old fixed-depth scan that missed slash-branch worktrees.
+fn collect_managed_worktrees(root: &Path, max_depth: usize, out: &mut Vec<PathBuf>) {
+    if max_depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.join(MANAGED_MARKER).exists() {
+            out.push(p); // a worktree — collect, don't descend into its working tree
+        } else {
+            collect_managed_worktrees(&p, max_depth - 1, out);
+        }
+    }
+}
+
 pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
     let mut candidates = Vec::new();
+    // t-worktree-leak PR-2: snapshot the live-agent set ONCE per pass (the
+    // force-reclaim liveness check consults it per candidate; this is the
+    // process-alive signal that protects idle-but-running agents).
+    let live_agents: std::collections::HashSet<String> =
+        crate::runtime::list_agents_with_fallback(home)
+            .into_iter()
+            .collect();
 
-    // New layout: <home>/worktrees/<agent>/<branch>/
+    // New layout: <home>/worktrees/<agent>/<branch>/ — but a SLASH branch
+    // (`fix/xxx`, `feat/yyy` = the common case) nests an EXTRA level
+    // (`<agent>/fix/xxx`), so the old fixed 1-level descent enumerated `fix` (not a
+    // worktree, no marker) and missed the real worktree entirely (reviewer-2 #4, a
+    // pre-existing GC bug that silently disabled GC — clean-release AND
+    // force-reclaim — for most branches). Walk DOWN to the `.agend-managed` marker
+    // instead of assuming a fixed depth.
     let new_root = daemon_managed_worktree_root(home);
-    if new_root.is_dir() {
-        if let Ok(agents) = std::fs::read_dir(&new_root) {
-            for agent_entry in agents.flatten() {
-                if !agent_entry.path().is_dir() {
-                    continue;
-                }
-                if let Ok(branches) = std::fs::read_dir(agent_entry.path()) {
-                    for branch_entry in branches.flatten() {
-                        let wt_path = branch_entry.path();
-                        if !wt_path.is_dir() {
-                            continue;
-                        }
-                        if let Some(candidate) = evaluate_candidate(home, &wt_path) {
-                            candidates.push(candidate);
-                        }
-                    }
-                }
-            }
+    let mut managed = Vec::new();
+    collect_managed_worktrees(&new_root, MARKER_WALK_MAX_DEPTH, &mut managed);
+    for wt_path in &managed {
+        if let Some(candidate) = evaluate_candidate(home, wt_path, &live_agents) {
+            candidates.push(candidate);
         }
     }
 
@@ -577,7 +683,7 @@ pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
                         if !wt_path.is_dir() {
                             continue;
                         }
-                        if let Some(candidate) = evaluate_candidate(home, &wt_path) {
+                        if let Some(candidate) = evaluate_candidate(home, &wt_path, &live_agents) {
                             candidates.push(candidate);
                         }
                     }
@@ -589,7 +695,125 @@ pub fn gc_candidates(home: &Path) -> Vec<GcCandidate> {
     candidates
 }
 
-fn evaluate_candidate(home: &Path, wt_path: &Path) -> Option<GcCandidate> {
+/// t-worktree-leak PR-2 safety #1: does the agent show ANY sign of life? This is
+/// MULTI-signal — never just heartbeat — so an idle-but-running agent (no recent
+/// heartbeat) is still protected. A positive on ANY signal → the worktree is
+/// NEVER force-reclaimed, regardless of age (liveness-AND-age). Reads that fail
+/// lean toward "alive" (conservative — never mis-reclaim).
+fn agent_has_liveness(
+    home: &Path,
+    agent: &str,
+    live_agents: &std::collections::HashSet<String>,
+) -> bool {
+    // (process) In the live-agent registry — covers idle-but-running agents that
+    // are not currently heartbeating.
+    if live_agents.contains(agent) {
+        return true;
+    }
+    let hb = crate::daemon::heartbeat_pair::snapshot_for(agent);
+    let now = crate::daemon::heartbeat_pair::now_ms();
+    // (heartbeat) any MCP tool call within the recency window.
+    if hb.heartbeat_at_ms != 0 && now.saturating_sub(hb.heartbeat_at_ms) < LIVENESS_WINDOW_MS {
+        return true;
+    }
+    // (PTY) recent terminal input.
+    if hb.last_input_at_ms != 0 && now.saturating_sub(hb.last_input_at_ms) < LIVENESS_WINDOW_MS {
+        return true;
+    }
+    // (waiting_on) actively declared a blocker → alive.
+    if hb.waiting_on_since_ms.is_some() {
+        return true;
+    }
+    // (ci-watch) subscribed to a live ci-watch → active CI-tracked work.
+    if agent_is_ci_watch_subscriber(home, agent) {
+        return true;
+    }
+    false
+}
+
+/// t-worktree-leak PR-2: fresh multi-signal liveness check for `agent` (snapshots
+/// the live-agent set itself). Used by the retention sweep's pre-archive fencing
+/// re-validation so an agent that came back to life between enumeration and
+/// archive is spared.
+pub(crate) fn is_agent_alive(home: &Path, agent: &str) -> bool {
+    let live_agents: std::collections::HashSet<String> =
+        crate::runtime::list_agents_with_fallback(home)
+            .into_iter()
+            .collect();
+    agent_has_liveness(home, agent, &live_agents)
+}
+
+/// PR-2: is `agent` a subscriber on any live ci-watch? codex gap ②: this is a
+/// liveness source, so every read failure FAILS TOWARD ALIVE (returns `true`,
+/// blocking reclaim) rather than silently treating the agent as not-subscribed —
+/// a mis-read must never let us reclaim a live agent. The ONE exception is the
+/// watch dir being genuinely absent (NotFound), which is a real "no watches"
+/// state, not a read failure.
+fn agent_is_ci_watch_subscriber(home: &Path, agent: &str) -> bool {
+    let dir = crate::daemon::ci_watch::ci_watches_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true, // can't enumerate watches → fail-toward-alive
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // A watch file we cannot read/parse COULD carry this agent's subscription
+        // → fail-toward-alive rather than skip it.
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return true;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return true;
+        };
+        if let Some(subs) = v.get("subscribers").and_then(|s| s.as_array()) {
+            if subs
+                .iter()
+                .any(|s| s.get("instance").and_then(|i| i.as_str()) == Some(agent))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// PR-2: is a never-released lease past the (per-agent jittered) force-reclaim age
+/// cap? The deterministic jitter spreads a fleet whose leases all crossed the cap
+/// together across ticks (anti-thundering-herd, safety #3). No `leased_at` → not
+/// reclaimable (conservative).
+fn leased_at_force_reclaimable(leased_at: Option<&str>, agent: &str) -> bool {
+    let Some(ts) = leased_at else {
+        return false;
+    };
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) else {
+        return false;
+    };
+    let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+    let jitter_h = (fnv1a(agent) % (FORCE_RECLAIM_JITTER_HOURS.max(1) as u64)) as i64;
+    let cap = chrono::Duration::days(force_reclaim_age_days()) + chrono::Duration::hours(jitter_h);
+    age > cap
+}
+
+/// Stable per-agent FNV-1a hash → deterministic jitter (no randomness, so reclaim
+/// timing is reproducible).
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn evaluate_candidate(
+    home: &Path,
+    wt_path: &Path,
+    live_agents: &std::collections::HashSet<String>,
+) -> Option<GcCandidate> {
     // Must be daemon-managed (R14).
     if !is_daemon_managed(wt_path) {
         return None;
@@ -619,32 +843,64 @@ fn evaluate_candidate(home: &Path, wt_path: &Path) -> Option<GcCandidate> {
     if agent_name.is_empty() {
         return None;
     }
-    // Must not have active binding.
-    if crate::binding::read(home, &agent_name).is_some() {
-        return None;
-    }
-    // Must be past grace TTL (check released_at in .agend-managed marker).
-    // If no released_at, worktree is still active (not yet released) → not a candidate.
-    if let Some(released_line) = marker_content
+    let binding_present = crate::binding::read(home, &agent_name).is_some();
+    let released_at = marker_content
         .lines()
-        .find(|l| l.starts_with("released_at="))
-    {
-        let ts = released_line.strip_prefix("released_at=").unwrap_or("");
-        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-            let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
-            if age < chrono::Duration::hours(GC_GRACE_HOURS) {
-                return None; // Still within grace period after release.
-            }
-        }
-    } else {
-        return None; // No released_at → still active, not a GC candidate.
-    }
+        .find_map(|l| l.strip_prefix("released_at="));
 
-    Some(GcCandidate {
-        path: wt_path.to_path_buf(),
-        agent: agent_name,
-        reason: format!("daemon-tagged, released >{}h, not pinned", GC_GRACE_HOURS),
-    })
+    match released_at {
+        // ── Clean-release path: explicitly released, past the grace TTL. ──
+        Some(ts) => {
+            // A released lease should already be unbound; if it is still bound,
+            // that is a contradiction — leave it alone (conservative).
+            if binding_present {
+                return None;
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                let age = chrono::Utc::now().signed_duration_since(dt.with_timezone(&chrono::Utc));
+                if age < chrono::Duration::hours(GC_GRACE_HOURS) {
+                    return None; // still within grace
+                }
+            }
+            Some(GcCandidate {
+                path: wt_path.to_path_buf(),
+                agent: agent_name,
+                reason: format!("daemon-tagged, released >{}h, not pinned", GC_GRACE_HOURS),
+                kind: GcKind::CleanRelease,
+            })
+        }
+        // ── t-worktree-leak PR-2 force-reclaim backstop: NEVER released. ──
+        // This is ONLY the no-event-abandonment / dead-agent tail (the
+        // invariant + sweeper in PR-1 handle every worktree that DID see a
+        // merge/close/task-done event; the 7-day expired-intent path hands off
+        // here). liveness-AND-age: ANY live signal → never reclaim (even past the
+        // cap); otherwise require the per-agent-jittered age cap.
+        None => {
+            // reviewer-2 #5: suspend force-reclaim during the daemon's post-boot
+            // grace window (the process-liveness signal is still re-establishing).
+            if daemon_within_boot_grace(home) {
+                return None;
+            }
+            if agent_has_liveness(home, &agent_name, live_agents) {
+                return None;
+            }
+            let leased_at = marker_content
+                .lines()
+                .find_map(|l| l.strip_prefix("leased_at="));
+            if !leased_at_force_reclaimable(leased_at, &agent_name) {
+                return None;
+            }
+            Some(GcCandidate {
+                path: wt_path.to_path_buf(),
+                agent: agent_name,
+                reason: format!(
+                    "force-reclaim: never-released lease, no liveness signal, leased >{}d (abandoned)",
+                    force_reclaim_age_days()
+                ),
+                kind: GcKind::ForceReclaim,
+            })
+        }
+    }
 }
 
 /// Dry-run: log candidates without deleting. Returns candidate list.
@@ -714,6 +970,26 @@ pub fn gc_run(home: &Path) -> Vec<GcResult> {
 fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     let wt_path = &candidate.path;
 
+    // t-worktree-leak PR-2 (codex gap ① CRITICAL): a force-reclaim candidate MUST
+    // NEVER be hard-deleted. Route it through the SINGLE safe deletion path
+    // (retention's `maybe_remove_candidate`: pre-archive liveness re-check +
+    // atomic archive-to-trash + unbind + LOUD confidence ALERT), so the daemon
+    // `gc_run` path and the retention sweep cannot diverge into an irrecoverable
+    // delete. Clean-release candidates keep the historical hard-delete below.
+    if candidate.kind == GcKind::ForceReclaim {
+        use crate::daemon::retention::worktrees::{maybe_remove_candidate, RemovalOutcome};
+        let outcome = maybe_remove_candidate(home, candidate);
+        return GcResult {
+            path: wt_path.clone(),
+            agent: candidate.agent.clone(),
+            removed: matches!(outcome, RemovalOutcome::Removed),
+            error: match outcome {
+                RemovalOutcome::Skipped { reason } => Some(reason),
+                RemovalOutcome::Removed => None,
+            },
+        };
+    }
+
     // Acquire the same binding lock that bind_full() uses, making
     // GC deletion and bind mutually exclusive (eliminates TOCTOU).
     let lock_path = crate::paths::runtime_dir(home)
@@ -732,8 +1008,14 @@ fn gc_remove_one(home: &Path, candidate: &GcCandidate) -> GcResult {
     };
 
     // Re-validate under lock: binding/pinned/grace state may have
-    // changed since gc_candidates() enumerated this worktree.
-    if evaluate_candidate(home, wt_path).is_none() {
+    // changed since gc_candidates() enumerated this worktree. t-worktree-leak
+    // PR-2: re-snapshot liveness here too, so a force-reclaim candidate whose
+    // agent came back to life between enumeration and removal is spared (fencing).
+    let live_agents: std::collections::HashSet<String> =
+        crate::runtime::list_agents_with_fallback(home)
+            .into_iter()
+            .collect();
+    if evaluate_candidate(home, wt_path, &live_agents).is_none() {
         return GcResult {
             path: wt_path.clone(),
             agent: candidate.agent.clone(),
@@ -2433,5 +2715,249 @@ mod tests {
         let resolved = resolve_source_repo(&fake_dir);
         assert!(resolved.is_none());
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── t-worktree-leak PR-2: force-reclaim backstop tests ──
+
+    fn backdate_lease(wt_path: &Path, days_ago: i64) {
+        let marker = wt_path.join(MANAGED_MARKER);
+        let content = std::fs::read_to_string(&marker).unwrap();
+        let old = (chrono::Utc::now() - chrono::Duration::days(days_ago)).to_rfc3339();
+        let new: String = content
+            .lines()
+            .map(|l| {
+                if l.starts_with("leased_at=") {
+                    format!("leased_at={old}")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&marker, new).unwrap();
+    }
+
+    #[test]
+    fn force_reclaim_dead_agent_past_cap_is_candidate() {
+        let home = tmp_home("fr-dead");
+        let repo = tmp_repo("fr-dead-repo");
+        let lease = lease(&home, &repo, "dev-dead", "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let cand = evaluate_candidate(&home, &lease.path, &live);
+        assert!(
+            cand.is_some(),
+            "dead agent, never-released, past cap → force-reclaim candidate"
+        );
+        assert_eq!(cand.unwrap().kind, GcKind::ForceReclaim);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_spares_live_registry_agent() {
+        // safety #1: any live signal → never reclaim, even past the cap.
+        let home = tmp_home("fr-live");
+        let repo = tmp_repo("fr-live-repo");
+        let lease = lease(&home, &repo, "dev-live", "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        let live: std::collections::HashSet<String> =
+            ["dev-live".to_string()].into_iter().collect();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "agent live in the registry → spared even past cap (liveness-AND-age)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_spares_ci_watch_subscriber() {
+        // multi-signal: a ci-watch subscription is a liveness signal (not heartbeat).
+        let home = tmp_home("fr-ciw");
+        let repo = tmp_repo("fr-ciw-repo");
+        let lease = lease(&home, &repo, "dev-ciw", "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        std::fs::write(
+            ci_dir.join("w.json"),
+            serde_json::json!({
+                "repo": "o/r", "branch": "feat/x",
+                "subscribers": [{ "instance": "dev-ciw" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "agent subscribed to a ci-watch → spared (multi-signal liveness, not just heartbeat)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_spares_recent_lease() {
+        // dead agent but the lease is recent → not yet past the age cap.
+        let home = tmp_home("fr-recent");
+        let repo = tmp_repo("fr-recent-repo");
+        let lease = lease(&home, &repo, "dev-recent", "feat/x").expect("lease");
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "recent lease → not yet reclaimable (age gate)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // codex gap ③: the heartbeat / PTY / waiting_on liveness signals + the
+    // read-failure → fail-toward-alive path (§3.9, safety-critical).
+
+    #[test]
+    fn force_reclaim_spares_recent_heartbeat() {
+        let home = tmp_home("fr-hb");
+        let repo = tmp_repo("fr-hb-repo");
+        let agent = "fr-hb-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.heartbeat_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        });
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "recent heartbeat → spared (heartbeat liveness signal)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_spares_recent_pty_input() {
+        let home = tmp_home("fr-pty");
+        let repo = tmp_repo("fr-pty-repo");
+        let agent = "fr-pty-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.last_input_at_ms = crate::daemon::heartbeat_pair::now_ms();
+        });
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "recent PTY input → spared (PTY liveness signal)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_spares_declared_waiting_on() {
+        let home = tmp_home("fr-wait");
+        let repo = tmp_repo("fr-wait-repo");
+        let agent = "fr-wait-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        crate::daemon::heartbeat_pair::update_with(agent, |p| {
+            p.waiting_on_since_ms = Some(crate::daemon::heartbeat_pair::now_ms());
+        });
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "declared waiting_on → spared (blocked-but-alive signal)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_reclaim_ci_watch_read_failure_fails_alive() {
+        let home = tmp_home("fr-ciwfail");
+        let repo = tmp_repo("fr-ciwfail-repo");
+        let agent = "fr-ciwfail-agent";
+        let lease = lease(&home, &repo, agent, "feat/x").expect("lease");
+        backdate_lease(&lease.path, force_reclaim_age_days() + 2);
+        // An unparseable ci-watch file → the liveness read fails → fail-toward-alive.
+        let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+        std::fs::create_dir_all(&ci_dir).unwrap();
+        std::fs::write(ci_dir.join("corrupt.json"), "{ this is not json").unwrap();
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(
+            evaluate_candidate(&home, &lease.path, &live).is_none(),
+            "unparseable ci-watch → fail-toward-alive → spared (never reclaim on uncertainty)"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn gc_run_force_reclaim_archives_never_hard_deletes() {
+        // codex gap ① CRITICAL: the daemon gc_run/gc_remove_one path must route a
+        // force-reclaim through the SAFE helper, never hard-delete. Proof: it is
+        // ARCHIVED to .trash (recoverable) rather than removed — the old
+        // `git worktree remove --force` would have left nothing behind.
+        let home = tmp_home("fr-gcrun");
+        let repo = tmp_repo("fr-gcrun-repo");
+        let lease = lease(&home, &repo, "fr-gcrun-agent", "feat/x").expect("lease");
+        let cand = GcCandidate {
+            path: lease.path.clone(),
+            agent: "fr-gcrun-agent".to_string(),
+            reason: "fr".to_string(),
+            kind: GcKind::ForceReclaim,
+        };
+        let result = gc_remove_one(&home, &cand);
+        assert!(
+            result.removed,
+            "force-reclaim via gc_run should archive: {:?}",
+            result.error
+        );
+        assert!(!lease.path.exists(), "worktree moved out");
+        let trash = home.join(".trash").join("worktrees");
+        assert!(
+            std::fs::read_dir(&trash)
+                .map(|d| d.flatten().count() > 0)
+                .unwrap_or(false),
+            "gc_run force-reclaim must ARCHIVE to .trash (recoverable), never hard-delete"
+        );
+        assert!(
+            crate::binding::read(&home, "fr-gcrun-agent").is_none(),
+            "binding unbound after force-reclaim"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn collect_managed_worktrees_finds_slash_branch_nested() {
+        // reviewer-2 #4: a slash-branch worktree nests an extra level
+        // (worktrees/<agent>/fix/xxx) and was missed by the old fixed-depth scan.
+        let home = tmp_home("walk-slash");
+        let root = daemon_managed_worktree_root(&home);
+        let nested = root.join("dev").join("fix").join("xxx");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(MANAGED_MARKER), "agent=dev\n").unwrap();
+        let flat = root.join("dev").join("track-x");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join(MANAGED_MARKER), "agent=dev\n").unwrap();
+        let mut out = Vec::new();
+        collect_managed_worktrees(&root, MARKER_WALK_MAX_DEPTH, &mut out);
+        assert!(
+            out.contains(&nested),
+            "slash-branch nested worktree must be enumerated (reviewer-2 #4)"
+        );
+        assert!(out.contains(&flat), "non-slash worktree still enumerated");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn boot_grace_predicate_suspends_only_when_recent_or_unknown() {
+        // reviewer-2 #5: recent boot → suspend; aged boot → proceed; unknown →
+        // conservative suspend.
+        assert!(
+            within_boot_grace(Some(1000), 1100, 600),
+            "100s after boot, 600s grace → in grace (suspend)"
+        );
+        assert!(
+            !within_boot_grace(Some(1000), 2000, 600),
+            "1000s after boot → past grace (proceed)"
+        );
+        assert!(
+            within_boot_grace(None, 2000, 600),
+            "unknown boot time → conservative suspend"
+        );
     }
 }

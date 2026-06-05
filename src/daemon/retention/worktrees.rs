@@ -107,15 +107,63 @@ fn try_archive(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn maybe_remove_candidate(home: &Path, path: &Path, agent: &str) -> RemovalOutcome {
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+pub(crate) fn maybe_remove_candidate(
+    home: &Path,
+    candidate: &crate::worktree_pool::GcCandidate,
+) -> RemovalOutcome {
+    let agent = candidate.agent.as_str();
+    let force_reclaim = candidate.kind == crate::worktree_pool::GcKind::ForceReclaim;
+    // t-worktree-leak PR-2: a force-reclaim's binding is still present (never
+    // released) — capture branch/repo from it BEFORE archive for the post-archive
+    // ALERT classification + the unbind.
+    let pre_binding = if force_reclaim {
+        crate::binding::read(home, agent)
+    } else {
+        None
+    };
+    let path = candidate
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| candidate.path.clone());
     let path = path.as_path();
     let status_output =
         crate::git_helpers::git_bypass(path, &["status", "--porcelain=v1", "--ignored"]);
     match status_output {
         Ok(o) if o.status.success() => {
-            if !o.stdout.is_empty() {
-                let status_text = String::from_utf8_lossy(&o.stdout);
+            let status_text = String::from_utf8_lossy(&o.stdout);
+            // Dirty pre-check, parameterized by mode (reviewer-2 efficacy). Porcelain
+            // v1 line = `XY <path>`: code at cols 0..2, path from col 3. `!!` = ignored.
+            //
+            // FORCE-RECLAIM (only fires on dead+age, ALWAYS archive-to-trash =
+            // recoverable): no gitignored file should block — `target/`, the
+            // `.agend-managed` marker, operator scratch all land in `.trash`
+            // recoverably (the archive IS the safety net). Block ONLY on real
+            // tracked/untracked WIP. Without this, every BUILT worktree (`!! target/`)
+            // no-ops — the same defect the marker caused.
+            //
+            // CLEAN-RELEASE (can hard-delete via gc_run = irrecoverable): keep #1053's
+            // `--ignored` strictness to protect operator gitignored DATA (T13a) — but
+            // never let the daemon's OWN marker block. (CleanRelease over-protecting
+            // `target/` is a separate pre-existing leak root, tracked as follow-up.)
+            let has_blocking_content = status_text.lines().any(|line| {
+                let code = line.get(..2).unwrap_or("");
+                let path = line.get(3..).map(str::trim).unwrap_or("");
+                if path.is_empty() {
+                    return false;
+                }
+                // The daemon's OWN marker NEVER blocks, under ANY status code — it is
+                // `!! .agend-managed` where the repo gitignores it (.gitignore:29) and
+                // `?? .agend-managed` where it does not. Either way, not operator data.
+                if path == crate::worktree_pool::MANAGED_MARKER {
+                    return false;
+                }
+                if code == "!!" {
+                    // Other ignored file (e.g. `target/`, operator scratch).
+                    return !force_reclaim; // force-reclaim: archive-recoverable → never blocks
+                }
+                true // tracked/untracked = real WIP → always blocks
+            });
+            if has_blocking_content {
                 tracing::warn!(
                     path = %path.display(),
                     status = %status_text.trim(),
@@ -153,10 +201,23 @@ pub(crate) fn maybe_remove_candidate(home: &Path, path: &Path, agent: &str) -> R
             };
         }
     };
-    // #1170 TOCTOU fix: re-validate binding state immediately before archive.
-    // gc_candidates() checked this earlier, but the worktree may have been
-    // rebound between enumeration and now.
-    if crate::binding::read(home, agent).is_some() {
+    // #1170 + t-worktree-leak PR-2: re-validate just before archive (TOCTOU /
+    // fencing). For a CLEAN release the binding must be gone — a rebind means the
+    // lease is live again → skip. For a FORCE-RECLAIM the binding is EXPECTED to be
+    // present (never released), so re-check LIVENESS instead: if the agent came
+    // back to life between enumeration and now, spare it.
+    if force_reclaim {
+        if crate::worktree_pool::is_agent_alive(home, agent) {
+            tracing::info!(
+                agent,
+                path = %path.display(),
+                "force-reclaim: agent showed liveness at archive time — sparing (fencing)"
+            );
+            return RemovalOutcome::Skipped {
+                reason: "agent_alive_at_archive".to_string(),
+            };
+        }
+    } else if crate::binding::read(home, agent).is_some() {
         tracing::info!(
             agent,
             path = %path.display(),
@@ -187,6 +248,23 @@ pub(crate) fn maybe_remove_candidate(home: &Path, path: &Path, agent: &str) -> R
             if let Err(e) = prune {
                 tracing::warn!(error = %e, "git worktree prune failed (non-fatal)");
             }
+            // t-worktree-leak PR-2: a force-reclaim's binding is still present
+            // (never released) → clear it now, then LOUD-classify + ALERT.
+            if force_reclaim {
+                crate::binding::unbind(home, agent);
+                let branch = pre_binding
+                    .as_ref()
+                    .and_then(|b| b.get("branch").and_then(|v| v.as_str()));
+                let repo = pre_binding
+                    .as_ref()
+                    .and_then(|b| b.get("source_repo").and_then(|v| v.as_str()))
+                    .and_then(|src| {
+                        crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(
+                            src,
+                        ))
+                    });
+                emit_force_reclaim_alert(home, agent, branch, repo.as_deref(), &candidate.reason);
+            }
             RemovalOutcome::Removed
         }
         Err(e) => {
@@ -201,6 +279,66 @@ pub(crate) fn maybe_remove_candidate(home: &Path, path: &Path, agent: &str) -> R
             }
         }
     }
+}
+
+/// t-worktree-leak PR-2: classify a force-reclaim by the branch's pr_state, to set
+/// the ALERT confidence. Never blindly trusts pr_state — `unknown` is explicit.
+fn classify_force_reclaim(home: &Path, repo: Option<&str>, branch: Option<&str>) -> &'static str {
+    let (Some(repo), Some(branch)) = (repo, branch) else {
+        return "unknown";
+    };
+    use crate::daemon::pr_state::MergeState;
+    match crate::daemon::pr_state::load(home, repo, branch) {
+        Some(s) => match s.merge_state {
+            // A terminal PR whose worktree had to be force-reclaimed means the
+            // event-driven release (PR-1) NEVER fired for it = a bug.
+            MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. } => "observed_terminal",
+            _ if s.pr_number > 0 => "observed_open",
+            _ if s.last_gh_poll_at.is_some() => "queried_none",
+            _ => "unknown",
+        },
+        None => "unknown",
+    }
+}
+
+/// t-worktree-leak PR-2 safety #4: LOUD operator notification on a force-reclaim,
+/// classified by confidence. `observed_terminal` = a terminal PR that never
+/// released = an event-release BUG → error-level ALERT (forces the event path to
+/// be fixed, never silently swallowed); other confidences are expected
+/// abandonment cleanup (warn). Always recoverable from `.trash`.
+fn emit_force_reclaim_alert(
+    home: &Path,
+    agent: &str,
+    branch: Option<&str>,
+    repo: Option<&str>,
+    reason: &str,
+) {
+    let confidence = classify_force_reclaim(home, repo, branch);
+    if confidence == "observed_terminal" {
+        tracing::error!(
+            agent,
+            ?branch,
+            confidence,
+            reason,
+            "PR-2 FORCE-RECLAIM ALERT: archived a worktree whose PR is TERMINAL but was \
+             NEVER released — the event-driven release path FAILED (bug). Recoverable in .trash."
+        );
+    } else {
+        tracing::warn!(
+            agent, ?branch, confidence, reason,
+            "PR-2 force-reclaim: archived an abandoned never-released worktree (recoverable in .trash)"
+        );
+    }
+    crate::event_log::log(
+        home,
+        if confidence == "observed_terminal" {
+            "force_reclaim_alert_event_bug"
+        } else {
+            "force_reclaim_archived"
+        },
+        agent,
+        &format!("branch={branch:?} confidence={confidence} reason={reason}"),
+    );
 }
 
 /// Purge `.trash/worktrees/*` entries older than `AGEND_WORKTREE_GC_TRASH_DAYS`
@@ -254,7 +392,7 @@ pub(super) fn sweep(home: &Path) -> usize {
     let candidates = crate::worktree_pool::gc_candidates(home);
     let mut removed = 0;
     for c in &candidates {
-        match maybe_remove_candidate(home, &c.path, &c.agent) {
+        match maybe_remove_candidate(home, c) {
             RemovalOutcome::Removed => {
                 removed += 1;
                 tracing::info!(
@@ -288,6 +426,25 @@ pub(super) fn sweep(home: &Path) -> usize {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Serializes the tests that mutate the process-global
+    /// `AGEND_WORKTREE_GC_TRASH_DAYS` env var, so they cannot race each other (or be
+    /// observed mid-mutation) under the parallel test runner.
+    static GC_TRASH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gc_trash_env_guard() -> std::sync::MutexGuard<'static, ()> {
+        GC_TRASH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build a CleanRelease GcCandidate for the existing maybe_remove_candidate tests.
+    fn clean_cand(path: &Path, agent: &str) -> crate::worktree_pool::GcCandidate {
+        crate::worktree_pool::GcCandidate {
+            path: path.to_path_buf(),
+            agent: agent.to_string(),
+            reason: "test".to_string(),
+            kind: crate::worktree_pool::GcKind::CleanRelease,
+        }
+    }
 
     fn tmp_home(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -362,7 +519,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let result = maybe_remove_candidate(&dir, &wt, "wt-ignored");
+        let result = maybe_remove_candidate(&dir, &clean_cand(&wt, "wt-ignored"));
         assert!(matches!(result, RemovalOutcome::Skipped { .. }));
         assert!(wt.exists(), "worktree must NOT be archived");
 
@@ -378,7 +535,7 @@ mod tests {
 
         std::fs::write(wt.join("new-file.txt"), "work in progress").unwrap();
 
-        let result = maybe_remove_candidate(&dir, &wt, "wt-untracked");
+        let result = maybe_remove_candidate(&dir, &clean_cand(&wt, "wt-untracked"));
         assert!(matches!(result, RemovalOutcome::Skipped { .. }));
         assert!(wt.exists(), "worktree must NOT be archived");
 
@@ -392,7 +549,7 @@ mod tests {
         let repo = setup_git_repo(&dir);
         let wt = add_worktree(&repo, "wt-clean");
 
-        let result = maybe_remove_candidate(&dir, &wt, "wt-clean");
+        let result = maybe_remove_candidate(&dir, &clean_cand(&wt, "wt-clean"));
         assert!(matches!(result, RemovalOutcome::Removed));
         assert!(!wt.exists(), "worktree moved from original path");
 
@@ -418,7 +575,7 @@ mod tests {
         let bad_path = dir.join("not-a-worktree");
         std::fs::create_dir_all(&bad_path).unwrap();
 
-        let result = maybe_remove_candidate(&dir, &bad_path, "agent");
+        let result = maybe_remove_candidate(&dir, &clean_cand(&bad_path, "agent"));
         assert!(matches!(result, RemovalOutcome::Skipped { .. }));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -466,6 +623,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn trash_purge_removes_old_preserves_recent() {
+        let _env = gc_trash_env_guard();
         let dir = tmp_home("t2-purge");
         let trash = trash_root(&dir);
         std::fs::create_dir_all(&trash).unwrap();
@@ -495,6 +653,7 @@ mod tests {
     /// in the same sweep tick (replaces a separate disable flag).
     #[test]
     fn trash_days_zero_purges_same_tick() {
+        let _env = gc_trash_env_guard();
         let dir = tmp_home("t3-zero");
         let trash = trash_root(&dir);
         std::fs::create_dir_all(&trash).unwrap();
@@ -548,7 +707,7 @@ mod tests {
         let repo = setup_git_repo(&dir);
         let wt = add_worktree(&repo, "wt-prune");
 
-        let result = maybe_remove_candidate(&dir, &wt, "wt-prune");
+        let result = maybe_remove_candidate(&dir, &clean_cand(&wt, "wt-prune"));
         assert!(matches!(result, RemovalOutcome::Removed));
 
         let output = std::process::Command::new("git")
@@ -570,6 +729,7 @@ mod tests {
     /// preserves the new entry under the default retention window.
     #[test]
     fn purge_preserves_fresh_archive_in_same_tick() {
+        let _env = gc_trash_env_guard();
         let dir = tmp_home("t6-concurrent");
         let trash = trash_root(&dir);
         std::fs::create_dir_all(&trash).unwrap();
@@ -602,7 +762,7 @@ mod tests {
         std::fs::create_dir_all(&trash).unwrap();
         std::fs::set_permissions(&trash, std::fs::Permissions::from_mode(0o500)).unwrap();
 
-        let result = maybe_remove_candidate(&dir, &wt, "wt-perm");
+        let result = maybe_remove_candidate(&dir, &clean_cand(&wt, "wt-perm"));
 
         // Restore permissions for cleanup regardless of test outcome.
         let _ = std::fs::set_permissions(&trash, std::fs::Permissions::from_mode(0o755));
@@ -634,7 +794,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = maybe_remove_candidate(&dir, &wt, "wt-rebound");
+        let result = maybe_remove_candidate(&dir, &clean_cand(&wt, "wt-rebound"));
         assert!(
             matches!(result, RemovalOutcome::Skipped { ref reason } if reason == "rebound_since_enumeration"),
             "rebound worktree must be skipped: {result:?}"
@@ -653,8 +813,8 @@ mod tests {
         let wt1 = add_worktree(&repo, "wt-col-a");
         let wt2 = add_worktree(&repo, "wt-col-b");
 
-        let r1 = maybe_remove_candidate(&dir, &wt1, "agent-x");
-        let r2 = maybe_remove_candidate(&dir, &wt2, "agent-x");
+        let r1 = maybe_remove_candidate(&dir, &clean_cand(&wt1, "agent-x"));
+        let r2 = maybe_remove_candidate(&dir, &clean_cand(&wt2, "agent-x"));
         assert!(matches!(r1, RemovalOutcome::Removed), "first: {r1:?}");
         assert!(matches!(r2, RemovalOutcome::Removed), "second: {r2:?}");
 
@@ -688,5 +848,211 @@ mod tests {
         assert_eq!(parts[1].len(), 9, "nanos must be 9 digits: {ts1}");
         // Two sequential calls should differ (or at least not panic)
         let _ = (ts1, ts2);
+    }
+
+    fn write_binding(home: &Path, agent: &str, branch: &str, wt: &Path) {
+        let bd = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&bd).unwrap();
+        std::fs::write(
+            bd.join("binding.json"),
+            serde_json::json!({
+                "version": 1, "agent": agent, "task_id": "t", "branch": branch,
+                "worktree": wt.to_str().unwrap(), "source_repo": "/x",
+                "issued_at": "2026-06-05T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// t-worktree-leak PR-2: a ForceReclaim candidate (binding still present, agent
+    /// dead) is archived AND unbound — the never-released binding is cleared.
+    #[test]
+    fn force_reclaim_archives_and_unbinds() {
+        let dir = tmp_home("fr-archive");
+        let repo = setup_git_repo(&dir);
+        let wt = add_worktree(&repo, "wt-fr");
+        write_binding(&dir, "dev-fr", "feat/x", &wt);
+        let cand = crate::worktree_pool::GcCandidate {
+            path: wt.clone(),
+            agent: "dev-fr".to_string(),
+            reason: "force-reclaim test".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(matches!(outcome, RemovalOutcome::Removed), "{outcome:?}");
+        assert!(!wt.exists(), "worktree archived (moved out)");
+        assert!(
+            crate::binding::read(&dir, "dev-fr").is_none(),
+            "force-reclaim must unbind the never-released binding"
+        );
+        let trash = dir.join(".trash").join("worktrees");
+        assert!(
+            std::fs::read_dir(&trash)
+                .map(|d| d.flatten().count() > 0)
+                .unwrap_or(false),
+            "archived worktree is recoverable in .trash"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// t-worktree-leak PR-2 safety #4: a force-reclaim of a branch whose PR is
+    /// TERMINAL classifies as `observed_terminal` (= event-release bug → ALERT);
+    /// no pr_state classifies as `unknown` (never blindly trusts pr_state).
+    #[test]
+    fn classify_force_reclaim_terminal_is_event_bug() {
+        let home = tmp_home("fr-classify");
+        assert_eq!(
+            classify_force_reclaim(&home, Some("o/r"), Some("feat/x")),
+            "unknown",
+            "absent pr_state → unknown, not a false bug-alert"
+        );
+        let mut s = crate::daemon::pr_state::new_for_branch(
+            "o/r",
+            "feat/x",
+            "sha",
+            crate::daemon::pr_state::ReviewClass::Single,
+        );
+        s.merge_state = crate::daemon::pr_state::MergeState::Merged {
+            merge_commit: "c".into(),
+            merged_at: "2026-06-05T00:00:00Z".into(),
+        };
+        crate::daemon::pr_state::save(&home, &s).unwrap();
+        assert_eq!(
+            classify_force_reclaim(&home, Some("o/r"), Some("feat/x")),
+            "observed_terminal",
+            "merged PR never released → event-release bug"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// setup_git_repo + commit a .gitignore with `.agend-managed`, so a leased
+    /// worktree's marker is reported as `!! .agend-managed` under `--ignored` —
+    /// the exact production / reviewer-2 repro condition.
+    fn setup_git_repo_marker_ignored(dir: &Path) -> PathBuf {
+        let repo = setup_git_repo(dir);
+        std::fs::write(repo.join(".gitignore"), ".agend-managed\ntarget/\n").unwrap();
+        for args in [
+            vec!["add", ".gitignore"],
+            vec!["commit", "-m", "gitignore marker"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+        }
+        repo
+    }
+
+    /// reviewer-2 efficacy (§3.9 representative fixture): a REAL `lease()` worktree
+    /// carries the gitignored `.agend-managed` marker, which `--ignored` reports as
+    /// `!! .agend-managed`. It MUST archive — NOT be skipped as WIP by its own
+    /// marker. (The old `add_worktree` fixture had no marker → masked this.)
+    #[test]
+    fn force_reclaim_real_lease_with_marker_is_archived() {
+        let dir = tmp_home("fr-real-lease");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-real", "feat/x").expect("lease");
+        assert!(
+            crate::binding::read(&dir, "dev-real").is_some(),
+            "pre: bound"
+        );
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-real".to_string(),
+            reason: "fr".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Removed),
+            "marker-bearing real lease must archive, not be skipped by its own marker: {outcome:?}"
+        );
+        assert!(!lease.path.exists(), "archived");
+        assert!(
+            crate::binding::read(&dir, "dev-real").is_none(),
+            "unbound after force-reclaim"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 4th leak root: a RELEASED marker-bearing worktree must also archive
+    /// (clean-release uses the same dirty-check).
+    #[test]
+    fn clean_release_real_lease_with_marker_is_archived() {
+        let dir = tmp_home("cr-real-lease");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-cr", "feat/y").expect("lease");
+        // Released → binding cleared (clean-release path requires the binding gone).
+        crate::binding::unbind(&dir, "dev-cr");
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-cr".to_string(),
+            reason: "cr".to_string(),
+            kind: crate::worktree_pool::GcKind::CleanRelease,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Removed),
+            "released marker-bearing worktree must archive (clean-release efficacy): {outcome:?}"
+        );
+        assert!(!lease.path.exists(), "archived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// reviewer-2 residual: a BUILT worktree carries in-tree `target/`
+    /// (`!! target/`). force-reclaim is always archive-to-trash (recoverable), so
+    /// gitignored build output must NOT block it — else every built worktree
+    /// (i.e. all of them) no-ops, the same defect the marker caused.
+    #[test]
+    fn force_reclaim_built_worktree_with_target_is_archived() {
+        let dir = tmp_home("fr-built");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-built", "feat/x").expect("lease");
+        std::fs::create_dir_all(lease.path.join("target")).unwrap();
+        std::fs::write(lease.path.join("target").join("artifact.o"), "build").unwrap();
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-built".to_string(),
+            reason: "fr".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Removed),
+            "built worktree (!! target/) force-reclaim must archive (recoverable): {outcome:?}"
+        );
+        assert!(!lease.path.exists(), "archived");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// force-reclaim still respects REAL WIP: an untracked (non-ignored) file means
+    /// uncommitted operator/agent work → skip (don't archive it away).
+    #[test]
+    fn force_reclaim_with_real_wip_is_skipped() {
+        let dir = tmp_home("fr-wip");
+        let repo = setup_git_repo_marker_ignored(&dir);
+        let lease = crate::worktree_pool::lease(&dir, &repo, "dev-wip", "feat/x").expect("lease");
+        // A non-gitignored untracked file = real WIP (`?? notes.txt`).
+        std::fs::write(lease.path.join("notes.txt"), "uncommitted work").unwrap();
+        let cand = crate::worktree_pool::GcCandidate {
+            path: lease.path.clone(),
+            agent: "dev-wip".to_string(),
+            reason: "fr".to_string(),
+            kind: crate::worktree_pool::GcKind::ForceReclaim,
+        };
+        let outcome = maybe_remove_candidate(&dir, &cand);
+        assert!(
+            matches!(outcome, RemovalOutcome::Skipped { .. }),
+            "force-reclaim must NOT archive a worktree with real (tracked/untracked) WIP: {outcome:?}"
+        );
+        assert!(lease.path.exists(), "preserved");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
