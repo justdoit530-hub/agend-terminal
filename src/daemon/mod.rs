@@ -152,6 +152,77 @@ pub(crate) static SHUTDOWN_REASON: AtomicU8 = AtomicU8::new(0);
 /// without API-layer plumbing.
 pub(crate) static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 
+/// #1814 FIX2 (reviewer race High): the spawned successor's child handle, parked
+/// by `handle_self_respawn` at commit so the run_core loop can do a FINAL
+/// liveness recheck (`try_wait`, which also reaps) before the irreversible
+/// teardown. Phase-1 only proves the successor was healthy at probe time; it has
+/// not yet acquired the flock / spawned agents. If it dies in the commit→exit
+/// window, exiting anyway would brick the control plane — so the loop aborts
+/// (clears RESTART_PENDING, stays alive) instead. (Residual: a successor that
+/// dies AFTER the predecessor has already exited needs an external supervisor —
+/// the d-2 step-6 accepted residual, not closable here.)
+static SELF_RESPAWN_SUCCESSOR: std::sync::Mutex<Option<std::process::Child>> =
+    std::sync::Mutex::new(None);
+
+/// #1814 FIX2: park the successor child handle for the pre-exit liveness recheck.
+pub(crate) fn park_self_respawn_successor(child: std::process::Child) {
+    *SELF_RESPAWN_SUCCESSOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(child);
+}
+
+/// #1814 FIX2: true iff a parked successor has already exited (`try_wait` reaps
+/// it). `None` parked → false (no self-respawn in flight).
+fn self_respawn_successor_died() -> bool {
+    let mut guard = SELF_RESPAWN_SUCCESSOR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match guard.as_mut() {
+        Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+        None => false,
+    }
+}
+
+/// #1814 FIX2: when the shutdown flag is set, decide whether to truly tear down.
+/// For a self-respawn restart, do a final successor-liveness recheck; if the
+/// successor died after commit, ABORT-STAY-ALIVE (clear the flags, drop the
+/// dead handle, keep serving). Returns `true` → break the loop (teardown);
+/// `false` → keep running. (Residual race: an in-flight api session could
+/// re-set the shutdown flag from a stale RESTART_PENDING read after we clear it
+/// → the next iteration would then exit; this is no worse than pre-FIX2 and the
+/// window is vanishingly small.)
+fn confirm_shutdown_or_abort_respawn(shutdown: &AtomicBool) -> bool {
+    if !RESTART_PENDING.load(Ordering::Acquire) || !crate::daemon::restart::self_respawn_enabled() {
+        return true;
+    }
+    if self_respawn_successor_died() {
+        tracing::error!(
+            "#1814 self-respawn: successor died after commit but before predecessor exit — \
+             ABORTING restart, staying alive (no brick). Operator may retry restart_daemon."
+        );
+        RESTART_PENDING.store(false, Ordering::Release);
+        shutdown.store(false, Ordering::Relaxed);
+        *SELF_RESPAWN_SUCCESSOR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        return false;
+    }
+    true
+}
+
+/// #1814 round-2: settle window before the FINAL pre-exit liveness recheck (the
+/// recover-as-primary gate in `run_core`). Gives a successor that is crashing
+/// around the predecessor's teardown a moment to surface so the recheck catches
+/// it. Env-overridable (`AGEND_SELF_RESPAWN_SETTLE_SECS`) — tests widen it so
+/// the cross-process death lands deterministically inside the recheck window.
+fn self_respawn_settle() -> std::time::Duration {
+    let secs = std::env::var("AGEND_SELF_RESPAWN_SETTLE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Record the reason the daemon is shutting down. Idempotent on
 /// re-entry (first-write-wins via `compare_exchange`); safe to
 /// call from signal handlers + API threads + watchdog without
@@ -190,7 +261,14 @@ pub(super) struct DaemonContext {
 
 /// Get the PID-isolated run directory for the current daemon.
 pub fn run_dir(home: &Path) -> PathBuf {
-    home.join("run").join(std::process::id().to_string())
+    run_dir_for_pid(home, std::process::id())
+}
+
+/// Run dir for an arbitrary daemon `pid` (`home/run/<pid>`). #1814: the
+/// self-respawn Phase-1 gate needs the SUCCESSOR's run dir (a different pid),
+/// which `run_dir` — pinned to the current process — can't give.
+pub fn run_dir_for_pid(home: &Path, pid: u32) -> PathBuf {
+    home.join("run").join(pid.to_string())
 }
 
 /// #1812: the SINGLE process-wide lock that every test mutating (or
@@ -242,8 +320,22 @@ pub fn find_active_run_dir(home: &Path) -> Option<PathBuf> {
                     continue;
                 }
             }
-            // No .daemon file but PID alive → legacy or corrupted, accept it
-            return Some(entry.path());
+            // No (valid) `.daemon` identity file but PID alive → NOT discoverable.
+            // #1814 (reviewer race High): a handoff successor publishes its
+            // run dir + api.port pre-flock (so the predecessor can Phase-1-probe
+            // it by name via `connect_run_dir_api`) but writes `.daemon` only
+            // AFTER it acquires the flock (promotes). Skipping un-`.daemon`'d
+            // dirs here keeps a half-promoted successor invisible to generic
+            // discovery during the overlap window — generic clients route only
+            // to the fully-promoted daemon (single-primary-lease invariant). A
+            // normal daemon writes `.daemon` at boot (microsecond gap), so this
+            // never hides a real primary. (Pre-#1814 this fell through to
+            // "accept it" for a since-extinct legacy/no-`.daemon` daemon class.)
+            tracing::debug!(
+                path = %entry.path().display(),
+                "#1814: run dir has no `.daemon` identity (pre-promote successor or mid-boot) — not discoverable yet"
+            );
+            continue;
         }
     }
     None
@@ -379,7 +471,13 @@ pub fn run(home: &Path, agents: Vec<AgentDef>) -> anyhow::Result<()> {
         }
     }
 
-    run_core(home, agents, None)
+    run_core(
+        home,
+        FleetSource::Resolved {
+            agents,
+            telegram: None,
+        },
+    )
 }
 
 /// Start daemon with a fleet already prepared by [`crate::bootstrap::prepare`].
@@ -410,7 +508,7 @@ pub fn run_with_prepared(mut prepared: Box<crate::bootstrap::OwnedFleet>) -> any
     // trusted source at startup to tell them apart. Unsigned bindings fail closed
     // (unbound) and re-sign on their next dispatch / bind_self.
     let _owned = prepared;
-    run_core(&home, agents, telegram)
+    run_core(&home, FleetSource::Resolved { agents, telegram })
 }
 
 /// Sprint 57 Wave 3 PR-2 (#548 Q3 contract pin): this daemon does
@@ -508,20 +606,143 @@ pub(crate) fn build_default_handlers(
 /// across all daemon processes). Per-PID identity is at
 /// `$AGEND_HOME/run/<pid>/.daemon` (PID-recycling guard for
 /// discovery — distinct purpose from the exclusive lock).
-fn run_core(
-    home: &Path,
-    agents: Vec<AgentDef>,
-    telegram: Option<Arc<dyn crate::channel::Channel>>,
-) -> anyhow::Result<()> {
+/// Where `run_core` sources its fleet from.
+///
+/// `Resolved` is the normal path: `bootstrap::prepare` already resolved the
+/// agents (and channel) under the flock. `HandoffDeferred` is the #1814
+/// successor-handoff path: the agents are NOT resolved yet because the
+/// destructive reconciles + resolve MUST wait until this successor acquires
+/// the flock (after the predecessor exits), never running in the two-daemon
+/// overlap window.
+enum FleetSource {
+    Resolved {
+        agents: Vec<AgentDef>,
+        telegram: Option<Arc<dyn crate::channel::Channel>>,
+    },
+    HandoffDeferred {
+        fleet_path: PathBuf,
+        opts: crate::bootstrap::PrepareOptions,
+    },
+}
+
+/// #1814: how long a successor waits for its predecessor to release the flock
+/// (by exiting) after Phase-1 passed. Generous — the predecessor only needs to
+/// run `shutdown_sequence` (≤2s grace) + a 1s settle before exit. A timeout is
+/// a backstop for a predecessor wedged in shutdown.
+const HANDOFF_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// #1814: marker file a handoff successor writes once its control plane (api
+/// socket) is bound, signalling the predecessor's Phase-1 gate that the
+/// control plane is ready. Distinct from `.ready` (which means "agent spawn
+/// loop complete" and is written only after promotion).
+pub const CONTROL_READY_FILE: &str = "control-ready";
+
+/// #1814 successor-handoff boot entry. Runs the minimal pre-lock prep (run dir
+/// and cookie), then `run_core` in deferred-fleet mode: bind api, write
+/// control-ready, block on the flock until the predecessor exits, then run the
+/// destructive reconciles, resolve, and spawn agents. Routed to from the
+/// `start` command only when a legitimate `AGEND_SUCCESSOR_HANDOFF` marker is
+/// present.
+pub fn run_successor_handoff(home: &Path, fleet_path: &Path) -> anyhow::Result<()> {
+    tracing::info!("#1814 successor-handoff boot: minimal pre-lock prep (no flock, no reconcile)");
+    // §3.9 test injection seam: force the successor to crash on launch (before
+    // it writes control-ready) so the integration test can exercise the
+    // predecessor's abort-stay-alive path against a REAL spawned successor.
+    // Only the handoff boot path reads this — a normal start never reaches here.
+    if std::env::var("AGEND_FORCE_SUCCESSOR_FAIL").as_deref() == Ok("1") {
+        tracing::warn!(
+            "#1814 AGEND_FORCE_SUCCESSOR_FAIL=1 — successor aborting on launch (test seam)"
+        );
+        std::process::exit(1);
+    }
+    crate::bootstrap::prepare_handoff_prelock(home)?;
+    run_core(
+        home,
+        FleetSource::HandoffDeferred {
+            fleet_path: fleet_path.to_path_buf(),
+            opts: crate::bootstrap::PrepareOptions::default(),
+        },
+    )
+}
+
+/// #1814: write the `control-ready` marker into this daemon's run dir.
+fn write_control_ready(home: &Path) {
+    let path = run_dir(home).join(CONTROL_READY_FILE);
+    if let Err(e) = std::fs::write(&path, chrono::Utc::now().to_rfc3339()) {
+        tracing::warn!(path = %path.display(), error = %e, "failed to write control-ready marker (handoff)");
+    }
+}
+
+fn run_core(home: &Path, source: FleetSource) -> anyhow::Result<()> {
     let started_at = std::time::Instant::now();
 
-    let ctx = init_daemon_services(home, telegram)?;
+    // For the handoff path, the channel inits post-lock (its registry attaches
+    // via the #945 pending-registry bridge that `init_daemon_services` arms),
+    // so pass None here; `Resolved` carries the already-inited channel.
+    let telegram_pre = match &source {
+        FleetSource::Resolved { telegram, .. } => telegram.clone(),
+        FleetSource::HandoffDeferred { .. } => None,
+    };
+
+    let ctx = init_daemon_services(home, telegram_pre)?;
 
     // #event-bus Step 2 (legacy-zero): register the per-pattern delivery
     // subscribers once (the bus is the SOLE delivery path). Shared with
     // `app::run_app` so owned `agend-terminal app` mode wires the IDENTICAL
     // set — see `register_event_subscribers`.
     register_event_subscribers(&ctx.registry);
+
+    // `init_daemon_services` has now bound + published this process's api port.
+    // For the handoff path the predecessor is still alive: signal control-ready
+    // (so its Phase-1 gate can confirm us), then block on the flock until it
+    // exits (the commit point), and ONLY THEN run the destructive reconciles +
+    // resolve. `_handoff_lock` holds the flock for the daemon's lifetime on the
+    // handoff path (None on the normal path, where `prepare`'s `OwnedFleet`
+    // already holds it).
+    let (agents, _handoff_lock) = match source {
+        FleetSource::Resolved { agents, .. } => (agents, None::<crate::bootstrap::DaemonLock>),
+        FleetSource::HandoffDeferred { fleet_path, opts } => {
+            write_control_ready(home);
+            // §3.9 FIX2 test seam: pass Phase-1 (api stays up to answer STATUS
+            // for a moment) then die BEFORE acquiring the flock — exercises the
+            // predecessor's commit→exit liveness recheck (abort-stay-alive).
+            if std::env::var("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY").as_deref() == Ok("1")
+            {
+                tracing::warn!(
+                    "#1814 AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY=1 — successor answering Phase-1 then aborting before flock (test seam)"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                std::process::exit(1);
+            }
+            // §3.9 round-2 test seam: stay alive LONG enough to pass the
+            // predecessor's loop-break recheck (so teardown begins), then die
+            // DURING the predecessor's teardown window — exercises the final
+            // recover-as-primary gate (predecessor re-spawns agents + resumes).
+            if std::env::var("AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN").as_deref() == Ok("1") {
+                tracing::warn!(
+                    "#1814 AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN=1 — successor surviving Phase-1 + loop-break, dying in teardown window (test seam)"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                std::process::exit(1);
+            }
+            tracing::info!(
+                "#1814 successor-handoff: control-ready; waiting for predecessor to release flock"
+            );
+            let lock = crate::bootstrap::acquire_daemon_lock_blocking(home, HANDOFF_LOCK_WAIT)?;
+            // #1814 FIX1: NOW that we hold the flock (predecessor has exited),
+            // publish the `.daemon` identity so generic discovery
+            // (`find_active_run_dir`) starts routing to us. Before this point we
+            // were intentionally undiscoverable (pre-flock = not the primary).
+            write_daemon_id(&run_dir(home));
+            tracing::info!(
+                "#1814 successor-handoff: flock acquired — sole daemon, running deferred reconciles + resolve"
+            );
+            crate::bootstrap::boot_hygiene_sweeps(home);
+            let (_config, agents, _telegram) =
+                crate::bootstrap::resolve_fleet_and_reconcile(home, &fleet_path, &opts)?;
+            (agents, Some(lock))
+        }
+    };
 
     spawn_fleet_agents(home, &agents, &ctx);
 
@@ -538,77 +759,149 @@ fn run_core(
 
     let (_keepalive, handlers, tick_rx) = build_tick_infrastructure(home, &ctx);
 
-    loop {
-        if ctx.shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let exit_event: Option<crate::agent::AgentExitEvent>;
-        crossbeam_channel::select! {
-            recv(ctx.crash_rx) -> msg => { exit_event = msg.ok(); }
-            recv(tick_rx) -> _ => { exit_event = None; }
-            recv(shutdown_rx) -> _ => { continue; }
-        }
-
-        let tick_ctx = per_tick::TickContext {
-            home,
-            registry: &ctx.registry,
-            externals: &ctx.externals,
-            configs: &ctx.configs,
-        };
-        crate::runtime_config::reload(home);
-        // #1339: operator-mode.json reloaded each tick — a mode change (via the
-        // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
-        crate::operator_mode::reload(home);
-        per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
-
-        let exit_event = match exit_event {
-            Some(e) => e,
-            None => continue,
-        };
-
-        if ctx.shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-        match exit_event {
-            crate::agent::AgentExitEvent::CleanExit(ref name) => {
-                tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
-                // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
-                if let Some(id) = crate::fleet::resolve_uuid(home, name) {
-                    ctx.registry.lock().remove(&id);
+    // #1814 round-2: `'serve` wraps the tick loop + teardown so the final
+    // recover-as-primary gate (below) can `continue 'serve` to resume serving if
+    // the successor dies during the predecessor's teardown — instead of exiting
+    // into a brick. Flag-off never enters the recover gate, so it falls straight
+    // through to the byte-identical exit path after the loop.
+    'serve: loop {
+        loop {
+            if ctx.shutdown.load(Ordering::Relaxed) {
+                // #1814 FIX2: a set shutdown flag from a self-respawn commit only
+                // tears down if the successor is still alive; otherwise abort-stay-alive.
+                if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
+                    break;
                 }
-                ctx.configs.lock().remove(name.as_str());
+                continue;
             }
-            crate::agent::AgentExitEvent::Stage2Restart(name) => {
-                spawn_stage2_thread(home, &name, &ctx);
+
+            let exit_event: Option<crate::agent::AgentExitEvent>;
+            crossbeam_channel::select! {
+                recv(ctx.crash_rx) -> msg => { exit_event = msg.ok(); }
+                recv(tick_rx) -> _ => { exit_event = None; }
+                recv(shutdown_rx) -> _ => { continue; }
             }
-            crate::agent::AgentExitEvent::Crash(name) => {
-                crash_respawn::handle_crash_respawn(home, &name, &ctx);
+
+            let tick_ctx = per_tick::TickContext {
+                home,
+                registry: &ctx.registry,
+                externals: &ctx.externals,
+                configs: &ctx.configs,
+            };
+            crate::runtime_config::reload(home);
+            // #1339: operator-mode.json reloaded each tick — a mode change (via the
+            // `mode` MCP tool) propagates fleet-wide without a restart (reload-coherent).
+            crate::operator_mode::reload(home);
+            per_tick::run_handlers_with_panic_guard(&handlers, &tick_ctx);
+
+            let exit_event = match exit_event {
+                Some(e) => e,
+                None => continue,
+            };
+
+            if ctx.shutdown.load(Ordering::Relaxed) {
+                if confirm_shutdown_or_abort_respawn(&ctx.shutdown) {
+                    break;
+                }
+                continue;
+            }
+            match exit_event {
+                crate::agent::AgentExitEvent::CleanExit(ref name) => {
+                    tracing::info!(agent = %name, "clean exit — removing from registry (no respawn)");
+                    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
+                    if let Some(id) = crate::fleet::resolve_uuid(home, name) {
+                        ctx.registry.lock().remove(&id);
+                    }
+                    ctx.configs.lock().remove(name.as_str());
+                }
+                crate::agent::AgentExitEvent::Stage2Restart(name) => {
+                    spawn_stage2_thread(home, &name, &ctx);
+                }
+                crate::agent::AgentExitEvent::Crash(name) => {
+                    crash_respawn::handle_crash_respawn(home, &name, &ctx);
+                }
             }
         }
+
+        log_residual_worktrees(home);
+
+        let metrics = shutdown_sequence(home, &ctx.registry, started_at);
+        crate::event_log::log(
+            home,
+            "daemon_stop",
+            "",
+            &format!(
+                "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
+                metrics.reason.as_str(),
+                metrics.agents_total,
+                metrics.agents_killed_after_grace,
+                metrics.uptime_secs
+            ),
+        );
+
+        // #1814 round-2 (reviewer TOCTOU): FINAL recover-as-primary gate. We have
+        // killed our agents (`shutdown_sequence` drained the registry) but the run
+        // dir + cookie + api-server thread are STILL intact (`remove_dir_all` below
+        // hasn't run). This is the last point before the irreversible exit/flock-
+        // release. Re-check the successor's liveness as late as possible:
+        //   • successor DEAD → do NOT exit. Recover as primary: clear the restart
+        //     flags, re-spawn our fleet agents into the (still-live) registry, and
+        //     `continue 'serve` to resume serving. No brick; agents re-spawned.
+        //   • successor ALIVE → commit: drop the run dir and exit(0) IMMEDIATELY
+        //     (no intervening sleep) so the only un-closable window is the
+        //     microseconds between this check and the exit syscall (the d-2 step-6
+        //     residual — a successor death after THIS point needs an external
+        //     supervisor and is out of scope for Stage 1).
+        // Flag-off never enters this block → it falls through to the byte-identical
+        // exit path after `'serve`.
+        if RESTART_PENDING.load(Ordering::Acquire) && crate::daemon::restart::self_respawn_enabled()
+        {
+            std::thread::sleep(self_respawn_settle());
+            if self_respawn_successor_died() {
+                tracing::error!(
+                "#1814 self-respawn: successor died DURING predecessor teardown — recovering as \
+                 primary (re-spawning agents, resuming; no brick)."
+            );
+                RESTART_PENDING.store(false, Ordering::Release);
+                ctx.shutdown.store(false, Ordering::Relaxed);
+                *SELF_RESPAWN_SUCCESSOR
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
+                let _ = std::fs::remove_file(home.join("restart-requested"));
+                spawn_fleet_agents(home, &agents, &ctx);
+                continue 'serve;
+            }
+            let _ = std::fs::remove_file(home.join("restart-requested"));
+            let _ = std::fs::remove_dir_all(run_dir(home));
+            tracing::info!("#1814 self-respawn: successor healthy through teardown — exiting 0");
+            std::process::exit(0);
+        }
+
+        break 'serve;
     }
 
-    log_residual_worktrees(home);
-
-    let metrics = shutdown_sequence(home, &ctx.registry, started_at);
-    crate::event_log::log(
-        home,
-        "daemon_stop",
-        "",
-        &format!(
-            "reason={} agents_total={} agents_killed_after_grace={} uptime_secs={}",
-            metrics.reason.as_str(),
-            metrics.agents_total,
-            metrics.agents_killed_after_grace,
-            metrics.uptime_secs
-        ),
-    );
     let _ = std::fs::remove_dir_all(run_dir(home));
     std::thread::sleep(std::time::Duration::from_secs(1));
 
     if RESTART_PENDING.load(Ordering::Acquire) {
         let flag = home.join("restart-requested");
         let _ = std::fs::remove_file(&flag);
+        if crate::daemon::restart::self_respawn_enabled() {
+            // #1814: the restart handler already spawned + Phase-1-confirmed a
+            // successor. It is blocked on our flock and promotes the moment we
+            // exit, so exit(0) (not 42) — no external supervisor is required.
+            //
+            // KNOWN/INTENDED Stage-1 race: if an external supervisor (launchd
+            // `KeepAlive=true`, systemd `Restart`, the wrapper) is ALSO active,
+            // our exit triggers BOTH our successor AND an external respawn.
+            // This self-corrects via the flock — whichever process acquires
+            // `.daemon.lock` first becomes the daemon; the loser hits the
+            // singleton attach-reject guard in `bootstrap::prepare` and exits.
+            // Not a bug; flagged here + in the PR so reviewers don't file it as
+            // one. (Stage 2 downgrades `is_restart_supervised` to advisory.)
+            tracing::info!("#1814 self-respawn: successor confirmed healthy — exiting 0");
+            std::process::exit(0);
+        }
         tracing::info!("operator-initiated restart: exiting with code 42");
         std::process::exit(42);
     }
@@ -635,6 +928,15 @@ fn init_daemon_services(
         ..crate::daemon_config::DaemonConfig::default()
     });
 
+    // #1814 FIX3 (reviewer-2, non-blocking) TODO(Stage 2): the three shared-
+    // state GC/migration steps below (skills::cleanup_stale_stages,
+    // dedup_state::cleanup_tmp_orphans, tasks::migrate_legacy_tasks_json_to_event_log)
+    // run inside `init_daemon_services`, which on the successor-handoff path
+    // executes PRE-flock (before the predecessor exits) — technically escaping
+    // the "minimal pre-lock" contract. Low risk for now (the first two are
+    // retention-gated; the third is idempotent), so left in place for Stage 1.
+    // Stage 2 should split `init_daemon_services` (as `prepare` was split into
+    // pre/post-lock) so these run only after the handoff successor holds the flock.
     const SKILLS_STAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
     crate::bootstrap::time_step("skills::cleanup_stale_stages", || {
         match crate::skills::cleanup_stale_stages(home, SKILLS_STAGE_RETENTION_SECS, &[]) {
@@ -1600,6 +1902,49 @@ mod tests {
         let found = find_active_run_dir(&home);
         assert!(found.is_none());
         assert!(!run.exists());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1814 FIX1 (reviewer race High): a run dir with an alive pid but NO
+    /// `.daemon` identity file (= a handoff successor that has published its api
+    /// pre-flock but NOT yet promoted) must NOT be discoverable via
+    /// `find_active_run_dir`. Otherwise generic CLI/MCP clients could route to a
+    /// half-promoted, no-agent successor during the overlap window (split-brain).
+    #[test]
+    fn find_active_run_dir_skips_dir_without_daemon_identity() {
+        let home = tmp_home("no_daemon_identity");
+        let pid = std::process::id(); // this test process — guaranteed alive
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        // Successor pre-promote shape: api.port published, but NO `.daemon`.
+        crate::ipc::write_port(&run, crate::ipc::API_NAME, 65000).ok();
+        assert!(
+            find_active_run_dir(&home).is_none(),
+            "a run dir without a `.daemon` identity must not be discoverable (pre-promote successor)"
+        );
+        // The dir must survive (it's a live successor mid-handoff, not stale).
+        assert!(
+            run.exists(),
+            "must NOT delete the un-promoted successor's run dir"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1814 FIX1 companion: once the `.daemon` identity (matching pid) IS
+    /// present (= the successor promoted post-flock), the dir becomes
+    /// discoverable again — the normal-daemon path is unchanged.
+    #[test]
+    fn find_active_run_dir_returns_dir_with_valid_daemon_identity() {
+        let home = tmp_home("valid_daemon_identity");
+        let pid = std::process::id();
+        let run = home.join("run").join(pid.to_string());
+        std::fs::create_dir_all(&run).ok();
+        write_daemon_id(&run); // writes `<pid>:<ts>` for the current (alive) pid
+        assert_eq!(
+            find_active_run_dir(&home).as_deref(),
+            Some(run.as_path()),
+            "a run dir with a valid matching `.daemon` must be discoverable"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
