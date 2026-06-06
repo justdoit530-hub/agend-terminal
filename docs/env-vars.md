@@ -51,7 +51,10 @@ The variables below are the **default names** for that indirection.
 
 | Name | Purpose | Default (unset) | Valid values / format | Source | Notes |
 |------|---------|-----------------|-----------------------|--------|-------|
-| `AGEND_WRAPPED` | Restart-supervisor marker set by `scripts/agend-wrapper.sh` before each daemon start; one signal that a supervisor will respawn the daemon on `exit(42)`, letting `restart_daemon` proceed. | Absent → contributes no supervised signal; if no other signal is present, `is_restart_supervised()` is false and restart fails closed. | **Presence-based** (`var_os(...).is_some()`); any value, even empty, counts. | `src/daemon/restart.rs:55` (`has_env`, lines 62–63) | ⚠️ Security-relevant: fail-closed gate on the destructive `restart_daemon` path. See also external `XPC_SERVICE_NAME` / `INVOCATION_ID` below, and the in-flight `AGEND_SUPERVISED` / handoff vars in [Pending](#13-pending--in-flight-not-yet-on-main). |
+| `AGEND_WRAPPED` | Restart-supervisor marker set by `scripts/agend-wrapper.sh` before each daemon start; one signal that a supervisor will respawn the daemon on `exit(42)`, letting `restart_daemon` proceed. | Absent → contributes no supervised signal; if no other signal is present, `is_restart_supervised()` is false and restart fails closed. | **Presence-based** (`var_os(...).is_some()`); any value, even empty, counts. | `src/daemon/restart.rs:55` (`has_env`, lines 62–63) | ⚠️ Security-relevant: fail-closed gate on the destructive `restart_daemon` path. See also external `XPC_SERVICE_NAME` / `INVOCATION_ID` below, and the positive `AGEND_SUPERVISED` sentinel + the `AGEND_RESTART_HANDOFF` / `AGEND_SUCCESSOR_HANDOFF` rows below. |
+| `AGEND_SUPERVISED` | Positive supervisor sentinel written into the generated launchd plist / systemd unit by `service install`; `is_restart_supervised()` accepts it as proof a supervisor will respawn the daemon on `exit(42)`. Replaced the ambient `XPC_SERVICE_NAME` false-positive. | Absent → contributes no supervised signal. | **Presence-based** (`has_env`); the templates write `=1`. | `src/daemon/restart.rs` (`SUPERVISED_ENV`, `is_restart_supervised`) | #1812. ⚠️ Security-relevant (same fail-closed gate as `AGEND_WRAPPED`). |
+| `AGEND_RESTART_HANDOFF` | On/off switch for the #1814 self-healing successor-handoff restart path (spawn a successor, health-gate it, abort-stay-alive on failure) vs the legacy `exit(42)` + external-respawn fallback. | Unset → off → legacy `exit(42)` path (flag-off is byte-identical to pre-#1814). | `"1"` enables; anything else (or unset) is off. | `src/daemon/restart.rs` (`self_respawn_enabled`, `RESTART_HANDOFF_ENV`) | #1814 Stage 1 feature flag (opt-in). |
+| `AGEND_SUCCESSOR_HANDOFF` | Internal handoff token (`<old_pid>:<token>`) the predecessor sets on the successor it spawns, so the successor takes the minimal pre-lock handoff boot (bypassing the singleton "another daemon is already running" guard, deferring flock + reconciles). NOT an operator knob. | Unset → normal boot (full `prepare`). | `<u32 pid>:<non-empty token>`; malformed → ignored (normal boot). | `src/daemon/restart.rs` (`successor_handoff_marker`, `SUCCESSOR_HANDOFF_ENV`) | #1814 — internal; set only by `spawn_successor_handoff`. |
 
 ---
 
@@ -167,11 +170,9 @@ These live in the `agend-git` shim binary (`src/bin/agend-git.rs`). The three
 These are designed but not yet merged. Documented here for forward reference;
 verify against code once their PRs land.
 
-| Name | Purpose | Status |
-|------|---------|--------|
-| `AGEND_SUPERVISED` | Positive supervisor sentinel written into the generated launchd plist / systemd unit (and wrapper), replacing the ambient `XPC_SERVICE_NAME` false-positive signal in `is_restart_supervised()`. | #1812 — proposed. |
-| `AGEND_RESTART_HANDOFF` | On/off switch for the self-healing successor-handoff restart path (vs the legacy `exit(42)` + external-respawn fallback). | #1814 — feature flag. |
-| `AGEND_SUCCESSOR_HANDOFF` | Internal token used during restart handoff to let the spawned successor bypass the singleton "another daemon is already running" guard. | #1814 — internal. |
+_None currently._ (The previously-listed `AGEND_SUPERVISED` (#1812) and
+`AGEND_RESTART_HANDOFF` / `AGEND_SUCCESSOR_HANDOFF` (#1814) have merged — see
+their permanent entries in [§3. Supervision & restart](#3-supervision--restart).)
 
 ---
 
@@ -187,6 +188,10 @@ that subprocess's timing — production always uses the fixed default. They are
 |------|---------|--------|-------|
 | `AGEND_BRIDGE_TOOLS_LIST_TIMEOUT_MS` | **Test-only seam.** Shortens the `agend-mcp-bridge` `tools/list` retry-timeout budget so a cross-process test sees the daemon-unreachable error fast. Production always uses the fixed **30 s** default. | `src/bin/agend-mcp-bridge.rs:271` (read); set by `tests/attached_path_mcp_invariants.rs` | Not a production tunable (#env-cleanup reclassify). `u64` ms; malformed → default. |
 | `AGEND_SPAWN_STAGGER_MS` | **Test-only seam.** Sets the multi-agent staggered-spawn delay in a spawned daemon so a cross-process test gets a deterministic startup-race window. Production always uses the fixed **500 ms** default. | `src/daemon/mod.rs:1091` (read); set by `tests/ready_marker_invariants.rs`, `tests/attached_path_mcp_invariants.rs` | Not a production tunable (#env-cleanup reclassify). `u64` ms; unparseable → default. |
+| `AGEND_SELF_RESPAWN_SETTLE_SECS` | **Test-only seam.** #1814 self-respawn settle window before the final recover-as-primary recheck. Production always uses the fixed **1 s** default; this exists ONLY so a cross-process integration test can widen the window deterministically (so the successor's death lands inside the recheck). | `src/daemon/mod.rs` (`self_respawn_settle`) | Not a production tunable. `u64` secs; unparseable → 1s. Widened by `tests/self_respawn_handoff.rs`. |
+| `AGEND_FORCE_SUCCESSOR_FAIL` | **Test-only seam.** #1814: makes a spawned self-respawn successor crash on launch (fails the Phase-1 gate). | `src/daemon/mod.rs` (`run_successor_handoff`) | Drives the "successor-fails → predecessor stays alive (ok:false)" integration test. |
+| `AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY` | **Test-only seam.** #1814: successor passes Phase-1 (answers STATUS) then dies before the flock — exercises the predecessor's commit→exit liveness recheck. | `src/daemon/mod.rs` (`run_core` handoff branch) | Drives the FIX2 abort-stay-alive integration test. |
+| `AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN` | **Test-only seam.** #1814: successor survives Phase-1 + the loop-break recheck, then dies during the predecessor's teardown window — exercises the final recover-as-primary gate. | `src/daemon/mod.rs` (`run_core` handoff branch) | Drives the recover-as-primary integration test (with `AGEND_SELF_RESPAWN_SETTLE_SECS`). |
 
 ---
 
