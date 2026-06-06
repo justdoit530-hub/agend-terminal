@@ -1388,8 +1388,16 @@ fn replay_missed_at_startup(home: &Path, registry: &AgentRegistry) {
 }
 
 /// Staggered-spawn delay — rate-limits PTY init during multi-agent startup
-/// bursts. Tunable via `AGEND_SPAWN_STAGGER_MS`.
+/// bursts. Production value is a fixed 500 ms.
+///
+/// `AGEND_SPAWN_STAGGER_MS` is a **test-only seam, NOT a production tunable**
+/// (#env-cleanup): the daemon is a separate process, so a cross-process
+/// integration test that spawns it has env as its only lever to set a
+/// deterministic stagger (e.g. `tests/ready_marker_invariants` /
+/// `tests/attached_path_mcp_invariants` pin a specific value to create a
+/// reproducible startup-race window). Operators never set it.
 fn spawn_stagger() -> std::time::Duration {
+    // test-only seam (see fn doc): prod always falls through to the 500ms default.
     let ms: u64 = std::env::var("AGEND_SPAWN_STAGGER_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1645,11 +1653,7 @@ fn handle_stage2_restart(
         }
     };
 
-    let backoff_ms = std::env::var("AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(crate::health::STAGE2_BACKOFF_DEFAULT_MS);
-    let backoff = Duration::from_millis(backoff_ms);
+    let backoff = Duration::from_millis(crate::health::STAGE2_BACKOFF_DEFAULT_MS);
 
     std::thread::sleep(backoff);
     if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2453,8 +2457,9 @@ mod tests {
         let (crash_tx, _crash_rx) = crossbeam_channel::unbounded();
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        std::env::set_var("AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS", "2000");
-
+        // Backoff is the fixed STAGE2_BACKOFF_DEFAULT_MS const; the spawned
+        // worker sleeps it on its own thread, so the caller must still return
+        // immediately (that non-blocking contract is what this test pins).
         let start = std::time::Instant::now();
         let home_owned = home.to_path_buf();
         let reg = Arc::clone(&registry);
@@ -2475,7 +2480,6 @@ mod tests {
 
         handle.join().unwrap();
 
-        std::env::remove_var("AGEND_AUTO_RECOVERY_STAGE2_BACKOFF_MS");
         std::fs::remove_dir_all(&home).ok();
     }
 }
