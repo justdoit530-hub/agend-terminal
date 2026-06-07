@@ -46,6 +46,8 @@ pub(crate) struct ThreadDumpHandler {
 impl ThreadDumpHandler {
     pub(crate) fn new() -> Self {
         // #t-23: single cached accessor shared with `sync_audit::thread_dump_enabled`.
+        // (#techdebt-#10 env_util did NOT touch this site — superseded by t-23's
+        // cached accessor, which is the better consolidation; kept t-23's.)
         Self {
             interval_secs: crate::sync_audit::thread_dump_interval_secs(),
             last_dump_at: AtomicU64::new(0),
