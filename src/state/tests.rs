@@ -2520,6 +2520,56 @@ fn fn_red_truecolor_fragmented_fires() {
     assert_eq!(st.get_state(), AgentState::ServerRateLimit);
 }
 
+// ── #1808/#1809 NARROW-pane soft-wrap regression ────────────────────
+
+/// #1808/#1809 NAMED REGRESSION (live repro 2026-06-08, fixup-dev + dev-2,
+/// BOTH in narrow split panes) — would FAIL before the de-wrap fix.
+///
+/// In a NARROW pane alacritty soft-wraps the long SRL line across several
+/// physical grid rows. The detection feed (`tail_lines_with_fg` → the
+/// `feed_with_fg` ingress) used to join EVERY physical row with `\n`,
+/// inserting `\n` MID-PHRASE ("Server is\ntemporarily\nlimiting\nrequests").
+/// The single-line SRL regex (backend_profile.rs) then failed to match across
+/// the `\n` → `detect_with_match` returned None → ServerRateLimit never
+/// latched → no auto-retry → the agent hung. WIDE panes (lead) kept the phrase
+/// on one physical row → matched → recovered: the lead-vs-worker asymmetry
+/// that mystified the whole session. The fix de-wraps soft-wrapped rows
+/// (WRAPLINE-aware) before the regex sees them. Drives the REAL vterm →
+/// `tail_lines_with_fg` → `feed_with_fg` entry (§3.9 — not a hand-fed `\n`
+/// string), at a width that forces alacritty to soft-wrap.
+#[test]
+fn regression_1808_narrow_pane_wrapped_srl_latches() {
+    // 25 cols: "Server is temporarily limiting requests" (39 chars) cannot fit
+    // on one physical row → alacritty soft-wraps the phrase across rows.
+    let mut vt = VTerm::new(25, 24);
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+    // Render RED like the real Ink error (vterm resolves the SGR off the grid).
+    drive_colored_line(&mut vt, &mut st, RED_16, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1808: a soft-wrapped SRL line in a narrow pane must latch ServerRateLimit \
+         (pre-fix: physical-row `\\n` joins split the phrase → single-line regex \
+         missed → no detection → autopilot hang)"
+    );
+}
+
+/// #1808 companion — the SAME narrow-pane wrapped SRL line rendered PLAIN
+/// (no red) must ALSO latch via the content-anchor (`in_error_line` sees the
+/// de-wrapped "API Error:" line). Proves the de-wrap — not the color — is what
+/// restores detection, and that the content path survives de-wrap.
+#[test]
+fn regression_1808_narrow_pane_wrapped_srl_plain_content_anchor() {
+    let mut vt = VTerm::new(25, 24);
+    let mut st = StateTracker::new(Some(&Backend::ClaudeCode));
+    drive_plain_line(&mut vt, &mut st, SRL_LINE);
+    assert_eq!(
+        st.get_state(),
+        AgentState::ServerRateLimit,
+        "#1808: de-wrapped SRL line still qualifies via in_error_line content anchor"
+    );
+}
+
 /// #1450 NAMED REGRESSION — would FAIL before the fix.
 ///
 /// Pre-#1450 the raw-byte anchor allow-list knew only 4 sixteen-color
@@ -4093,11 +4143,34 @@ the agent kept going after the throttle\n";
 fn unclassified_throttle_logged_on_phrase_plus_nonretryable_state() {
     // Throttle phrase present, classifier landed on Ready (the in-the-wild
     // miss — e.g. anchor suppressed it / wording drifted) → capture.
-    let tail = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[]);
-    let tail = tail.expect("throttle phrase + non-retryable state must be captured");
+    let captured = unclassified_throttle_tail(AgentState::Idle, THROTTLE_SCREEN, &[]);
+    let (tail, wrap_split) =
+        captured.expect("throttle phrase + non-retryable state must be captured");
     assert!(
         tail.contains("temporarily limiting requests"),
         "captured tail must carry the throttle line, got: {tail:?}"
+    );
+    assert!(
+        !wrap_split,
+        "a contiguous (un-wrapped) phrase must NOT be flagged wrap_split"
+    );
+}
+
+/// #1808: the instrument was BLIND to a LINE-WRAPPED throttle phrase because it
+/// only did a contiguous `str::contains` — the exact reason the live narrow-pane
+/// SRL miss captured nothing. A phrase split by hard `\n` (Ink-style layout) must
+/// now be captured AND flagged `wrap_split` (the Phase 2 soft-vs-hard signal).
+#[test]
+fn unclassified_throttle_captures_hard_wrapped_phrase_with_wrap_split_flag() {
+    // Phrase split across rows by `\n` the way an app word-wrap emits it — NOT
+    // contiguous, so the old `contains` check missed it entirely.
+    let screen = "⏺ API Error:\ntemporarily limiting\nrequests (not your\nusage limit)\n";
+    let captured = unclassified_throttle_tail(AgentState::Idle, screen, &[]);
+    let (_tail, wrap_split) =
+        captured.expect("a hard-`\\n`-wrapped throttle phrase must still be captured (#1808)");
+    assert!(
+        wrap_split,
+        "a phrase found only after whitespace-flatten must be flagged wrap_split (hard-wrap signal)"
     );
 }
 
