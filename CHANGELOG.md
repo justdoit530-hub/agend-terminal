@@ -9,6 +9,10 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 - **MSRV: declared `rust-version` corrected to 1.88 (#1994)** — the previous declaration (1.87) was false: the locked dependency set required up to rustc 1.95 (`sysinfo 0.39.3`), so `cargo install agend-terminal --locked` broke for anyone on 1.87–1.94 who trusted it. `sysinfo` is pinned to `0.38` (MSRV 1.88, no code changes — caught by the #1987 release gate on its first run, which now enforces the floor). Builders need rustc ≥ 1.88.
 
+### Fixed
+
+- **Fresh Telegram setup resolves at startup (#2005)** — the quickstart fleet.yaml template pinned the legacy `bot_token_env: AGEND_BOT_TOKEN` while `.env` was written under the canonical `AGEND_TELEGRAM_BOT_TOKEN`, and the credentials fallback retried the same legacy name — so a fresh install's Telegram channel failed to resolve at daemon startup (old installs were masked by leftover legacy `.env` keys). The template now pins the canonical name and the fallback is symmetric (configured name → the other of canonical/legacy), so all four fleet/.env drift combinations resolve; legacy use still warns.
+
 ### Added
 
 - **`quickstart --unattended` (alias `--yes`)** — non-interactive setup for CI / scripted installs: never reads stdin (missing input = clear error + non-zero exit, not a hang), never waits on the network. Backend = first detected on PATH; Telegram optionally from `AGEND_TELEGRAM_BOT_TOKEN` / `AGEND_TELEGRAM_GROUP_ID` env (token stored unverified; the daemon validates at startup), otherwise skipped. Idempotent: an existing fleet.yaml is never overwritten; an existing `.env` token is only replaced by an explicit env var.
