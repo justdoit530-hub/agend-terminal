@@ -8,7 +8,58 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
+/// #1990: on-disk schema version for `binding.json`. The file has always carried
+/// a bare `version` field (written by [`bind_full`]) but did NOT go through the
+/// `SchemaVersioned` trait, so it had no future-version guard — this const is
+/// that guard (see [`parse_binding_guarded`]). Additive field adds don't need a
+/// bump; only a non-additive change to an existing field does.
+const BINDING_SCHEMA_VERSION: u64 = 1;
+
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
+
+/// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
+/// (`version` > [`BINDING_SCHEMA_VERSION`]) → `None`. This guards only the
+/// DAEMON-SIDE readers that route through [`read`]: they treat a future-version
+/// binding as absent and fail-closed (e.g. auto-release / lease helpers won't act
+/// on a binding shape they can't fully understand). It does NOT cover the git
+/// shim, which has its OWN reader (`agend-git.rs::read_binding`) that
+/// HMAC-verifies and treats a parseable future-version binding as BOUND — so the
+/// agent stays restricted to its own worktree (safe), but is not "denied".
+/// DESTRUCTIVE daemon-side sites (worktree retention) must use
+/// [`present_including_future`] instead, so they never mistake a future binding
+/// for absent and reclaim a newer daemon's live worktree. The missing-signature
+/// fail-closed path is unchanged.
+fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_str(content).ok()?;
+    let found = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
+    if found > BINDING_SCHEMA_VERSION {
+        tracing::warn!(
+            found,
+            supported = BINDING_SCHEMA_VERSION,
+            "binding.json written by a newer schema version — daemon-side readers treat it as absent"
+        );
+        return None;
+    }
+    Some(v)
+}
+
+/// #1990: true if a binding file is present at a version this daemon understands
+/// OR a NEWER one. Distinct from [`read`], which returns `None` for a
+/// future-version binding (the correct fail-closed for daemon-side actors that
+/// would ACT on the binding). A DESTRUCTIVE retention site must use THIS so it
+/// never reclaims a worktree a newer daemon legitimately (re)bound just because
+/// this older daemon can't parse the binding's version — "future ≠ absent".
+/// A non-JSON / missing file is genuinely absent → `false` (pre-existing behavior).
+pub fn present_including_future(home: &Path, agent: &str) -> bool {
+    let path = crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .map(|v| v.is_object())
+        .unwrap_or(false)
+}
 
 fn binding_index() -> &'static RwLock<HashMap<String, serde_json::Value>> {
     INDEX.get_or_init(|| RwLock::new(HashMap::new()))
@@ -101,7 +152,7 @@ pub fn bind_full(
     let wt_str = worktree.display().to_string();
     let src_str = source_repo.display().to_string();
     let mut binding = json!({
-        "version": 1,
+        "version": BINDING_SCHEMA_VERSION,
         "agent": agent,
         "task_id": task_id,
         "branch": branch,
@@ -256,13 +307,13 @@ pub fn read(home: &Path, agent: &str) -> Option<serde_json::Value> {
         }
         let v: serde_json::Value = std::fs::read_to_string(path)
             .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())?;
+            .and_then(|c| parse_binding_guarded(&c))?;
         map.insert(key, v.clone());
         return Some(v);
     }
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
+        .and_then(|c| parse_binding_guarded(&c))
 }
 
 /// Check if an agent is bound in a daemon-managed worktree.
@@ -536,6 +587,55 @@ mod tests {
         assert_eq!(binding["branch"], "feature-x");
         assert_eq!(binding["version"], 1);
         assert!(binding["issued_at"].as_str().is_some());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990: a binding.json a NEWER daemon wrote (version > current) reads as
+    /// `None` — treated as ABSENT so every consumer (git shim push gate, lease
+    /// checks) fail-closes, rather than acting on a shape this binary may not
+    /// fully understand. The missing-signature fail-closed path is unchanged.
+    #[test]
+    fn future_version_binding_reads_as_absent() {
+        let home = tmp_home("future-binding");
+        let dir = crate::paths::runtime_dir(&home).join("ag");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("binding.json"),
+            r#"{"version":999,"agent":"ag","task_id":"T-1","branch":"main"}"#,
+        )
+        .unwrap();
+        assert!(
+            read(&home, "ag").is_none(),
+            "a future-version binding.json must read as absent (fail-closed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #1990 (reviewer-2 P2b): destructive retention must distinguish a
+    /// future-version binding (present — a newer daemon's live worktree) from a
+    /// truly absent one. `read` collapses both to None; `present_including_future`
+    /// must report the future binding as present.
+    #[test]
+    fn present_including_future_distinguishes_future_from_absent() {
+        let home = tmp_home("present-future");
+        let dir = crate::paths::runtime_dir(&home).join("ag");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Truly absent → false.
+        assert!(!present_including_future(&home, "ag"));
+        // Future-version binding → read() fail-closes to None, but it is PRESENT.
+        std::fs::write(
+            dir.join("binding.json"),
+            r#"{"version":999,"agent":"ag","task_id":"T-1","branch":"main"}"#,
+        )
+        .unwrap();
+        assert!(
+            read(&home, "ag").is_none(),
+            "read() fail-closes a future binding"
+        );
+        assert!(
+            present_including_future(&home, "ag"),
+            "present_including_future must report a future binding as present (future ≠ absent)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 

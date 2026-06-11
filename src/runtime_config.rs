@@ -4,6 +4,7 @@
 //! Values override compile-time defaults. The MCP `config` tool provides
 //! get/set access.
 
+use crate::store::SchemaVersioned;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -45,6 +46,21 @@ pub struct RuntimeConfig {
     /// the other gates here.
     #[serde(default = "default_true")]
     pub show_pane_state: bool,
+    /// #1990: on-disk schema version. `#[serde(default)]` → an older config
+    /// written before this field reads back as 0 (≤ CURRENT, loads normally);
+    /// a value > CURRENT means a newer daemon wrote it and is fail-closed in
+    /// [`reload`] (keep-last-good / safe-default per #1576, never adopted).
+    /// Additive bumps (new fields with serde defaults) do NOT need a version
+    /// bump — only a non-additive change to an existing field does.
+    #[serde(default)]
+    pub schema_version: u32,
+}
+
+impl SchemaVersioned for RuntimeConfig {
+    const CURRENT: u32 = 1;
+    fn version_mut(&mut self) -> &mut u32 {
+        &mut self.schema_version
+    }
 }
 
 fn default_true() -> bool {
@@ -71,6 +87,7 @@ impl Default for RuntimeConfig {
             usage_limit_propagation_enabled: false,
             idle_watchdog_enabled: true,
             show_pane_state: true,
+            schema_version: RuntimeConfig::CURRENT,
         }
     }
 }
@@ -107,6 +124,19 @@ pub fn reload(home: &Path) {
     let path = home.join("runtime-config.json");
     match std::fs::read_to_string(&path) {
         Ok(c) => match serde_json::from_str::<RuntimeConfig>(&c) {
+            // #1990: a newer daemon wrote a schema we don't fully understand.
+            // Route through the SAME #1576 fail-closed disposition as a corrupt
+            // file (keep last-known-good at runtime, safe default at startup) —
+            // never silently adopt a config we can't trust. NOT load_versioned,
+            // which would reset to default at runtime and lose keep-last-good.
+            Ok(config) if config.schema_version > RuntimeConfig::CURRENT => fail_closed(
+                is_startup,
+                &format!(
+                    "schema_version {} > supported {}",
+                    config.schema_version,
+                    RuntimeConfig::CURRENT
+                ),
+            ),
             Ok(config) => {
                 *global().write() = config;
                 CORRUPT_WARNED.store(false, Ordering::Relaxed);
@@ -196,6 +226,25 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
         _ => return Err(format!("unknown config key: {key}")),
     }
     let path = home.join("runtime-config.json");
+    // #1990 (reviewer-2 P1): `config` comes from in-memory `get()` (the
+    // keep-last-good snapshot), NOT the disk file — so a blind write here would
+    // CLOBBER a future-version file a newer daemon wrote, downgrading it. Reads
+    // are protected by keep-last-good; the write path needs its own guard. Check
+    // the on-disk version first and refuse with a visible error (mirrors the
+    // decisions-update fail-closed) rather than silently overwriting.
+    if let Ok(disk) = std::fs::read_to_string(&path) {
+        if let Ok(existing) = serde_json::from_str::<RuntimeConfig>(&disk) {
+            if existing.schema_version > RuntimeConfig::CURRENT {
+                return Err(format!(
+                    "runtime-config.json was written by a newer schema version ({} > {}); refusing to overwrite — upgrade the daemon",
+                    existing.schema_version,
+                    RuntimeConfig::CURRENT
+                ));
+            }
+        }
+    }
+    // #1990: stamp the current schema version on every write.
+    config.schema_version = RuntimeConfig::CURRENT;
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
@@ -229,8 +278,14 @@ pub fn list() -> serde_json::Value {
 pub fn keys() -> Vec<String> {
     serde_json::to_value(RuntimeConfig::default())
         .ok()
-        .and_then(|v| v.as_object().map(|m| m.keys().cloned().collect()))
+        .and_then(|v| v.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()))
         .unwrap_or_default()
+        .into_iter()
+        // #1990: `schema_version` is on-disk metadata, not an operator-settable
+        // key — keep it out of the `config` MCP tool's key list (set/get_key
+        // reject it, so it must not appear as settable).
+        .filter(|k| k != "schema_version")
+        .collect()
 }
 
 #[cfg(test)]
@@ -332,5 +387,79 @@ mod tests {
                 "keys() reported a non-gettable key: {k}"
             );
         }
+    }
+
+    /// #1990 additive: a pre-#1990 config written WITHOUT a `schema_version`
+    /// field must still load (the field defaults to 0 ≤ CURRENT).
+    #[test]
+    #[serial(runtime_config)]
+    fn old_config_without_schema_version_loads() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-oldver");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"dev_idle_threshold_secs": 4242}"#,
+        )
+        .unwrap();
+        reload(&dir);
+        assert_eq!(
+            get_key("dev_idle_threshold_secs").unwrap(),
+            "4242",
+            "a pre-#1990 config (no schema_version) must still load"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1990 + #1576: a config carrying a FUTURE `schema_version` must be
+    /// fail-closed — NOT adopted — keeping the last-known-good value rather than
+    /// reverting to defaults mid-run.
+    #[test]
+    #[serial(runtime_config)]
+    fn future_schema_version_config_kept_last_good() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-futurever");
+        std::fs::create_dir_all(&dir).ok();
+        // Establish a known last-known-good first.
+        set(&dir, "dev_idle_threshold_secs", "5555").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("dev_idle_threshold_secs").unwrap(), "5555");
+        // A newer daemon overwrites with a future schema + a different value.
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 999, "dev_idle_threshold_secs": 1}"#,
+        )
+        .unwrap();
+        reload(&dir);
+        assert_eq!(
+            get_key("dev_idle_threshold_secs").unwrap(),
+            "5555",
+            "a future-schema config must be rejected, keeping last-known-good (not adopting 1)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1990 (reviewer-2 P1): `set` writes from the in-memory keep-last-good
+    /// snapshot, so a blind write would clobber a future-version file on disk.
+    /// It must refuse instead, leaving the newer daemon's file intact.
+    #[test]
+    #[serial(runtime_config)]
+    fn set_refuses_to_overwrite_future_version_file() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-setfuture");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 999, "dev_idle_threshold_secs": 1}"#,
+        )
+        .unwrap();
+        let r = set(&dir, "dev_idle_threshold_secs", "7200");
+        assert!(
+            r.is_err(),
+            "set must refuse to overwrite a future-version config: {r:?}"
+        );
+        let disk = std::fs::read_to_string(dir.join("runtime-config.json")).unwrap();
+        assert!(
+            disk.contains("999"),
+            "the future-version file must be left intact, not downgraded: {disk}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
