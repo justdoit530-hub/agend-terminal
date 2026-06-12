@@ -118,24 +118,19 @@ impl Categories {
 /// Enumerate local branches via `git for-each-ref`, parsing name +
 /// tip SHA + ISO-8601 committerdate per line.
 fn enumerate_branches(repo: &Path) -> Result<Vec<BranchInfo>, String> {
-    let output = std::process::Command::new("git")
-        .args([
+    // W1.2: git_cmd = always-bypass + bounded + trimmed stdout; its GitError
+    // covers both the spawn-fail and non-zero-exit branches this used to handle
+    // separately (same semantics, more structured message).
+    let stdout = crate::git_helpers::git_cmd(
+        repo,
+        &[
             "for-each-ref",
             "--sort=-committerdate",
             "--format=%(refname:short)|%(objectname)|%(committerdate:iso8601-strict)",
             "refs/heads/",
-        ])
-        .current_dir(repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .map_err(|e| format!("git for-each-ref spawn failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git for-each-ref failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        ],
+    )
+    .map_err(|e| format!("git for-each-ref: {e}"))?;
     let branches: Vec<BranchInfo> = stdout
         .lines()
         .filter_map(|line| {
@@ -160,16 +155,11 @@ fn enumerate_branches(repo: &Path) -> Result<Vec<BranchInfo>, String> {
 /// commit (`git branch --merged base` includes it). Used to detect
 /// the `clean_merged` category.
 fn is_clean_merged(repo: &Path, base: &str, branch: &str) -> bool {
-    let output = std::process::Command::new("git")
-        .args(["branch", "--merged", base])
-        .current_dir(repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
-    let Ok(o) = output else { return false };
-    if !o.status.success() {
+    // W1.2: git_cmd → trimmed stdout on success; both the spawn-error and
+    // non-zero-exit `return false` branches collapse to the `Err → false` arm.
+    let Ok(stdout) = crate::git_helpers::git_cmd(repo, &["branch", "--merged", base]) else {
         return false;
-    }
-    let stdout = String::from_utf8_lossy(&o.stdout);
+    };
     stdout
         .lines()
         .map(|l| l.trim_start_matches('*').trim())
@@ -201,16 +191,11 @@ pub(crate) fn is_squash_merged(repo: &Path, base: &str, branch: &str) -> bool {
 
 /// `git cherry` based detection.
 fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
-    let output = std::process::Command::new("git")
-        .args(["cherry", base, branch])
-        .current_dir(repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output();
-    let Ok(o) = output else { return false };
-    if !o.status.success() {
+    // W1.2: git_cmd → trimmed stdout on success; spawn-error + non-zero-exit
+    // both collapse to the `Err → false` arm.
+    let Ok(stdout) = crate::git_helpers::git_cmd(repo, &["cherry", base, branch]) else {
         return false;
-    }
-    let stdout = String::from_utf8_lossy(&o.stdout);
+    };
     let mut had_any = false;
     for line in stdout.lines() {
         let trimmed = line.trim();
@@ -231,13 +216,11 @@ fn is_squash_merged_cherry(repo: &Path, base: &str, branch: &str) -> bool {
 /// branch name reuse.
 fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
     // Resolve owner/repo from git remote origin.
-    let remote = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (this site previously
+    // ran raw `git` with NO bypass env). Daemon-side git over a fleet repo is the
+    // forgot-bypass latent class (#821/#1463); always-bypass is the intended fix.
+    // git_cmd trims stdout → identical to the prior `.trim().to_string()`.
+    let remote = crate::git_helpers::git_cmd(repo, &["remote", "get-url", "origin"]).ok();
     let Some(remote_url) = remote else {
         return false;
     };
@@ -246,13 +229,9 @@ fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
         return false;
     };
     // Get local branch tip SHA.
-    let local_sha = std::process::Command::new("git")
-        .args(["rev-parse", branch])
-        .current_dir(repo)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    // W1.2 class-2: BEHAVIOR DELTA — adds AGEND_GIT_BYPASS (was raw, no bypass).
+    // Same forgot-bypass class as the remote read above; git_cmd trims → identical.
+    let local_sha = crate::git_helpers::git_cmd(repo, &["rev-parse", branch]).ok();
     let Some(local_sha) = local_sha else {
         return false;
     };
@@ -445,13 +424,10 @@ pub(crate) fn emit_delete_batch(
         let Some(cand) = name_to_candidate.get(name.as_str()) else {
             continue;
         };
-        let output = std::process::Command::new("git")
-            .args(["branch", "-D", name])
-            .current_dir(repo)
-            .env("AGEND_GIT_BYPASS", "1")
-            .output();
-        match output {
-            Ok(o) if o.status.success() => {
+        // W1.2: git_cmd's GitError preserves the two distinct failure logs this
+        // site emits — NonZero carries the trimmed stderr, Spawn carries the io error.
+        match crate::git_helpers::git_cmd(repo, &["branch", "-D", name]) {
+            Ok(_) => {
                 deleted += 1;
                 let category = category_of(name);
                 crate::event_log::log(
@@ -465,18 +441,15 @@ pub(crate) fn emit_delete_batch(
                     ),
                 );
             }
-            Ok(o) => {
+            Err(crate::git_helpers::GitError::NonZero { stderr, .. }) => {
                 crate::event_log::log(
                     home,
                     "branch_sweep_apply_failed",
                     "system:branch_sweep",
-                    &format!(
-                        "branch={name} stderr={}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
+                    &format!("branch={name} stderr={stderr}"),
                 );
             }
-            Err(e) => {
+            Err(crate::git_helpers::GitError::Spawn(e)) => {
                 crate::event_log::log(
                     home,
                     "branch_sweep_apply_failed",
