@@ -169,10 +169,41 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
                 .unwrap_or_else(|| "claude".to_string())
         });
     let command = command.as_str();
-    let args: Vec<String> = params["args"]
+    let mut args: Vec<String> = params["args"]
         .as_str()
         .map(|s| s.split_whitespace().map(String::from).collect())
         .unwrap_or_default();
+    // #2038: fleet.yaml's per-instance `model` (and, for arg-less callers,
+    // `args`) only applied at the daemon-boot spawn — the runtime respawn
+    // flows (restart_instance / replace_instance / start_instance, deploy
+    // Phase 3) issue SPAWN without them, so the written config silently
+    // didn't apply until the next full daemon restart. Same class as the
+    // #900 env fix: re-resolve from fleet.yaml at this handler boundary
+    // (single resolve, shared with the env fallback below).
+    let fleet_resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
+        .ok()
+        .and_then(|f| f.resolve_instance(name));
+    // replace_instance sends no `args` key at all — fall back to the fleet
+    // entry's resolved args (boot parity). A present-but-empty `args` ("")
+    // means the caller already resolved them as empty (restart path), which
+    // matches what the fallback would yield.
+    if params["args"].as_str().is_none() {
+        if let Some(r) = &fleet_resolved {
+            args = r.args.clone();
+        }
+    }
+    // Model precedence: an explicit `--model` in args (create_instance
+    // pre-formats it there) > `params.model` (deploy Phase 3 sends the
+    // template's model on the wire — pre-#2038 this field was silently
+    // ignored) > the fleet entry's resolved model. push_model_arg enforces
+    // the first tier by never duplicating an existing flag.
+    if let Some(model) = params["model"]
+        .as_str()
+        .filter(|m| !m.is_empty())
+        .or_else(|| fleet_resolved.as_ref().and_then(|r| r.model.as_deref()))
+    {
+        crate::backend::Backend::push_model_arg(&mut args, command, model);
+    }
     let requested_work_dir = params["working_directory"]
         .as_str()
         .map(std::path::PathBuf::from)
@@ -204,9 +235,8 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     // hand-edited fleet.yaml entries where the wire payload omits env.
     let env_from_params = parse_env_object(params.get("env"));
     let env_from_fleet = if env_from_params.is_none() {
-        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-            .ok()
-            .and_then(|f| f.resolve_instance(name).map(|r| r.env))
+        // #2038: reuses the single fleet resolve from the args/model block above.
+        fleet_resolved.as_ref().map(|r| r.env.clone())
     } else {
         None
     };
@@ -1095,6 +1125,279 @@ mod tests {
             actual.as_deref(),
             Some("from-params-wins"),
             "params.env MUST take precedence over fleet.yaml env for the same key"
+        );
+    }
+
+    // ----- #2038: fleet.yaml model/args propagation through SPAWN RPC -----
+    //
+    // §3.9 path mapping: restart_instance sends `args` (fleet-resolved, no
+    // --model) and replace_instance sends NO `args` key at all — both flows
+    // are SPAWN RPCs into handle_spawn, so the two shapes below ARE the
+    // restart/replace argv assertions. The crash-respawn path does not go
+    // through SPAWN: `respawn_agent_worker` replays the boot-resolved
+    // `AgentConfig.args`, which already carry `--model` from
+    // `bootstrap::agent_resolve` — model is preserved there by construction
+    // (no harness-reachable seam to assert the spawned argv without a live
+    // daemon, hence this doc note per the #2038 task contract).
+
+    /// Write a tiny shell script that captures its own argv (`$*`) to
+    /// `sentinel_path` then sleeps so the agent stays alive long enough for
+    /// cleanup_agent to reap it. The daemon-appended `--model <val>` lands in
+    /// the script's argv, so the sentinel content IS the spawned argv tail.
+    #[cfg(unix)]
+    fn write_argv_capture_script(
+        home: &std::path::Path,
+        sentinel_path: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let script = home.join("argv-capture.sh");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s' \"${{*:-__NO_ARGS__}}\" > '{}'\nsleep 30\n",
+            sentinel_path.display()
+        );
+        std::fs::write(&script, body).expect("write script");
+        script
+    }
+
+    /// #2038 ingress 1 (restart_instance shape) — SPAWN params carry `args`
+    /// without `--model`; handle_spawn MUST append the fleet entry's `model`.
+    /// Pre-fix the spawned argv had no `--model` and the backend silently ran
+    /// its default model until the next full daemon restart.
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_falls_back_to_fleet_yaml_model_2038() {
+        let (ctx, home) = env_test_ctx("handle-spawn-model-fleet");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  model-fleet-test:\n    backend: shell\n    model: model-2038-fleet\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "model-fleet-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+                // No --model in args, none in params — must come from fleet.yaml.
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "model-fleet-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-fleet"),
+            "fleet.yaml model MUST reach the spawned argv on a runtime SPAWN \
+             (restart_instance shape); pre-#2038 it was boot-only"
+        );
+    }
+
+    /// #2038 ingress 2 (replace_instance shape) — SPAWN params omit `args`
+    /// entirely; handle_spawn MUST fall back to the fleet entry's resolved
+    /// `args` AND append its `model`. Pre-fix replace respawned with empty
+    /// argv: both fleet args and model were dropped.
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_falls_back_to_fleet_yaml_args_and_model_2038() {
+        let (ctx, home) = env_test_ctx("handle-spawn-args-fleet");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  args-fleet-test:\n    backend: shell\n    args:\n      - {}\n    model: model-2038-replace\n",
+                script.display()
+            ),
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "args-fleet-test",
+                "backend": "/bin/sh",
+                // No "args" field at all — the replace_instance wire shape.
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "args-fleet-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        // The script itself ran (proving fleet args fallback) and saw the
+        // appended model flag (proving model fallback).
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-replace"),
+            "an args-less SPAWN (replace_instance shape) MUST respawn with the \
+             fleet entry's args + model"
+        );
+    }
+
+    /// #2038 precedence — a caller-supplied `--model` in args wins over the
+    /// fleet entry's model, and the flag is never duplicated
+    /// (create_instance pre-formats `--model` into its SPAWN args).
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_caller_model_flag_wins_over_fleet_2038() {
+        let (ctx, home) = env_test_ctx("handle-spawn-model-prec");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  model-prec-test:\n    backend: shell\n    model: model-2038-loser\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "model-prec-test",
+                "backend": "/bin/sh",
+                "args": format!("{} --model model-2038-explicit", script.display()),
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "model-prec-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        let argv = actual.expect("sentinel must have content");
+        assert_eq!(
+            argv, "--model model-2038-explicit",
+            "caller-passed --model MUST win over fleet.yaml model with no duplicate flag"
+        );
+    }
+
+    /// #2038 ingress 3 (deploy Phase-3 shape) — SPAWN params carry an explicit
+    /// `model` field (deployments.rs sends the template's model on the wire).
+    /// Pre-#2038 handle_spawn silently ignored it; now it MUST be honoured and
+    /// it wins over a diverging fleet entry (params are the caller's explicit
+    /// intent, same precedence rule as params.env over fleet env in #900).
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_params_model_wins_over_fleet_2038() {
+        let (ctx, home) = env_test_ctx("handle-spawn-params-model");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  params-model-test:\n    backend: shell\n    model: model-2038-fleet-loser\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "params-model-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+                "model": "model-2038-params",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "params-model-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-params"),
+            "params.model MUST be honoured and win over the fleet entry's model"
+        );
+    }
+
+    /// #2038 precedence (resolve chain) — per-instance `model:` overrides
+    /// `defaults.model`, proven at the SPAWN entry point (not just at the
+    /// `resolve_instance` unit level): the spawned argv carries the instance
+    /// value, never the default.
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_instance_model_overrides_defaults_2038() {
+        let (ctx, home) = env_test_ctx("handle-spawn-inst-vs-defaults");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: shell\n    model: model-2038-inst-wins\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "inst-model-test",
+                "backend": "/bin/sh",
+                "args": script.display().to_string(),
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "inst-model-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-inst-wins"),
+            "per-instance model MUST override defaults.model at the SPAWN entry"
+        );
+    }
+
+    /// #2038 ingress 4 (CREATE_TEAM Phase-2) — team members spawn through
+    /// `spawn_one` directly (not handle_spawn), so the team handler needs its
+    /// own boot-parity proof: with `defaults.model` (and `defaults.args`
+    /// carrying the capture script) in fleet.yaml, the real CREATE_TEAM entry
+    /// point MUST spawn the member with `--model` in its argv. Pre-#2038 the
+    /// member spawned with empty args (`&[]`), dropping both.
+    #[cfg(unix)]
+    #[test]
+    fn create_team_spawns_members_with_defaults_model_2038() {
+        let (ctx, home) = env_test_ctx("create-team-defaults-model");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "defaults:\n  args:\n    - {}\n  model: model-2038-team\ninstances: {{}}\n",
+                script.display()
+            ),
+        )
+        .expect("write fleet.yaml");
+
+        let result = crate::api::handlers::team::handle_create_team(
+            &json!({
+                "name": "team2038",
+                "count": 1,
+                "backend": "/bin/sh",
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "create_team must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "team2038-1");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("--model model-2038-team"),
+            "CREATE_TEAM Phase-2 member spawn MUST carry defaults.model (and \
+             defaults.args) — pre-#2038 it spawned with empty argv"
         );
     }
 }
