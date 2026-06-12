@@ -163,6 +163,51 @@ pub struct FleetConfig {
     pub(crate) home: Option<PathBuf>,
 }
 
+/// An entry in a channel's `user_allowlist`. **Channel-agnostic by design** —
+/// used by Telegram today, and intended for any future channel adapter
+/// (Discord, Slack, …): when their inbound handlers land they should give their
+/// `user_allowlist` this same `Option<Vec<AllowlistEntry>>` type and resolve the
+/// sender name the same way (see `TelegramState::username_for` +
+/// `NotifySource::Channel`, which already renders `user:NAME via {channel}` for
+/// any `ChannelKind`).
+///
+/// Accepts either a bare numeric user id (legacy: `- 12345`) or a `{ id, name }`
+/// map that also records a display name. The name is surfaced as
+/// `[user:NAME via <channel>]` in agent inboxes when the sender has no public
+/// platform username (so the operator no longer shows up as `unknown`).
+/// Backward compatible via `#[serde(untagged)]` — old bare-id lists still parse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AllowlistEntry {
+    /// Bare Telegram user id (legacy shape).
+    Id(i64),
+    /// `{ id: 12345, name: "Alice" }` — id plus display name.
+    Named { id: i64, name: String },
+}
+
+impl AllowlistEntry {
+    /// The Telegram user id, regardless of shape.
+    pub fn id(&self) -> i64 {
+        match self {
+            Self::Id(id) | Self::Named { id, .. } => *id,
+        }
+    }
+
+    /// The configured display name, if this entry carries one.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Named { name, .. } => Some(name.as_str()),
+            Self::Id(_) => None,
+        }
+    }
+}
+
+impl From<i64> for AllowlistEntry {
+    fn from(id: i64) -> Self {
+        Self::Id(id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ChannelConfig {
@@ -187,8 +232,13 @@ pub enum ChannelConfig {
         ///   down an environment without removing the channel config.
         /// - `Some([...])`: only those user IDs are accepted; others are
         ///   dropped with a warn log.
+        ///
+        /// Each entry is either a bare id (`- 12345`) or `{ id, name }` — see
+        /// [`AllowlistEntry`]. A configured `name` is shown as the sender in
+        /// agent inboxes (`[user:NAME via telegram]`) when the Telegram account
+        /// has no public @username.
         #[serde(default)]
-        user_allowlist: Option<Vec<i64>>,
+        user_allowlist: Option<Vec<AllowlistEntry>>,
         /// Optional fleet-activity binding — where cross-instance
         /// `FleetEvent`s (delegate / report / decision / broadcast) are
         /// mirrored as one-liner log rows. Omitted = no fleet sink for
@@ -989,6 +1039,74 @@ instances:
             Some(crate::fleet::ChannelConfig::Discord { .. }) => panic!("unexpected discord"),
         }
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // #2045: the `{ id, name }` allowlist form parses through the REAL fleet load
+    // entry (FleetConfig::load), alongside a legacy bare id — the happy path the
+    // deny test below guards.
+    #[test]
+    fn user_allowlist_named_entry_loads_via_real_fleet() {
+        let dir = std::env::temp_dir().join(format!("agend-fleet-allow-ok-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channel:
+  type: telegram
+  bot_token_env: MY_BOT_TOKEN
+  group_id: -100
+  user_allowlist:
+    - 12345
+    - { id: 67890, name: "Alice" }
+instances: {}
+"#,
+        );
+        let config = FleetConfig::load(&path).expect("named + bare allowlist must load");
+        match config.channel {
+            Some(ChannelConfig::Telegram {
+                ref user_allowlist, ..
+            }) => {
+                let list = user_allowlist.as_ref().expect("allowlist present");
+                assert_eq!(list[0].id(), 12345);
+                assert_eq!(list[0].name(), None);
+                assert_eq!(list[1].id(), 67890);
+                assert_eq!(list[1].name(), Some("Alice"));
+            }
+            other => panic!("expected telegram channel, got {other:?}"),
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // #2045 review add 2 (the authz-surface invariant): a MALFORMED allowlist
+    // entry must FAIL-CLOSED at the real fleet load entry — `FleetConfig::load`
+    // returns `Err`, so the daemon refuses to boot with a half-parsed allowlist
+    // rather than silently dropping the bad entry and accepting whatever remains.
+    // The `#[serde(untagged)]` enum has no fallthrough: an entry that is neither a
+    // bare integer nor a complete `{ id: i64, name: String }` matches no variant.
+    #[test]
+    fn user_allowlist_malformed_entry_fails_closed_via_real_fleet() {
+        // A `{ id, name }` map whose id is a quoted string — matches neither
+        // `Id(i64)` (it's a map) nor `Named { id: i64, .. }` (id is not i64).
+        let dir =
+            std::env::temp_dir().join(format!("agend-fleet-allow-bad-{}", std::process::id()));
+        let path = write_fleet(
+            &dir,
+            r#"
+channel:
+  type: telegram
+  bot_token_env: MY_BOT_TOKEN
+  group_id: -100
+  user_allowlist:
+    - 12345
+    - { id: "not_a_number", name: "Mallory" }
+instances: {}
+"#,
+        );
+        assert!(
+            FleetConfig::load(&path).is_err(),
+            "a malformed allowlist entry must fail the whole fleet load (fail-closed \
+             authz surface), not be silently dropped"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 

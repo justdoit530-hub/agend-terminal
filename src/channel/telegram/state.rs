@@ -92,6 +92,11 @@ pub struct TelegramState {
     /// config's `fleet_binding` block plus the on-disk topic registry
     /// sentinel `"__fleet__"`.
     pub fleet_binding_topic_id: Option<i32>,
+    /// Display names for allowlisted Telegram user ids (from the `{ id, name }`
+    /// form of `user_allowlist`). Used to render `[user:NAME via telegram]` when
+    /// the sender has no public @username. Set post-bootstrap in
+    /// [`init_from_config`]; empty when no names are configured.
+    pub user_names: HashMap<i64, String>,
 }
 
 impl TelegramState {
@@ -117,6 +122,7 @@ impl TelegramState {
             user_allowlist,
             registry: None,
             fleet_binding_topic_id: None,
+            user_names: HashMap::new(),
         }
     }
 
@@ -150,6 +156,7 @@ impl TelegramState {
             user_allowlist,
             registry: None,
             fleet_binding_topic_id: None,
+            user_names: HashMap::new(),
         }
     }
 
@@ -168,6 +175,13 @@ impl TelegramState {
         crate::channel::auth::is_authorized_recipient(&self.user_allowlist, user_id)
     }
 
+    /// Configured display name for a Telegram user id, if any (from the
+    /// `{ id, name }` form of `user_allowlist`). Used to resolve the sender
+    /// shown in agent inboxes when the account has no public @username.
+    pub fn username_for(&self, user_id: i64) -> Option<&str> {
+        self.user_names.get(&user_id).map(String::as_str)
+    }
+
     /// Send a message to an instance's Telegram topic.
     #[allow(dead_code)]
     pub async fn send_to_topic(&self, instance_name: &str, text: &str) -> anyhow::Result<()> {
@@ -180,6 +194,34 @@ impl TelegramState {
             .as_ref()
             .expect("telegram bot not initialized (contract-test construction?)");
         send_with_topic(bot, self.group_id, Some(*topic_id), text, None).await
+    }
+}
+
+/// Cap (in chars) for an operator-configured display name. 32 matches the
+/// Telegram @username length limit — long enough for any real name, short
+/// enough to keep the notification header readable.
+const DISPLAY_NAME_MAX_CHARS: usize = 32;
+
+/// Sanitize an operator-configured allowlist display name before it is stored
+/// and later surfaced in the line-oriented `[user:NAME via telegram]`
+/// notification header. The name is operator-trust input (it never participates
+/// in authorization — only the id projection does), so this is header-hygiene,
+/// not a privilege boundary: a control character or newline in a name would
+/// garble the single-line header parsing. Strips ASCII/Unicode control
+/// characters, trims surrounding whitespace, and caps the length. Returns
+/// `None` when nothing usable remains, so the caller drops the entry and the
+/// sender falls back to `unknown` rather than rendering an empty name.
+pub(crate) fn sanitize_display_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(DISPLAY_NAME_MAX_CHARS)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -286,6 +328,60 @@ mod tests {
         assert!(state.is_user_allowed(100));
         assert!(!state.is_user_allowed(41));
         assert!(!state.is_user_allowed(0));
+    }
+
+    #[test]
+    fn username_for_resolves_configured_name() {
+        let mut state = TelegramState::new(
+            "tok",
+            -1,
+            HashMap::new(),
+            PathBuf::from("/tmp"),
+            HashMap::new(),
+            Some(vec![42, 100]),
+        );
+        state.user_names.insert(42, "Alice".to_string());
+        // configured name → resolved
+        assert_eq!(state.username_for(42), Some("Alice"));
+        // allowlisted but no name → None (caller falls back to "unknown")
+        assert_eq!(state.username_for(100), None);
+        // unknown id → None
+        assert_eq!(state.username_for(999), None);
+    }
+
+    #[test]
+    fn allowlist_entry_untagged_accepts_bare_id_and_named() {
+        use crate::fleet::AllowlistEntry;
+        let yaml = "- 12345\n- { id: 67890, name: \"Alice\" }\n";
+        let list: Vec<AllowlistEntry> = serde_yaml_ng::from_str(yaml).expect("parse");
+        assert_eq!(list[0].id(), 12345);
+        assert_eq!(list[0].name(), None);
+        assert_eq!(list[1].id(), 67890);
+        assert_eq!(list[1].name(), Some("Alice"));
+    }
+
+    // #2045 review add 1: the configured display name is sanitized before it can
+    // reach the line-oriented `[user:NAME via telegram]` notification header.
+    #[test]
+    fn sanitize_display_name_strips_control_chars_and_caps_length() {
+        // Plain name passes through unchanged.
+        assert_eq!(sanitize_display_name("Yu"), Some("Yu".to_string()));
+        // Newline / CR / tab (the header-garbling chars) are stripped.
+        assert_eq!(
+            sanitize_display_name("Al\nice\r\tBob"),
+            Some("AliceBob".to_string()),
+            "control chars (incl. newline/CR/tab) must be removed so the \
+             single-line notification header can't be garbled"
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(sanitize_display_name("  Yu  "), Some("Yu".to_string()));
+        // Length is capped at DISPLAY_NAME_MAX_CHARS (32).
+        let long = "x".repeat(50);
+        assert_eq!(sanitize_display_name(&long).map(|s| s.len()), Some(32));
+        // A name that sanitizes to nothing → None (caller falls back to "unknown").
+        assert_eq!(sanitize_display_name("\n\r\t"), None);
+        assert_eq!(sanitize_display_name("   "), None);
+        assert_eq!(sanitize_display_name(""), None);
     }
 
     #[test]
