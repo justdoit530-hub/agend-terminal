@@ -2,12 +2,13 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub(super) fn handle_restart_daemon(home: &Path) -> Value {
-    // #1814 Stage 1: flag-gated self-respawn. When AGEND_RESTART_HANDOFF=1 the
-    // daemon owns its own respawn (spawn successor → Phase-1 health gate →
-    // abort-stay-alive on failure), so restart never hinges on an external
-    // supervisor being correctly detected (retires the #851/#1812 brick class
-    // at the root). Flag OFF → the legacy supervisor + exit(42) path below runs
-    // byte-identically.
+    // #1814: self-respawn is the DEFAULT (Stage 4). By default the daemon owns
+    // its own respawn (spawn successor → Phase-1 health gate → abort-stay-alive
+    // on failure), so restart never hinges on an external supervisor being
+    // correctly detected (retires the #851/#1812 brick class at the root). Only
+    // the explicit opt-out `AGEND_RESTART_HANDOFF=0` takes the legacy supervisor
+    // + exit(42) path below (byte-identical to pre-#1814). See
+    // `daemon::restart::self_respawn_enabled` + `docs/env-vars.md`.
     // #1814 observability: record which restart path this request takes so the
     // pre-soak operator A/B (legacy exit42 vs self-respawn) is greppable on one
     // tag. `target: "handoff"` + an `event` field make the handoff lifecycle
@@ -257,13 +258,13 @@ mod tests {
     #[test]
     fn handle_restart_daemon_fails_closed_when_unsupervised() {
         with_env_and_reset(
-            &[],
+            // #1814 Stage 4: self-respawn is now the DEFAULT, so the legacy
+            // fail-closed (is_restart_supervised) branch is only reached via the
+            // explicit opt-out `AGEND_RESTART_HANDOFF=0`. Set it so this test
+            // exercises the legacy supervisor-required path (was: unset, which
+            // pre-Stage-4 meant legacy-by-default but now means self-respawn).
+            &[("AGEND_RESTART_HANDOFF", "0")],
             &[
-                // #1964 drive-by (env false-fail): AGEND_RESTART_HANDOFF is now
-                // set fleet-wide (#1814 Stage 1 deployed) — without clearing it
-                // this test takes the self-respawn branch instead of the
-                // fail-closed one and fake-FAILs on every fleet agent.
-                "AGEND_RESTART_HANDOFF",
                 "AGEND_WRAPPED",
                 "AGEND_SUPERVISED",
                 "INVOCATION_ID",
@@ -322,7 +323,11 @@ mod tests {
     #[test]
     fn handle_restart_daemon_fails_closed_on_bare_gui_xpc_only() {
         with_env_and_reset(
-            &[("XPC_SERVICE_NAME", "0")],
+            // #1814 Stage 4: opt into the legacy supervisor-detection path
+            // (=0) so this exercises the is_restart_supervised XPC false-positive
+            // guard — under the new self-respawn default it would otherwise hit
+            // the spawn path (which also returns ok:false, masking the intent).
+            &[("XPC_SERVICE_NAME", "0"), ("AGEND_RESTART_HANDOFF", "0")],
             &["AGEND_WRAPPED", "AGEND_SUPERVISED", "INVOCATION_ID"],
             || {
                 let tmp = std::env::temp_dir().join(format!(
