@@ -71,6 +71,16 @@ const MODULE_SCOPE: &[&str] = &[
     "mcp/handlers/ci/mod.rs",
     "daemon/auto_release.rs",
     "daemon/retention/worktrees.rs",
+    // W1.2 worktree slice (final substantive W1.2): per-site judgement on
+    // worktree.rs's 11 production sites. Migrated the simple LOCAL ops —
+    // has_commits/empty-commit (→git_ok), branch --show-current (→git_cmd),
+    // branch -D (→git_ok), checkout_branch switch×2 (→git_cmd), prune (→git_cmd,
+    // 3-way map + LOCAL_GIT_TIMEOUT bound). Kept raw via git-raw-allowed (4 sites,
+    // byte-identical-conservative): the two `worktree add` (nested stderr-substring
+    // fallback dispatch), has_uncommitted_changes (porcelain emptiness + fail-closed
+    // WIP guard), remove_worktree (two contracted spawn-vs-non-zero Err strings).
+    // worktree lifecycle stays byte-identical.
+    "worktree.rs",
 ];
 
 /// One violation entry — `(file, line_number, snippet)`.
