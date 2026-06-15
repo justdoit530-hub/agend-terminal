@@ -22,7 +22,6 @@ use super::{find_cargo_test_payload, parse_claims, Claim};
 /// bails with `None`, dropping the genuine later invocation. Correct behavior
 /// returns the payload of the SECOND, valid occurrence.
 #[test]
-#[ignore = "verify-claim-cost cargo-testbed-first-match: red until fix; remove #[ignore] after fix to confirm"]
 fn find_cargo_test_payload_skips_testbed_and_finds_real_invocation_verify_claim_cost() {
     let line = "cargo testbed && cargo test foo::bar_test";
 
@@ -60,7 +59,6 @@ fn find_cargo_test_payload_rejects_standalone_testing_verify_claim_cost() {
 /// `verify()` then rejects the whole push because the fn is absent. The module
 /// contract (header lines 3-4) is that unknown phrases pass through.
 #[test]
-#[ignore = "verify-claim-cost fn-prose-falsepositive: red until fix; remove #[ignore] after fix to confirm"]
 fn prose_mentioning_fn_pattern_stays_unknown_verify_claim_cost() {
     let text = "will add fn new_helper() in a follow-up";
     let claims = parse_claims(text);
@@ -87,5 +85,28 @@ fn deliberate_fn_exists_claim_is_not_unknown_verify_claim_cost() {
         !matches!(claims[0], Claim::Unknown(_)),
         "a deliberate `fn name() exists` assertion should remain a verifiable \
          FunctionExists claim, not fall through to Unknown"
+    );
+}
+
+/// RED-guard against the fail-OPEN regression that a blanket future-marker scan
+/// introduced (dual-1 REJECT): a PRESENT-TENSE fn claim whose SAME segment also
+/// contains a common modal AFTER the fn reference ("references fn x() — this will
+/// help") must STAY a verifiable FunctionExists. Downgrading it to Unknown would
+/// make `verify()` return passed:true and SKIP the §4.3 hallucinated-fn check —
+/// letting a non-existent fn through (worse than the original over-reject, which
+/// was fail-CLOSED). The positional heuristic (marker must precede the fn token)
+/// keeps this a claim because `will` appears AFTER `fn verify_push(`.
+#[test]
+fn present_tense_fn_claim_with_trailing_modal_stays_function_exists_verify_claim_cost() {
+    let claims = parse_claims("references fn verify_push() — this will help reviewers");
+    assert_eq!(claims.len(), 1, "one segment -> one claim");
+    assert_eq!(
+        claims,
+        vec![Claim::FunctionExists {
+            fn_names: vec!["verify_push".into()]
+        }],
+        "a present-tense fn assertion with a TRAILING modal must remain a \
+         verifiable FunctionExists (the modal is about reviewers, not future \
+         work) — downgrading to Unknown fail-OPENs the hallucinated-fn check"
     );
 }
