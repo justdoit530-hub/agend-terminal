@@ -405,7 +405,7 @@ pub fn teardown_workspace_worktree(home: &Path, agent: &str, working_dir: &Path)
     let source_repo = resolve_owning_repo(home, agent, working_dir);
 
     if worktree_has_work_at_risk(working_dir) {
-        match backup_worktree_dir(home, agent, working_dir) {
+        match backup_worktree_dir(home, agent, None, working_dir) {
             Ok(dest) => tracing::warn!(agent, backup = %dest.display(),
                 "#2234 teardown: workspace worktree had uncommitted/unpushed work — backed up before removal"),
             Err(e) => {
@@ -476,8 +476,27 @@ fn resolve_owning_repo(home: &Path, agent: &str, working_dir: &Path) -> PathBuf 
 /// uncommitted/untracked changes, or — when a remote exists to be ahead of —
 /// local commits not reachable from any remote-tracking ref (committed-orphan).
 fn worktree_has_work_at_risk(wt: &Path) -> bool {
-    if crate::worktree::has_uncommitted_changes(wt) {
-        return true;
+    // Uncommitted/untracked work — EXCLUDING the daemon's own `.agend-managed`
+    // marker, which `git status --porcelain` reports as untracked but is
+    // regenerable metadata, not work (every leased/provisioned worktree carries
+    // it, so counting it would force a backup on EVERY release/teardown). Parse
+    // porcelain directly rather than `has_uncommitted_changes` so we can drop the
+    // marker line; fail-closed (spawn/non-zero → treat as at-risk) is preserved.
+    match crate::git_helpers::git_bypass(wt, &["status", "--porcelain"]) {
+        Ok(o) if o.status.success() => {
+            // Porcelain line = `XY <path>` (status code + space + path). The ONLY
+            // line to ignore is the root marker `?? .agend-managed`; match the path
+            // EXACTLY (porcelain path starts at byte 3) so a real file whose name
+            // merely ENDS with `.agend-managed` is NOT mistaken for the marker.
+            let is_marker_line = |l: &str| l.get(3..) == Some(MANAGED_MARKER);
+            let dirty = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| !is_marker_line(l));
+            if dirty {
+                return true;
+            }
+        }
+        _ => return true, // fail-closed
     }
     // "Unpushed" only has meaning when a remote exists; in a remote-less repo
     // every commit looks unreachable-from-remotes, which is not work-at-risk.
@@ -503,17 +522,43 @@ fn worktree_has_work_at_risk(wt: &Path) -> bool {
 /// Back up a worktree WHOLE to `<home>/reconcile-backups/<agent>-<epoch>/`,
 /// skipping the regenerable build cache (`target`) and the gitlink (`.git`).
 /// Conservative (lead Q2): never auto-deleted — operator / gc reclaim later.
-fn backup_worktree_dir(home: &Path, agent: &str, wt: &Path) -> std::io::Result<PathBuf> {
+/// Back up `wt` to `<home>/reconcile-backups/<agent>[-<branch>]-<epoch>/`. The
+/// optional `branch` discriminator (lead Q1 ruling) keeps backups UNIQUE when a
+/// single dispatch releases MULTIPLE stale holders in the same wall-clock second
+/// (#2234 Phase 1c `release_stale_branch_holders`) — without it `<agent>-<epoch>`
+/// would collide and the second copy would merge into the first. `None`
+/// (teardown's single-worktree path) keeps the original `<agent>-<epoch>` name.
+fn backup_worktree_dir(
+    home: &Path,
+    agent: &str,
+    branch: Option<&str>,
+    wt: &Path,
+) -> std::io::Result<PathBuf> {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let dest = home
-        .join("reconcile-backups")
-        .join(format!("{agent}-{epoch}"));
+    let name = match branch {
+        Some(b) => format!("{agent}-{}-{epoch}", sanitize_backup_segment(b)),
+        None => format!("{agent}-{epoch}"),
+    };
+    let dest = home.join("reconcile-backups").join(name);
     std::fs::create_dir_all(&dest)?;
     copy_dir_excluding(wt, &dest, &["target", ".git"])?;
     Ok(dest)
+}
+
+/// Filesystem-safe slug for a branch in a backup dir name (`feat/x` → `feat-x`).
+fn sanitize_backup_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn copy_dir_excluding(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Result<()> {
@@ -543,12 +588,70 @@ fn copy_dir_excluding(src: &Path, dst: &Path, exclude: &[&str]) -> std::io::Resu
 /// agents once the flag is on). Per lead Q1: a flag (not a per-instance field) —
 /// default off → opt-in a few agents → flip the default at cutover.
 pub fn workspace_as_worktree_enabled(agent: &str) -> bool {
-    match std::env::var("AGEND_WORKSPACE_AS_WORKTREE").as_deref() {
-        Ok("1") | Ok("true") => match std::env::var("AGEND_WORKSPACE_AS_WORKTREE_AGENTS") {
-            Ok(list) if !list.trim().is_empty() => list.split(',').any(|a| a.trim() == agent),
-            _ => true,
-        },
-        _ => false,
+    // Test-injectable seam (#2234 Phase 1c): tests enable (B) via a THREAD-LOCAL
+    // override (`workspace_worktree_test_seam::force`) instead of a process-global
+    // `set_var`, so a flag-ON test never leaks the flag to other tests running in
+    // parallel in the same binary (the env-leak flake class r6 caught twice). The
+    // production read-path below is byte-identical — the daemon still reads
+    // `AGEND_WORKSPACE_AS_WORKTREE` (+ allowlist). Compiled out of release builds.
+    #[cfg(test)]
+    if let Some(forced) = workspace_worktree_test_seam::get() {
+        return forced;
+    }
+    workspace_as_worktree_from_env(
+        std::env::var("AGEND_WORKSPACE_AS_WORKTREE").ok().as_deref(),
+        std::env::var("AGEND_WORKSPACE_AS_WORKTREE_AGENTS")
+            .ok()
+            .as_deref(),
+        agent,
+    )
+}
+
+/// Pure flag decision over (flag, allowlist) inputs — unit-testable without any
+/// process-global env mutation. `AGEND_WORKSPACE_AS_WORKTREE` must be `1`/`true`;
+/// a non-empty `AGEND_WORKSPACE_AS_WORKTREE_AGENTS` then scopes to listed agents.
+fn workspace_as_worktree_from_env(
+    flag: Option<&str>,
+    allowlist: Option<&str>,
+    agent: &str,
+) -> bool {
+    if !matches!(flag, Some("1") | Some("true")) {
+        return false;
+    }
+    match allowlist {
+        Some(list) if !list.trim().is_empty() => list.split(',').any(|a| a.trim() == agent),
+        _ => true,
+    }
+}
+
+/// #2234 Phase 1c test seam: a THREAD-LOCAL (B)-flag override. Tests force the
+/// flag on/off for their OWN thread — `workspace_as_worktree_enabled` runs
+/// synchronously on the caller thread (dispatch / resolve_auto_worktree), so the
+/// override is observed there but is invisible to other tests' threads. This
+/// roots out the process-global `set_var` leak class (no serial-grouping needed).
+#[cfg(test)]
+pub(crate) mod workspace_worktree_test_seam {
+    use std::cell::Cell;
+    thread_local! {
+        static OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    pub(crate) fn get() -> Option<bool> {
+        OVERRIDE.with(|c| c.get())
+    }
+    fn set(v: Option<bool>) {
+        OVERRIDE.with(|c| c.set(v));
+    }
+    /// RAII: force the flag for the current thread; restores on drop (incl. panic).
+    #[must_use]
+    pub(crate) struct ForceGuard;
+    pub(crate) fn force(enabled: bool) -> ForceGuard {
+        set(Some(enabled));
+        ForceGuard
+    }
+    impl Drop for ForceGuard {
+        fn drop(&mut self) {
+            set(None);
+        }
     }
 }
 
@@ -599,7 +702,7 @@ pub fn reconcile_workspace_to_worktree(
             .map(|mut d| d.next().is_some())
             .unwrap_or(false);
         if non_empty {
-            backup_worktree_dir(home, agent, target).map_err(|e| {
+            backup_worktree_dir(home, agent, branch, target).map_err(|e| {
                 format!(
                     "reconcile aborted (fail-closed): backup of {} failed: {e} — workspace left untouched",
                     target.display()
@@ -687,6 +790,107 @@ fn provision_worktree_at(
             target.display()
         )),
     }
+}
+
+/// #2234 Phase 1c: the (B) replacement for `lease` in dispatch — prepare the
+/// agent's WORKSPACE worktree for `branch`. Idempotent reconcile (spawn already
+/// provisioned it; re-assert covers a dispatch racing a not-yet-spawned agent or
+/// a deferred reconcile) → free `branch` from any stale legacy holders (each
+/// work-at-risk backed up before `--force`) → in-place `git checkout` (no
+/// `--force`; atomic abort on dirty). Returns the workspace worktree path to bind.
+pub fn prepare_workspace_worktree(
+    home: &Path,
+    agent: &str,
+    source_repo: &Path,
+    branch: &str,
+) -> Result<PathBuf, String> {
+    let ws = crate::paths::workspace_dir(home).join(agent);
+    reconcile_workspace_to_worktree(home, agent, &ws, source_repo, None)?;
+    release_stale_branch_holders(home, agent, source_repo, branch, &ws)?;
+    checkout_workspace_branch(&ws, branch)?;
+    Ok(ws)
+}
+
+/// #2234 Phase 1c (must-resolve #1, r6 confluence catch): free `branch` from any
+/// STALE legacy holders (the pre-(B) `worktrees/<agent>/<branch>` pool) before
+/// the workspace worktree's in-place checkout — else git refuses with "branch
+/// already checked out at <other>". Drives off the canonical
+/// [`enumerate_managed_worktrees`] (single source of truth over /workspace +
+/// /worktrees). Only releases this `agent`'s registered holders of `branch` that
+/// are NOT the workspace worktree itself; other residuals are left for GC (off
+/// the dispatch critical path → lower blast). Any single release failing
+/// (including a fail-closed backup abort) ABORTS the whole dispatch.
+pub fn release_stale_branch_holders(
+    home: &Path,
+    agent: &str,
+    source_repo: &Path,
+    branch: &str,
+    workspace_path: &Path,
+) -> Result<(), String> {
+    let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let ws = canon(workspace_path);
+    for wt in enumerate_managed_worktrees(home, source_repo) {
+        let is_self = canon(&wt.path) == ws;
+        let holds_branch = wt.branch.as_deref() == Some(branch);
+        let mine = wt.agent.as_deref() == Some(agent);
+        if !is_self && mine && holds_branch {
+            release_one_stale_holder(home, agent, source_repo, branch, &wt.path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Release a single stale legacy worktree, WORK-AT-RISK guarded (must-resolve
+/// #1): the old bound worktree is exactly where the shim's `-C <worktree>`
+/// redirected commits, so it may hold uncommitted/unpushed work that a bare
+/// `--force` would destroy. Mirror Phase-0 teardown: if work-at-risk, back up
+/// the WHOLE dir FIRST (keyed by branch so concurrent same-second releases don't
+/// collide) — and if that backup FAILS, ABORT fail-closed (never `--force`
+/// without a durable backup). All Phase-0 primitives reused verbatim.
+fn release_one_stale_holder(
+    home: &Path,
+    agent: &str,
+    source_repo: &Path,
+    branch: &str,
+    holder: &Path,
+) -> Result<(), String> {
+    if worktree_has_work_at_risk(holder) {
+        backup_worktree_dir(home, agent, Some(branch), holder).map_err(|e| {
+            format!(
+                "release aborted (fail-closed): backup of stale holder {} failed: {e}",
+                holder.display()
+            )
+        })?;
+    }
+    match remove_worktree(agent, holder, source_repo) {
+        WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => Ok(()),
+        WorktreeRemoval::Unmanaged(m) => Err(m),
+        WorktreeRemoval::Failed(e) => Err(e),
+    }
+}
+
+/// #2234 Phase 1c: in-place `git checkout <branch>` of the workspace worktree
+/// (the (B) replacement for leasing a fresh per-branch worktree). NO `--force` —
+/// git aborts atomically if the tree is dirty/conflicting, leaving HEAD on the
+/// prior branch so the caller can reject the dispatch without a half-applied
+/// state (the holding-clean invariant makes this the normal clean case).
+pub fn checkout_workspace_branch(workspace: &Path, branch: &str) -> Result<(), String> {
+    use crate::git_helpers::git_cmd;
+    git_cmd(workspace, &["checkout", branch])
+        .map(|_| ())
+        .map_err(|e| format!("in-place checkout of '{branch}' failed: {e}"))
+}
+
+/// #2234 Phase 1c rollback: return the workspace worktree to its HOLDING state
+/// (detached at HEAD) — used when `bind_full` fails AFTER a successful checkout.
+/// NEVER deletes the (permanent) workspace worktree; the just-checked-out branch
+/// carries no agent work yet (bind_full runs synchronously right after checkout,
+/// before the agent is told the dispatch succeeded), so detaching is safe.
+pub fn detach_workspace_to_holding(workspace: &Path) -> Result<(), String> {
+    use crate::git_helpers::git_cmd;
+    git_cmd(workspace, &["checkout", "--detach"])
+        .map(|_| ())
+        .map_err(|e| format!("rollback detach failed: {e}"))
 }
 
 fn clear_binding_state(home: &Path, agent: &str) {
@@ -2146,6 +2350,167 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    // ── #2234 cure-(B) Phase 1c: release_stale_branch_holders + in-place checkout ──
+
+    /// A clean legacy holder is released without a backup.
+    #[test]
+    fn release_stale_holder_clean_removes_no_backup() {
+        let home = tmp_home("p1c-clean");
+        let repo = tmp_repo("p1c-clean-repo");
+        let l = lease(&home, &repo, "deva", "feat/clean").expect("lease legacy holder");
+        assert!(l.path.exists());
+
+        release_one_stale_holder(&home, "deva", &repo, "feat/clean", &l.path).expect("release");
+
+        assert!(!l.path.exists(), "clean legacy holder removed via git");
+        assert!(backup_dir_for(&home, "deva").is_none(), "clean → no backup");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A legacy holder with work-at-risk (uncommitted) is backed up before
+    /// removal — never silently destroyed (the shim-redirected-commit hazard).
+    #[test]
+    fn release_stale_holder_work_at_risk_backs_up() {
+        let home = tmp_home("p1c-risk");
+        let repo = tmp_repo("p1c-risk-repo");
+        let l = lease(&home, &repo, "devb", "feat/risk").expect("lease");
+        std::fs::write(l.path.join("WIP.txt"), "unsaved").unwrap();
+        assert!(worktree_has_work_at_risk(&l.path));
+
+        release_one_stale_holder(&home, "devb", &repo, "feat/risk", &l.path).expect("release");
+
+        assert!(!l.path.exists(), "holder removed after backup");
+        let backup = backup_dir_for(&home, "devb").expect("work-at-risk backed up");
+        assert_eq!(
+            std::fs::read_to_string(backup.join("WIP.txt")).unwrap(),
+            "unsaved"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Fail-closed: if a work-at-risk holder's backup fails, release ABORTS and
+    /// leaves the holder untouched (never --force without a durable backup).
+    #[test]
+    fn release_stale_holder_backup_fail_aborts() {
+        let home = tmp_home("p1c-bkfail");
+        let repo = tmp_repo("p1c-bkfail-repo");
+        let l = lease(&home, &repo, "devc", "feat/bk").expect("lease");
+        std::fs::write(l.path.join("WIP.txt"), "precious").unwrap();
+        // Block backup: make the reconcile-backups parent a FILE.
+        std::fs::create_dir_all(&home).ok();
+        std::fs::write(home.join("reconcile-backups"), "blocker").unwrap();
+
+        let err = release_one_stale_holder(&home, "devc", &repo, "feat/bk", &l.path)
+            .expect_err("must abort on backup failure");
+        assert!(err.contains("backup"), "names the backup failure: {err}");
+        assert!(l.path.exists(), "holder untouched");
+        assert_eq!(
+            std::fs::read_to_string(l.path.join("WIP.txt")).unwrap(),
+            "precious",
+            "work not destroyed on backup failure"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The confluence end-to-end: a legacy `worktrees/<agent>/<branch>` holds the
+    /// branch, so the workspace worktree CANNOT check it out in place — until
+    /// `release_stale_branch_holders` frees it.
+    #[test]
+    fn release_stale_branch_holders_frees_branch_for_in_place_checkout() {
+        let home = tmp_home("p1c-free");
+        let repo = tmp_repo("p1c-free-repo");
+        // (B) workspace worktree (detached holding).
+        let ws = crate::paths::workspace_dir(&home).join("devf");
+        reconcile_workspace_to_worktree(&home, "devf", &ws, &repo, None).expect("provision ws");
+        // Legacy holder of feat/coexist (checks the branch out THERE).
+        let l = lease(&home, &repo, "devf", "feat/coexist").expect("lease legacy");
+        assert!(l.path.exists());
+        assert!(
+            checkout_workspace_branch(&ws, "feat/coexist").is_err(),
+            "branch already checked out at the legacy holder → in-place checkout blocked"
+        );
+
+        release_stale_branch_holders(&home, "devf", &repo, "feat/coexist", &ws).expect("free");
+
+        assert!(!l.path.exists(), "legacy holder released");
+        checkout_workspace_branch(&ws, "feat/coexist")
+            .expect("branch is now free → in-place checkout succeeds");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// In-place checkout + holding-detach rollback round-trip.
+    #[test]
+    fn checkout_workspace_branch_and_detach_rollback() {
+        let home = tmp_home("p1c-checkout");
+        let repo = tmp_repo("p1c-checkout-repo");
+        let ws = crate::paths::workspace_dir(&home).join("devg");
+        reconcile_workspace_to_worktree(&home, "devg", &ws, &repo, None).expect("provision");
+
+        // Make a branch to land on.
+        std::process::Command::new("git")
+            .args(["branch", "feat/land"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git branch");
+
+        checkout_workspace_branch(&ws, "feat/land").expect("in-place checkout");
+        let cur = crate::git_helpers::git_cmd(&ws, &["branch", "--show-current"]).unwrap();
+        assert_eq!(cur, "feat/land", "workspace now on the branch");
+
+        detach_workspace_to_holding(&ws).expect("rollback to holding");
+        let detached = crate::git_helpers::git_cmd(&ws, &["branch", "--show-current"]).unwrap();
+        assert!(
+            detached.is_empty(),
+            "rollback → detached holding (no branch)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// #2234 Phase 1c: the production flag decision (`workspace_as_worktree_from_env`)
+    /// — pure over (flag, allowlist) inputs, no process-global env (so no leak).
+    #[test]
+    fn workspace_as_worktree_from_env_flag_and_allowlist() {
+        // Off by default / unset / wrong value.
+        assert!(!workspace_as_worktree_from_env(None, None, "a"));
+        assert!(!workspace_as_worktree_from_env(Some("0"), None, "a"));
+        assert!(!workspace_as_worktree_from_env(Some("yes"), None, "a"));
+        // On for all agents when set and no allowlist.
+        assert!(workspace_as_worktree_from_env(Some("1"), None, "a"));
+        assert!(workspace_as_worktree_from_env(Some("true"), Some(""), "a"));
+        // Allowlist scopes to listed agents only.
+        assert!(workspace_as_worktree_from_env(Some("1"), Some("a,b"), "a"));
+        assert!(workspace_as_worktree_from_env(
+            Some("1"),
+            Some(" a , b "),
+            "b"
+        ));
+        assert!(!workspace_as_worktree_from_env(Some("1"), Some("a,b"), "c"));
+    }
+
+    /// #2234 Phase 1c: the thread-local test seam overrides the env decision for
+    /// the current thread only, and the RAII guard restores on drop.
+    #[test]
+    fn workspace_worktree_test_seam_is_thread_scoped_and_restores() {
+        assert!(!workspace_as_worktree_enabled("z"), "default off");
+        {
+            let _g = workspace_worktree_test_seam::force(true);
+            assert!(
+                workspace_as_worktree_enabled("z"),
+                "forced on for this thread"
+            );
+        }
+        assert!(
+            !workspace_as_worktree_enabled("z"),
+            "guard drop restores the env-default (off)"
+        );
     }
 
     fn tmp_repo(tag: &str) -> PathBuf {
