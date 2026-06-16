@@ -2559,6 +2559,166 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
     }
 
+    // ── #2234 (B) gray-rollout BLOCKER: re-dispatch dirty in-place checkout ──
+    //
+    // operator-required EMPIRICAL repro (task t-…29025-0). `prepare_workspace_worktree`
+    // = reconcile (case (iii): already a daemon worktree → NO-OP, does NOT clean) →
+    // `checkout_workspace_branch` = plain `git checkout <branch>` with NO `--force`.
+    // The "HOLDING-CLEAN BY CONSTRUCTION" invariant (worktree_pool.rs docs) only
+    // holds for a FRESHLY-provisioned worktree. When a dispatch re-targets an
+    // EXISTING workspace worktree that carries uncommitted/untracked work (an
+    // interrupted agent, or a dispatch racing an agent mid-edit), the in-place
+    // checkout's real git semantics are NOT "abort if dirty" — they are:
+    //   • non-conflicting tracked mod  → SILENTLY carried onto the new branch
+    //                                     (wrong-branch pollution),
+    //   • conflicting tracked mod      → abort (work intact, dispatch fails),
+    //   • untracked file               → carried onto the new branch.
+    // These three tests CHARACTERIZE that current behavior on `main` (they pass,
+    // pinning the gap). Phase 3 converts the two "silent carry" cases to RED→GREEN
+    // once the dirty-guard (backup-or-refuse, never silent-carry) lands.
+
+    /// Set up `repo` with `shared.txt` (identical on both branches → modifying it
+    /// is NON-conflicting) and `diverge.txt` (differs feat/x vs feat/y → modifying
+    /// it conflicts on checkout), plus branches `feat/x` and `feat/y`. Leaves the
+    /// canonical repo back on `main` so the workspace worktree can hold the branches.
+    fn setup_xy_repo(repo: &Path) {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::fs::write(repo.join("shared.txt"), "base\n").unwrap();
+        std::fs::write(repo.join("diverge.txt"), "base\n").unwrap();
+        git(&["add", "shared.txt", "diverge.txt"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "C0",
+        ]);
+        git(&["branch", "feat/x"]);
+        git(&["checkout", "-b", "feat/y"]);
+        std::fs::write(repo.join("diverge.txt"), "y-version\n").unwrap();
+        git(&["add", "diverge.txt"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "Y diverge",
+        ]);
+        git(&["checkout", "main"]);
+    }
+
+    /// HOLE ①: an uncommitted modification to a tracked file that is IDENTICAL on
+    /// both branches is SILENTLY carried onto the target branch by the no-`--force`
+    /// in-place checkout — the agent's feat/x WIP lands on feat/y (wrong-branch
+    /// pollution), and the dispatch reports success.
+    #[test]
+    fn dirty_in_place_checkout_silently_carries_nonconflicting_tracked_mod() {
+        let home = tmp_home("dirty-carry");
+        let repo = tmp_repo("dirty-carry-repo");
+        setup_xy_repo(&repo);
+        let ws = crate::paths::workspace_dir(&home).join("devc");
+        reconcile_workspace_to_worktree(&home, "devc", &ws, &repo, None).expect("provision");
+        checkout_workspace_branch(&ws, "feat/x").expect("land on X");
+
+        // Interrupted-agent WIP: uncommitted edit to a file with NO diff X↔Y.
+        std::fs::write(ws.join("shared.txt"), "AGENT-WIP\n").unwrap();
+
+        let r = checkout_workspace_branch(&ws, "feat/y");
+
+        assert!(
+            r.is_ok(),
+            "characterization: non-conflicting dirty checkout SUCCEEDS (no --force, no guard)"
+        );
+        let on = crate::git_helpers::git_cmd(&ws, &["branch", "--show-current"]).unwrap();
+        assert_eq!(on, "feat/y", "switched to Y");
+        let carried = std::fs::read_to_string(ws.join("shared.txt")).unwrap();
+        assert_eq!(
+            carried, "AGENT-WIP\n",
+            "#2234 HOLE: uncommitted feat/x work SILENTLY carried onto feat/y (wrong-branch pollution)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// ② (the one safe-ish case): a CONFLICTING uncommitted modification (the file
+    /// differs between branches) makes git abort the checkout atomically — HEAD
+    /// stays on the prior branch and the work is intact, but the dispatch FAILS
+    /// (the `Err` path the caller must surface, not silently swallow).
+    #[test]
+    fn dirty_in_place_checkout_aborts_on_conflicting_tracked_mod_work_intact() {
+        let home = tmp_home("dirty-abort");
+        let repo = tmp_repo("dirty-abort-repo");
+        setup_xy_repo(&repo);
+        let ws = crate::paths::workspace_dir(&home).join("deva");
+        reconcile_workspace_to_worktree(&home, "deva", &ws, &repo, None).expect("provision");
+        checkout_workspace_branch(&ws, "feat/x").expect("land on X");
+
+        // diverge.txt DIFFERS feat/x↔feat/y → the local edit conflicts.
+        std::fs::write(ws.join("diverge.txt"), "AGENT-WIP-CONFLICT\n").unwrap();
+
+        let r = checkout_workspace_branch(&ws, "feat/y");
+
+        assert!(
+            r.is_err(),
+            "characterization: conflicting dirty checkout ABORTS (git refuses to overwrite)"
+        );
+        let on = crate::git_helpers::git_cmd(&ws, &["branch", "--show-current"]).unwrap();
+        assert_eq!(on, "feat/x", "HEAD stays on X (atomic abort)");
+        let intact = std::fs::read_to_string(ws.join("diverge.txt")).unwrap();
+        assert_eq!(
+            intact, "AGENT-WIP-CONFLICT\n",
+            "work intact on X — but the dispatch fails (Err must be surfaced)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// HOLE ③: an UNTRACKED file does not block the checkout and is carried onto
+    /// the target branch — scratch/leftover state leaks across the branch switch.
+    #[test]
+    fn dirty_in_place_checkout_carries_untracked_file() {
+        let home = tmp_home("dirty-untracked");
+        let repo = tmp_repo("dirty-untracked-repo");
+        setup_xy_repo(&repo);
+        let ws = crate::paths::workspace_dir(&home).join("devu");
+        reconcile_workspace_to_worktree(&home, "devu", &ws, &repo, None).expect("provision");
+        checkout_workspace_branch(&ws, "feat/x").expect("land on X");
+
+        // Untracked scratch file present on neither branch.
+        std::fs::write(ws.join("scratch.tmp"), "untracked\n").unwrap();
+
+        let r = checkout_workspace_branch(&ws, "feat/y");
+
+        assert!(
+            r.is_ok(),
+            "characterization: an untracked file does not block the checkout"
+        );
+        let on = crate::git_helpers::git_cmd(&ws, &["branch", "--show-current"]).unwrap();
+        assert_eq!(on, "feat/y", "switched to Y");
+        assert!(
+            ws.join("scratch.tmp").exists(),
+            "#2234 HOLE: untracked file carried onto feat/y (not isolated per-branch)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
     /// #2234 Phase 1c: the production flag decision (`workspace_as_worktree_from_env`)
     /// — pure over (flag, allowlist) inputs, no process-global env (so no leak).
     #[test]
