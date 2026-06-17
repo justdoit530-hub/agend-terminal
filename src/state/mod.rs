@@ -2372,7 +2372,7 @@ impl StateTracker {
     /// #1523 Phase 0: turn-completion sentinel shadow telemetry.
     ///
     /// When `AGEND_TURN_SENTINEL_SHADOW=1`, hook-less agents are instructed to
-    /// print `<<<AGEND-DONE:{nonce}>>>` as the final line when a turn finishes
+    /// print `=====AGEND-DONE:{nonce}=====` as the final line when a turn finishes
     /// (see [`turn_sentinel_token`]). This side-logs whether THIS agent's token
     /// is on screen alongside the heuristic classification, so emit-rate /
     /// false-emit (instruction-echo / source-view) / leak can be measured before
