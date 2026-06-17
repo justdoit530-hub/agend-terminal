@@ -557,6 +557,13 @@ enum ServiceAction {
 }
 
 fn main() -> anyhow::Result<()> {
+    // #t-41673 gap-instrument: capture process entry as early as possible. The
+    // daemon bootstrap log (emitted right after tracing init below) reports
+    // `elapsed_ms` since this point — the pre-tracing-init startup cost. Binary
+    // load happens BEFORE main(), so the remainder of the restart "new-launch"
+    // gap (OS spawn + dynamic load) shows up as the wall-clock delta between the
+    // predecessor's `predecessor_exit` log and this process's bootstrap log.
+    let process_entry = std::time::Instant::now();
     load_dotenv();
 
     let cli = Cli::parse();
@@ -578,24 +585,44 @@ fn main() -> anyhow::Result<()> {
     let home = home_dir();
     std::fs::create_dir_all(&home)?;
 
-    // `_log_guard` must outlive any tracing call below. Drop = flush + close
-    // the rolling appender's worker thread, so we deliberately bind it in
-    // `main`'s scope rather than returning it from `setup_rolling_tracing`'s
-    // call site. CLI mode produces `None`; the binding is still required so
-    // the daemon-path `Some(guard)` lives until process exit.
+    // #t-41673/C1: the daemon's rolling-log guard is stashed in a global slot
+    // (see `logging::store_daemon_flush_guard`) so `run_core`'s restart exits can
+    // flush it before `std::process::exit()` — which would otherwise skip the
+    // guard's Drop and lose the `predecessor_exit` timing anchor. The RAII holder
+    // below preserves the original behavior (flush on normal return / `?` error /
+    // panic unwind), since those paths DO run Drop. App owns its own guard inside
+    // `app::run` (see `src/app/mod.rs`); CLI mode has no rolling guard.
     //
-    // #927 PR-A: was `setup_daemon_tracing`; parametrized so the app path
-    // can share the same rolling-appender + panic-hook machinery. App's
-    // guard is owned by `app::run` itself (see `src/app/mod.rs`).
-    let _log_guard = if is_app {
+    // #927 PR-A: `setup_rolling_tracing` (was `setup_daemon_tracing`) is shared
+    // with the app path for the same rolling-appender + panic-hook machinery.
+    struct DaemonLogFlushOnDrop;
+    impl Drop for DaemonLogFlushOnDrop {
+        fn drop(&mut self) {
+            crate::logging::flush_daemon_log();
+        }
+    }
+    let _daemon_log_flush = if is_app {
         None
     } else if is_daemon_child {
-        Some(crate::logging::setup_rolling_tracing(
+        let guard = crate::logging::setup_rolling_tracing(
             &home,
             "daemon",
             "agend_terminal=info",
             crate::logging::MigrationPolicy::Migrate,
-        )?)
+        )?;
+        crate::logging::store_daemon_flush_guard(guard);
+        // #t-41673 gap-instrument: earliest in-process daemon log once tracing is
+        // live. Its wall-clock timestamp marks the END of the old-exit→new-launch
+        // gap; `elapsed_ms` is the main-entry→tracing-ready startup cost. Mirrors
+        // the #2271 restart_timing (`target: "handoff"`, `elapsed_ms`) style.
+        tracing::info!(
+            target: "handoff",
+            event = "process_bootstrap",
+            pid = std::process::id(),
+            elapsed_ms = process_entry.elapsed().as_millis() as u64,
+            "daemon process bootstrap: tracing live (#t-41673 gap-instrument)"
+        );
+        Some(DaemonLogFlushOnDrop)
     } else {
         crate::logging::setup_cli_tracing();
         None
