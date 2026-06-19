@@ -239,6 +239,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     branch,
                     &worktree_dir,
                     &source_canonical,
+                    true, // #2158 GR1: agent self-claim (repo checkout bind:true) → notify operator
                 ) {
                     // #1310: rollback worktree on binding failure to prevent orphans
                     tracing::warn!(
@@ -257,29 +258,18 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         "branch": branch,
                     });
                 }
-                if let Some(r) = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
-                    &source_canonical,
-                ) {
-                    // t-ci-ready-pr2-drop-derive-reviewer (operator-approved B): the
-                    // #1040/#1037 `<team>-reviewer` auto-derive was REMOVED from the
-                    // dev-self-claim path too (consistent decouple with the dispatch
-                    // side). A self-claimed `repo action=checkout bind=true` now arms
-                    // the watch with NO chain target → on CI pass the dev (a
-                    // subscriber) gets the informational `[ci-pass]`; chaining the
-                    // actionable `[ci-ready-for-action]` to a reviewer requires an
-                    // EXPLICIT `next_after_ci` (review handoff is now explicit, not a
-                    // silent naming-convention auto-handoff).
-                    let watch_args = json!({"repository": &r, "branch": branch});
-                    let watch_resp = super::handle_watch_ci(home, &watch_args, instance_name);
-                    if let Some(err_msg) = watch_resp.get("error").and_then(|v| v.as_str()) {
-                        let code = watch_resp
-                            .get("code")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        warnings.push(format!("watch_ci: {err_msg} (code={code})"));
-                    }
-                }
+                // #2158 GR1 (operator-approved): a self-claimed `repo action=checkout
+                // bind=true` no longer SILENTLY arms a ci_watch — neither here (this
+                // inline arm is removed) NOR via the shared dispatch_hook path
+                // (`bind_self` self-claims pass `arm_ci_watch=false`). The silent
+                // auto-arm was part of the #2158 incident blast: a transient sub-agent
+                // (sharing the primary's identity) self-claiming a worktree also armed a
+                // watch the operator never asked for. The daemon DISPATCH path passes
+                // `arm_ci_watch=true` and STILL arms for normal delegation. A
+                // self-claiming agent that wants CI notifications arms it explicitly via
+                // `ci action=watch`.
                 resp["bound"] = json!(true);
+                resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
                 resp["fetch_attempted"] = json!(fetch_attempted);
             }

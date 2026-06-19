@@ -1590,6 +1590,122 @@ fn dispatch_auto_bind_lease_sets_next_after_ci_from_dispatch_hook_931() {
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// #2158 GR1: the dispatch ci-watch auto-arm is gated on the caller's EXPLICIT
+/// `arm_ci_watch` intent, NOT on task_id presence (r6's catch: a single-target
+/// `send kind=task` is auto-create-exempt and reaches dispatch with task_id=""). The
+/// wrappers encode the intent: `_with_source` (bind_self) → false; `_with_chain`
+/// (delegate/dispatch) → true.
+#[test]
+#[cfg(unix)]
+fn arm_ci_watch_gated_on_dispatch_intent_not_task_id_2158_gr1() {
+    let mk_parent = |tag: &str| {
+        std::env::temp_dir().join(format!(
+            "agend-2158-gr1-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    };
+    let watch_for = |home: &std::path::Path, branch: &str| {
+        crate::daemon::ci_watch::ci_watches_dir(home).join(crate::daemon::ci_watch::watch_filename(
+            "owner/repo",
+            branch,
+        ))
+    };
+    // #2158 GR1: the SAME dispatch-intent signal gates the operator NOTIFY (inverted):
+    // self-claim notifies, dispatch does not — regardless of task_id.
+    let notified = |home: &std::path::Path| {
+        std::fs::read_to_string(home.join("event-log.jsonl"))
+            .unwrap_or_default()
+            .contains("binding_out_of_dispatch")
+    };
+
+    // (a) bind_self self-claim (`_with_source`) → NO arm, even WITH a task_id
+    //     (self-provision must never silently arm) — and DOES notify the operator.
+    let parent_a = mk_parent("bindself");
+    let (home_a, _c) =
+        p781_canonical_with_team_source_repo(&parent_a, "feat/gr1-bs", true, "val", &["val-dev"]);
+    let r = super::dispatch_auto_bind_lease_with_source(
+        &home_a,
+        "val-dev",
+        "T-has-task",
+        "feat/gr1-bs",
+        None,
+        None,
+    );
+    assert!(r.is_ok(), "bind_self bind must succeed: {:?}", r.err());
+    assert!(
+        !watch_for(&home_a, "feat/gr1-bs").exists(),
+        "#2158 GR1: bind_self self-claim must NOT auto-arm ci_watch"
+    );
+    assert!(
+        notified(&home_a),
+        "#2158 GR1: bind_self self-claim MUST notify the operator"
+    );
+    std::fs::remove_dir_all(&parent_a).ok();
+
+    // (b) dispatch (`_with_chain`) WITH a task_id → arms.
+    let parent_b = mk_parent("disp-tid");
+    let (home_b, _c) =
+        p781_canonical_with_team_source_repo(&parent_b, "feat/gr1-tid", true, "val", &["val-dev"]);
+    let r2 = super::dispatch_auto_bind_lease_with_chain(
+        &home_b,
+        "val-dev",
+        "T-gr1",
+        "feat/gr1-tid",
+        None,
+        None,
+        None,
+    );
+    assert!(r2.is_ok(), "dispatch bind must succeed: {:?}", r2.err());
+    assert!(
+        watch_for(&home_b, "feat/gr1-tid").exists(),
+        "a dispatch with a task_id must arm ci_watch"
+    );
+    assert!(
+        !notified(&home_b),
+        "a dispatch (task_id set) must NOT notify the operator"
+    );
+    std::fs::remove_dir_all(&parent_b).ok();
+
+    // (c) r6's REGRESSION: dispatch (`_with_chain`) OMITTING the task_id — a
+    //     single-target `send kind=task` is auto-create-exempt and reaches dispatch
+    //     with task_id="" → must STILL arm (the task_id heuristic wrongly skipped this).
+    let parent_c = mk_parent("disp-notid");
+    let (home_c, _c) = p781_canonical_with_team_source_repo(
+        &parent_c,
+        "feat/gr1-notid",
+        true,
+        "val",
+        &["val-dev"],
+    );
+    let r3 = super::dispatch_auto_bind_lease_with_chain(
+        &home_c,
+        "val-dev",
+        "",
+        "feat/gr1-notid",
+        None,
+        None,
+        None,
+    );
+    assert!(
+        r3.is_ok(),
+        "dispatch (no task_id) bind must succeed: {:?}",
+        r3.err()
+    );
+    assert!(
+        watch_for(&home_c, "feat/gr1-notid").exists(),
+        "#2158 GR1: a dispatch with an EMPTY task_id (single-target auto-create) must STILL arm"
+    );
+    assert!(
+        !notified(&home_c),
+        "#2158 GR1 (r2's catch): an EMPTY-task_id dispatch must NOT false-notify the operator"
+    );
+    std::fs::remove_dir_all(&parent_c).ok();
+}
+
 /// #1877 §3.9 + regression guard: EVERY MCP-accepted dispatch directive must
 /// reach the auto-armed watch together. This re-marshal-drop class has recurred
 /// 4× — #931 (next_after_ci), #1031 (task_id), #1877 (review_class from a
