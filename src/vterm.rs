@@ -2110,4 +2110,53 @@ mod tests {
             "zero-size area must not affect buffer"
         );
     }
+
+    /// #perf-R1 spike measurement (NOT a regression gate — `#[ignore]`, run in
+    /// release: `cargo test --release --ignored perf_r1_tail_extract_cost --
+    /// --nocapture`). Isolates the wasted work on an UNCHANGED frame: the PTY hot
+    /// path currently builds the full fg mask (`tail_lines_with_fg`, O(rows*cols)
+    /// + per-cell classify_fg + 2 Vecs/row) BEFORE the text-only dedup hash gate
+    /// discovers the frame is identical and discards it. The proposed pre-hash
+    /// gate runs the cheap text-only `tail_lines` first. This prints both costs +
+    /// the ratio (the per-identical-frame saving).
+    #[test]
+    #[ignore = "perf measurement, run explicitly in release"]
+    fn perf_r1_tail_extract_cost() {
+        use std::time::Instant;
+        // ~200 cols × 50 visible rows, filled with mixed colored content so
+        // classify_fg has realistic work (red anchors + 256/rgb + default).
+        let mut vt = VTerm::new(200, 50);
+        for r in 0..50 {
+            let line = format!(
+                "\x1b[31mERROR\x1b[0m row {r} \x1b[38;5;208midx\x1b[0m \
+                 \x1b[38;2;10;200;30mrgb\x1b[0m normal padding text to widen the row {r}\r\n"
+            );
+            vt.process(line.as_bytes());
+        }
+        let n = 100_000u32;
+        let rows = vt.rows() as usize;
+
+        // black-box the results so the optimizer can't elide the work.
+        let t0 = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..n {
+            let (text, fg) = vt.tail_lines_with_fg(rows);
+            acc = acc.wrapping_add(text.len()).wrapping_add(fg.len());
+        }
+        let with_fg = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..n {
+            let text = vt.tail_lines(rows);
+            acc = acc.wrapping_add(text.len());
+        }
+        let text_only = t1.elapsed();
+
+        let wf = with_fg.as_nanos() as f64 / n as f64;
+        let to = text_only.as_nanos() as f64 / n as f64;
+        println!("#perf-R1 (200x50, n={n}, acc={acc}):");
+        println!("  tail_lines_with_fg (current, per identical frame): {wf:.0} ns/call");
+        println!("  tail_lines (text-only pre-hash gate)             : {to:.0} ns/call");
+        println!("  saving per unchanged frame                       : {:.0} ns ({:.1}x)", wf - to, wf / to);
+    }
 }
