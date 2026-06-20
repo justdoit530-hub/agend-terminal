@@ -478,7 +478,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
                 &registry,
                 &home,
                 "shell",
-                &std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string()),
+                &crate::shell_command(),
                 &[],
                 crate::backend::SpawnMode::Fresh,
                 None,
@@ -1422,8 +1422,7 @@ fn pane_from_menu_item(
 ) -> Result<Pane> {
     match item.kind {
         MenuItemKind::Shell => {
-            let shell =
-                std::env::var("SHELL").unwrap_or_else(|_| crate::default_shell().to_string());
+            let shell = crate::shell_command();
             pane_factory::create_pane(
                 layout,
                 registry,
