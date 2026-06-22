@@ -3630,3 +3630,135 @@ fn test_custom_disk_threshold_env() {
     std::env::remove_var("AGEND_LOW_DISK_THRESHOLD");
     assert_eq!(super::disk::get_low_disk_threshold_bytes(), default_val); // default
 }
+
+// ───────── #t-…61487: poll-reminder counts only OBLIGATIONS ─────────
+
+/// `obligation_reason` classifies kinds: query / open-or-unknown task = obligation;
+/// report / update / plain (kind=None) = NOT. The SINGLE predicate shared by
+/// `inbox action=clear` and the poll-reminder count.
+#[test]
+fn obligation_reason_classifies_kinds() {
+    let home = tmp_home("oblig-kinds");
+    // query → obligation.
+    assert!(obligation_reason(&home, &msg().kind("query").build()).is_some());
+    // report / update / plain → NOT obligations.
+    assert!(obligation_reason(&home, &msg().kind("report").build()).is_none());
+    assert!(obligation_reason(&home, &msg().kind("update").build()).is_none());
+    assert!(obligation_reason(&home, &make_msg("a", "plain")).is_none()); // kind=None
+                                                                          // task with an unknown / no id → kept (obligation) — "uncertain → keep".
+    let mut task_unknown = msg().kind("task").build();
+    task_unknown.correlation_id = Some("t-not-on-board".into());
+    assert!(obligation_reason(&home, &task_unknown).is_some());
+    assert!(obligation_reason(&home, &msg().kind("task").build()).is_some()); // no id → kept
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A terminal (Done) task on the board is NOT an obligation → not counted (the agent
+/// is no longer responsible for it).
+#[test]
+fn obligation_reason_excludes_terminal_task() {
+    let home = tmp_home("oblig-terminal");
+    let inst = crate::task_events::InstanceName::from("u");
+    crate::task_events::append(
+        &home,
+        &inst,
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId("t-done".into()),
+            title: "t".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: None,
+            due_at: None,
+            branch: None,
+            depends_on: vec![],
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+        },
+    )
+    .unwrap();
+    crate::task_events::append(
+        &home,
+        &inst,
+        crate::task_events::TaskEvent::Done {
+            task_id: crate::task_events::TaskId("t-done".into()),
+            by: crate::task_events::InstanceName::from("u"),
+            source: crate::task_events::DoneSource::OperatorManual {
+                authored_at: "2026-01-01T00:00:00Z".into(),
+                result: None,
+            },
+        },
+    )
+    .unwrap();
+
+    let mut done_task = msg().kind("task").build();
+    done_task.correlation_id = Some("t-done".into());
+    assert!(
+        obligation_reason(&home, &done_task).is_none(),
+        "a Done task must NOT be an obligation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #t-…61487 LOCK-DISCIPLINE source-scan guard (#1617 class): the reclaim re-nudge
+/// gate `reclaim_renudge_worthy` → `obligation_reason` does task-board IO
+/// (`tasks::load_by_id`). `reclaim_stale_delivering` MUST call it in Phase 2 — AFTER
+/// the `with_inbox_lock(home, &agent_name, |path| { … })` closure closes — never
+/// inside it (holding the per-agent inbox flock across a blocking board read is the
+/// #1617 fleet-stall class). Brace-match the locked closure (mirrors the
+/// poll_reminder `…_not_held_across_registry_lock` guard) and assert the classifier
+/// is OUTSIDE it. Needles are `concat`-built so this scan can't self-satisfy.
+#[test]
+fn reclaim_renudge_classifier_runs_unlocked_not_under_inbox_lock() {
+    let src = include_str!("storage.rs");
+    let cfg_test = ["#[cfg(", "test)]"].concat();
+    let prod = match src.find(&cfg_test) {
+        Some(i) => &src[..i],
+        None => src,
+    };
+    // Scope to the reclaim fn body (the classifier is DEFINED earlier in the file,
+    // so slicing from the fn start excludes its definition site from the scan).
+    let fn_needle = ["fn reclaim_stale", "_delivering"].concat();
+    let fstart = prod
+        .find(&fn_needle)
+        .expect("reclaim_stale_delivering present");
+    let fn_region = &prod[fstart..];
+
+    // Find + brace-match the `with_inbox_lock(home, &agent_name, |path| { … }` closure.
+    let lock_needle = ["with_inbox_lock(home, &agent_name", ", |path| {"].concat();
+    let lstart = fn_region
+        .find(&lock_needle)
+        .expect("reclaim uses with_inbox_lock(home, &agent_name, |path| …)");
+    let open_rel = fn_region[lstart..].find('{').expect("closure opens");
+    let block_start = lstart + open_rel;
+    let mut depth = 0usize;
+    let mut block_end = block_start;
+    for (i, c) in fn_region[block_start..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    block_end = block_start + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(block_end > block_start, "lock closure must close");
+
+    let classifier = ["reclaim_renudge", "_worthy"].concat();
+    let obligation = ["obligation", "_reason"].concat();
+    let locked = &fn_region[block_start..=block_end];
+    assert!(
+        !locked.contains(&classifier) && !locked.contains(&obligation),
+        "reclaim must NOT call reclaim_renudge_worthy/obligation_reason under with_inbox_lock (#1617)"
+    );
+    assert!(
+        fn_region[block_end..].contains(&classifier),
+        "reclaim_renudge_worthy must run AFTER the with_inbox_lock closure closes (Phase 2, unlocked)"
+    );
+}
