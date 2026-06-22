@@ -641,15 +641,36 @@ fn render_pane(
         };
     }
     let inner = content.rect();
-    if let Some(d) =
-        crate::render::resize::ResizeDecision::needed(inner, pane.vterm.cols(), pane.vterm.rows())
-    {
-        pane.vterm.resize(d.cols, d.rows);
-        pane.resize_pty(registry, d.cols, d.rows);
-    }
     let render_offset = pane.scroll_offset;
-    pane.vterm
-        .render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
+    // The cursor source differs by render path (live VTerm vs off-thread
+    // snapshot); capture it here so the focused-cursor block below stays shared.
+    let cursor = if let Some(handle) = &pane.offthread {
+        // Option X (off-thread parse, flag AGEND_OFFTHREAD_PARSE): the parser
+        // thread owns the VTerm and publishes an immutable snapshot. The main
+        // thread does ZERO parse here — it loads the latest snapshot, paints it,
+        // and routes any resize to the parser thread (which owns the VTerm). P1
+        // renders the live offset-0 grid; off-thread scrollback is a P2 follow-up.
+        let snap = handle.load();
+        if let Some(d) = crate::render::resize::ResizeDecision::needed(inner, snap.cols, snap.rows)
+        {
+            handle.request_resize(d.cols, d.rows);
+            pane.resize_pty(registry, d.cols, d.rows);
+        }
+        snap.render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
+        snap.cursor
+    } else {
+        if let Some(d) = crate::render::resize::ResizeDecision::needed(
+            inner,
+            pane.vterm.cols(),
+            pane.vterm.rows(),
+        ) {
+            pane.vterm.resize(d.cols, d.rows);
+            pane.resize_pty(registry, d.cols, d.rows);
+        }
+        pane.vterm
+            .render_to_buffer(frame.buffer_mut(), inner, render_offset, !focused);
+        pane.vterm.cursor_pos()
+    };
 
     if let Some(ref sel) = pane.selection {
         // Selection is stored in absolute scrollback logical coords; map each
@@ -686,7 +707,7 @@ fn render_pane(
     }
 
     if focused {
-        let (cursor_line, cursor_col) = pane.vterm.cursor_pos();
+        let (cursor_line, cursor_col) = cursor;
         let max_x = inner.x + inner.width.saturating_sub(1);
         let max_y = inner.y + inner.height.saturating_sub(1);
         let (cx, cy) = if render_offset == 0 {
@@ -862,6 +883,7 @@ mod tests {
             pending_notification_count: 3,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let segments = pane_title_segments(&pane, Style::default(), AgentState::Idle, false);
         let joined = segments
@@ -889,6 +911,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         // #1713 flag OFF (default): no state badge appended; only the base label
         // (+ the transient Restarting/Crashed tab badge, which lives elsewhere).
@@ -920,6 +943,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         for (state, want) in [
             (AgentState::ServerRateLimit, "[ServerRateLimit]"),
@@ -972,6 +996,7 @@ mod tests {
                 pending_notification_count: 0,
                 selection: None,
                 source: PaneSource::Local,
+                offthread: None,
             },
         );
         let snapshot = HashMap::new();
@@ -1006,6 +1031,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1029,6 +1055,90 @@ mod tests {
             pane.vterm.rows(),
             16,
             "render must keep the VTerm/PTY rows equal to pane content rows"
+        );
+    }
+
+    /// Option X (S3 wiring): when `pane.offthread = Some`, `render_pane` paints the
+    /// parser thread's published snapshot — NOT the (idle) main-thread `pane.vterm`.
+    /// Proven by leaving `pane.vterm` blank and asserting the snapshot's content
+    /// reaches the frame buffer. (Pairs with `drain_output_is_noop_when_offthread...`
+    /// in layout::pane: together they show the off-thread path renders correctly
+    /// while the main thread does zero parse.)
+    #[test]
+    fn render_paints_offthread_snapshot_not_main_vterm() {
+        // Spawn a parser, push known content, and wait for it to publish a snapshot.
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            1,
+            "t".to_string(),
+            data_rx,
+            VTerm::new(38, 16),
+            wake_tx,
+        )
+        .expect("parser thread spawns");
+        data_tx
+            .send(b"\x1b[2J\x1b[HOFFTHREAD_SNAP".to_vec())
+            .unwrap();
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("parser thread must publish a snapshot");
+
+        let backend = ratatui::backend::TestBackend::new(40, 20);
+        let mut terminal =
+            ratatui::Terminal::new(backend).expect("test terminal creation should succeed");
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+        let pane = Pane {
+            agent_name: "agent".into(),
+            instance_id: crate::types::InstanceId::default(),
+            // Blank/idle — the render source MUST be the snapshot, not this VTerm.
+            vterm: VTerm::new(38, 16),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: Some(handle),
+        };
+        assert!(
+            pane.vterm.tail_lines(16).trim().is_empty(),
+            "sanity: the main-thread VTerm starts blank"
+        );
+
+        let mut layout = Layout::new();
+        layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
+        terminal
+            .draw(|frame| {
+                render(
+                    frame,
+                    &mut layout,
+                    false,
+                    &registry,
+                    TelegramStatus::NotConfigured,
+                    false,
+                );
+            })
+            .expect("test terminal draw should succeed");
+
+        let buf = terminal.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+        }
+        assert!(
+            text.contains("OFFTHREAD_SNAP"),
+            "render must paint the off-thread snapshot content, not the blank main VTerm; frame: {text:?}"
         );
     }
 
@@ -1419,6 +1529,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1472,6 +1583,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         };
         let mut layout = Layout::new();
         layout.add_tab(crate::layout::Tab::new("agent".to_string(), pane));
@@ -1500,6 +1612,7 @@ mod tests {
             pending_notification_count: 0,
             selection: None,
             source: PaneSource::Local,
+            offthread: None,
         }
     }
 
