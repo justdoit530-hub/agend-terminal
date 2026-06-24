@@ -3,9 +3,9 @@
 //! alert goes to the agent's team orchestrator (and the usage is visible via
 //! LIST `context_pct`/`context_source`); nothing is auto-restarted.
 //!
-//! Source per agent (see `StateTracker::resolved_context`): the statusline
-//! `pattern` ONLY — a pane whose statusline can't be read is honestly
-//! `unknown` (no alert, `null` in LIST).
+//! Source per agent (see `StateTracker::resolved_context`): typed context
+//! providers. Today only statusline providers produce readings; unavailable
+//! backends are honestly `unknown` (no alert, `null` in LIST).
 //!
 //! #1945-disable (operator decision, 2026-06-10): the transcript-estimate
 //! fallback is DISABLED — its first live minute fired a triple false 100%
@@ -101,9 +101,9 @@ impl PerTickHandler for ContextAlertHandler {
             return;
         }
 
-        // Phase 1 (cheap, locks only): snapshot each agent's resolved context
-        // — statusline pattern only (#1945-disable: no transcript estimate;
-        // an unreadable pane is unknown and never alerts).
+        // Phase 1 (cheap, locks only): snapshot each agent's resolved context.
+        // Unavailable providers return None, so they stay unknown and never
+        // alert as a guessed 100%.
         let mut resolved: Vec<(String, f32, &'static str)> = Vec::new();
         // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
         // agent names — not just those with a context reading — so the per-agent
@@ -115,7 +115,7 @@ impl PerTickHandler for ContextAlertHandler {
             for handle in reg.values() {
                 live.insert(handle.name.as_str().to_string());
                 if let Some((pct, source)) = handle.core.lock().state.resolved_context() {
-                    resolved.push((handle.name.as_str().to_string(), pct, source));
+                    resolved.push((handle.name.as_str().to_string(), pct, source.source_name()));
                 }
             }
             live

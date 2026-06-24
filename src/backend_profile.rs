@@ -27,6 +27,29 @@ use crate::behavioral::{BehavioralConfig, MarkerCacheId, ProductivityConfig};
 use crate::state::AgentState;
 use std::sync::OnceLock;
 
+/// Source-of-truth capability for context% telemetry.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ContextProvider {
+    /// The backend renders a stable status/footer line that reports context use.
+    StatusLine,
+    /// Reserved for a calibrated transcript-token estimator. Callers must treat
+    /// this as lower confidence than [`ContextProvider::StatusLine`].
+    #[allow(dead_code)]
+    TranscriptEstimate { confidence: f32 },
+    /// The backend has no trustworthy passive context signal.
+    Unavailable,
+}
+
+impl ContextProvider {
+    pub fn source_name(self) -> &'static str {
+        match self {
+            ContextProvider::StatusLine => "statusline",
+            ContextProvider::TranscriptEstimate { .. } => "transcript",
+            ContextProvider::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// All per-backend detection data for one backend, co-located.
 ///
 /// #8 Phase 2 step-0: now consumed by PROD — `StatePatterns::for_backend`,
@@ -45,6 +68,7 @@ pub struct BackendProfile {
     /// only over the bottom status rows — NOT the error tail window — because
     /// agents routinely DISCUSS context% in conversation text (prose-FP).
     pub context_pattern: Option<&'static str>,
+    pub context_provider: ContextProvider,
     /// #1947: prompt markers identifying the backend's INPUT line (and echoed /
     /// submitted user-message lines). An error pattern matched on a line whose
     /// trimmed start is one of these is operator-typed / quoted text, not CLI
@@ -150,6 +174,7 @@ fn agy_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Agy),
         },
         context_pattern: None,
+        context_provider: ContextProvider::Unavailable,
         input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
@@ -210,6 +235,7 @@ fn kirocli_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Kiro),
         },
         context_pattern: Some(KIRO_CONTEXT_PATTERN),
+        context_provider: ContextProvider::StatusLine,
         input_line_markers: &[">"],
         initial_state: AgentState::Starting,
     }
@@ -284,6 +310,7 @@ fn opencode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::OpenCode),
         },
         context_pattern: None,
+        context_provider: ContextProvider::Unavailable,
         input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
@@ -343,6 +370,7 @@ fn codex_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Codex),
         },
         context_pattern: None,
+        context_provider: ContextProvider::Unavailable,
         input_line_markers: &["›"],
         initial_state: AgentState::Starting,
     }
@@ -430,6 +458,7 @@ fn claudecode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Claude),
         },
         context_pattern: Some(CLAUDE_CONTEXT_PATTERN),
+        context_provider: ContextProvider::StatusLine,
         input_line_markers: &["❯", ">"],
         initial_state: AgentState::Starting,
     }
@@ -448,6 +477,7 @@ fn empty_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Generic),
         },
         context_pattern: None,
+        context_provider: ContextProvider::Unavailable,
         input_line_markers: &[],
         initial_state: AgentState::Idle,
     }
@@ -474,6 +504,39 @@ mod context_pattern_tests {
         assert!(!has(&Backend::Agy));
         assert!(!has(&Backend::Shell));
         assert!(!has(&Backend::Raw("x".into())));
+    }
+
+    #[test]
+    fn context_provider_presence_per_backend() {
+        let provider = |b: &Backend| profile(b).context_provider;
+        assert_eq!(provider(&Backend::ClaudeCode), ContextProvider::StatusLine);
+        assert_eq!(provider(&Backend::KiroCli), ContextProvider::StatusLine);
+        assert_eq!(provider(&Backend::Codex), ContextProvider::Unavailable);
+        assert_eq!(provider(&Backend::OpenCode), ContextProvider::Unavailable);
+        assert_eq!(provider(&Backend::Agy), ContextProvider::Unavailable);
+        assert_eq!(provider(&Backend::Shell), ContextProvider::Unavailable);
+        assert_eq!(
+            provider(&Backend::Raw("x".into())),
+            ContextProvider::Unavailable
+        );
+    }
+
+    #[test]
+    fn unavailable_context_providers_do_not_claim_a_pattern() {
+        for backend in [
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Agy,
+            Backend::Shell,
+            Backend::Raw("x".into()),
+        ] {
+            let profile = profile(&backend);
+            assert_eq!(profile.context_provider, ContextProvider::Unavailable);
+            assert!(
+                profile.context_pattern.is_none(),
+                "{backend:?} is unavailable and must not compile a statusline pattern"
+            );
+        }
     }
 
     /// Both patterns compile and extract the percent (capture group 1) from
