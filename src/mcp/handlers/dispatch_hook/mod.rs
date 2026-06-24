@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 mod auto_watch;
 mod from_ref;
+mod live_binding;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
@@ -443,6 +444,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // The semantic is preserved here at the binding layer: if the
     // target already holds a binding on a DIFFERENT branch, the new
     // dispatch must reject (operator must `release_worktree` first).
+    let mut reuse_live_worktree: Option<PathBuf> = None; // #2158 partial-skip (set below)
     if let Some(existing) = crate::binding::read(home, target) {
         if let Some(existing_branch) = existing.get("branch").and_then(|v| v.as_str()) {
             if existing_branch != branch {
@@ -458,6 +460,10 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                     raw: None,
                 });
             }
+            // #2158 partial-skip: live-bound same (source_repo, branch) → REUSE worktree below
+            // (skip destructive reset; metadata tail runs). Rationale: `live_binding`.
+            reuse_live_worktree =
+                live_binding::live_binding_worktree_to_reuse(&existing, &source_repo_str);
         }
     }
 
@@ -479,8 +485,12 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // `refs/remotes/origin/main` (see `setup_test_repo` in
     // `dispatch_hook/tests.rs` and `setup_git_repo_with_remote` in
     // `p0b_tests.rs` for the canonical fixture pattern).
-    let (auto_created_branch, fetch_attempted) =
-        ensure_branch_exists(home, &source_repo, branch, "origin/main", target)?;
+    let reused = reuse_live_worktree.is_some(); // #2158: skip #869 ref-advance + gate rollback
+    let (auto_created_branch, fetch_attempted) = if reused {
+        (false, false)
+    } else {
+        ensure_branch_exists(home, &source_repo, branch, "origin/main", target)?
+    };
 
     // #2234 cure-(B): under the flag the agent's WORKSPACE dir IS its worktree
     // (cwd == worktree) — switch it to `branch` IN PLACE instead of leasing a
@@ -506,7 +516,9 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
             raw: Some(msg),
         }
     };
-    let wt_path = if workspace_b {
+    let wt_path = if let Some(wt) = reuse_live_worktree {
+        wt // #2158 partial-skip: reuse verbatim — NO lease/`sync_worktree_to_head` reset (wipe)
+    } else if workspace_b {
         // (B): reconcile → free `branch` from stale legacy holders (work-at-risk
         // backed up before --force) → in-place checkout. Encapsulated helper.
         crate::worktree_pool::prepare_workspace_worktree(home, target, &source_repo, branch)
@@ -544,7 +556,10 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 %target, %branch, path = %wt_path.display(), error = %e,
                 "dispatch auto-bind bind_full failed — rolling back"
             );
-            if workspace_b {
+            if reused {
+                // #2158 r4: a REUSED worktree is the agent's LIVE tree (uncommitted WIP), not a
+                // disposable lease — never remove/detach it; return the error (binding stays intact).
+            } else if workspace_b {
                 // (B): the workspace worktree is PERMANENT (the agent's cwd) — never
                 // delete it; roll the just-applied checkout back to HOLDING. Safe:
                 // no work exists on `branch` yet (bind_full ran synchronously right
