@@ -5,12 +5,12 @@
 //! safety net against the 6/10 97%-stall incident shape, not seamless
 //! succession (Plan B, deferred until the #1523 hook track stabilizes).
 //!
-//! Signal: `StateTracker::resolved_context` — statusline `pattern` ONLY.
-//! Per-backend honesty: today only the claude backend renders a readable
-//! context statusline, so only claude agents ever produce a reading; kiro
-//! (pie icon, pattern TBD), codex (hidden by default), opencode/agy (no
-//! passive signal) yield `None` and are NEVER injected — the fallback is
-//! "do nothing", documented, not "guess" (multi-backend principle).
+//! Signal: `StateTracker::resolved_context`.
+//! Per-backend honesty: Claude and Kiro currently render readable status/footer
+//! context percentages (`ContextProvider::StatusLine`). Codex, OpenCode, and
+//! Agy declare `ContextProvider::Unavailable`, yield `None`, and are NEVER
+//! injected from a guessed value — the fallback is "do nothing", documented,
+//! not "guess" (multi-backend principle).
 //!
 //! NOISE BUDGET (hard requirement, per operator) — the #2008 four
 //! principles apply:
@@ -225,8 +225,8 @@ impl PerTickHandler for ContextHandoffHandler {
         }
 
         // Phase 1 (cheap, locks only): snapshot resolved context + idleness.
-        // Agents without a pattern reading (every non-claude backend today)
-        // produce nothing here and are never injected.
+        // Agents whose provider is unavailable produce nothing here and are
+        // never injected from a guessed value.
         let mut snapshot: Vec<(String, f32, bool)> = Vec::new();
         // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
         // agent names so the per-agent `states` episode-latch can drop deleted

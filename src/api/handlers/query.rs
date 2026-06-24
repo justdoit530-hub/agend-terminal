@@ -27,6 +27,7 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 blocked_reason,
                 blocked_note,
                 context,
+                context_provider,
                 api_in_flight,
                 last_api_activity_at,
                 observed_status,
@@ -40,10 +41,11 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                     // blocked and its free-text annotation (previously internal-only).
                     c.health.current_reason.as_ref().map(|r| r.to_string()),
                     c.health.current_note.clone(),
-                    // Context% telemetry: resolved usage + producing source
-                    // ("pattern" = the agent's own statusline, "transcript" =
-                    // token-usage estimate). Absent = honestly unknown.
+                    // Context% telemetry: resolved usage + producing source.
+                    // Absent = honestly unknown; context_provider says whether
+                    // the backend has a trustworthy passive signal at all.
                     c.state.resolved_context(),
+                    c.state.context_provider(),
                     // #2413 Phase 1: out-of-path API-activity signal, read under the
                     // SAME lock as agent_state so a consumer can reconcile the two
                     // atomically (false-idle = agent_state=="idle" && api_in_flight).
@@ -66,7 +68,8 @@ pub(crate) fn handle_list(_params: &Value, ctx: &HandlerCtx) -> Value {
                 "blocked_reason": blocked_reason,
                 "blocked_note": blocked_note,
                 "context_pct": context.map(|(pct, _)| pct),
-                "context_source": context.map(|(_, source)| source),
+                "context_source": context.map(|(_, source)| source.source_name()),
+                "context_provider": context_provider.source_name(),
                 // #2413 Phase 1: live LLM-socket activity (out-of-path lsof probe).
                 // api_in_flight=true while pattern-state is "idle" ⇒ false-idle.
                 "api_in_flight": api_in_flight,

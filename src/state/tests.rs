@@ -1,5 +1,6 @@
 use super::patterns::is_generic_startup_prompt;
 use super::*;
+use crate::backend_profile::ContextProvider;
 use crate::health::HealthTracker;
 use crate::vterm::CellFg;
 
@@ -4990,7 +4991,7 @@ fn claude_context_pct_extracted_from_statusline() {
     t.feed(CLAUDE_STATUSLINE_FRAME);
     let (pct, source) = t.resolved_context().expect("statusline percent extracted");
     assert!((pct - 61.0).abs() < f32::EPSILON);
-    assert_eq!(source, "pattern");
+    assert_eq!(source, ContextProvider::StatusLine);
 }
 
 /// A stale frame can leave an OLD statusline copy above the live one (seen in
@@ -5029,7 +5030,7 @@ fn kiro_context_pct_extracted_from_footer() {
     );
     let (pct, source) = t.resolved_context().expect("footer percent extracted");
     assert!((pct - 10.0).abs() < f32::EPSILON);
-    assert_eq!(source, "pattern");
+    assert_eq!(source, ContextProvider::StatusLine);
 }
 
 /// Prose-FP guard: agents routinely DISCUSS context% in conversation text.
@@ -5067,10 +5068,10 @@ fn context_pct_truncated_statusline_keeps_previous_reading() {
     assert!((pct - 61.0).abs() < f32::EPSILON);
 }
 
-/// #1945-disable: context resolution is PATTERN ONLY — the transcript
-/// estimate is disabled (its first live minute fired a triple false 100%
-/// alert), so an unreadable statusline is honestly unknown (no alert) and a
-/// readable one reports source "pattern". The estimate plumbing
+/// #1945-disable: context resolution is statusline-provider only — the
+/// transcript estimate is disabled (its first live minute fired a triple false
+/// 100% alert), so an unreadable statusline is honestly unknown (no alert) and
+/// a readable one reports `ContextProvider::StatusLine`. The estimate plumbing
 /// (`set_context_estimate` / the "transcript" source) is REMOVED from the
 /// tracker — this test pins that the disabled path stays disabled.
 #[test]
@@ -5083,8 +5084,8 @@ fn context_resolution_is_pattern_only_estimate_disabled_1945() {
     t.feed(CLAUDE_STATUSLINE_FRAME);
     assert_eq!(
         t.resolved_context().map(|(p, s)| (p as u32, s)),
-        Some((61, "pattern")),
-        "pattern reading reports with source \"pattern\""
+        Some((61, ContextProvider::StatusLine)),
+        "pattern reading reports with source ContextProvider::StatusLine"
     );
 }
 
@@ -5099,10 +5100,11 @@ fn context_pct_unknown_for_backends_without_pattern() {
         Backend::Shell,
     ] {
         let mut t = StateTracker::new(Some(&backend));
+        assert_eq!(t.context_provider(), ContextProvider::Unavailable);
         t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
         assert!(
             t.resolved_context().is_none(),
-            "{backend:?} has no context_pattern → unknown"
+            "{backend:?} has ContextProvider::Unavailable → unknown"
         );
     }
 }

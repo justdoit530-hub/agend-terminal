@@ -283,6 +283,7 @@ pub struct StateTracker {
     /// truncate the statusline mid-session; the timestamp lets consumers
     /// judge staleness instead of treating "can't read" as "safe".
     context_pct: Option<(f32, Instant)>,
+    context_provider: crate::backend_profile::ContextProvider,
     /// Set to true the moment we enter `InteractivePrompt`; cleared by
     /// `take_interactive_prompt_notice()` once the supervisor has forwarded a
     /// Telegram notice. This deduplicates per-entry: re-entry (e.g. dismissed
@@ -1315,6 +1316,10 @@ impl StateTracker {
                 .and_then(|p| p.context_pattern)
                 .and_then(|p| regex::Regex::new(p).ok()),
             context_pct: None,
+            context_provider: backend
+                .map(crate::backend_profile::profile)
+                .map(|p| p.context_provider)
+                .unwrap_or(crate::backend_profile::ContextProvider::Unavailable),
             interactive_prompt_pending_notice: false,
             interactive_recovery_pending_notice: false,
             blocked_since: None,
@@ -1478,9 +1483,9 @@ impl StateTracker {
         }
     }
 
-    /// Resolved context usage as `(percent, source)` — PATTERN ONLY (the
-    /// agent's own statusline). Readings older than [`CONTEXT_FRESH`] are
-    /// dropped rather than trusted — `None` = honestly unknown, no alert.
+    /// Resolved context usage as `(percent, provider)` — currently statusline
+    /// only. Readings older than [`CONTEXT_FRESH`] are dropped rather than
+    /// trusted — `None` = honestly unknown, no alert.
     ///
     /// #1945-disable (operator decision, 2026-06-10): the transcript-estimate
     /// fallback ("transcript" source) is DISABLED — its first live minute
@@ -1489,13 +1494,17 @@ impl StateTracker {
     /// corrected estimator + its root-cause record live on in
     /// `token_cost::estimate_context_pct` (tested, uncalled); re-enable ONLY
     /// after validating its readings against statusline ground truth.
-    pub fn resolved_context(&self) -> Option<(f32, &'static str)> {
+    pub fn resolved_context(&self) -> Option<(f32, crate::backend_profile::ContextProvider)> {
         if let Some((pct, at)) = self.context_pct {
             if at.elapsed() < CONTEXT_FRESH {
-                return Some((pct, "pattern"));
+                return Some((pct, self.context_provider));
             }
         }
         None
+    }
+
+    pub fn context_provider(&self) -> crate::backend_profile::ContextProvider {
+        self.context_provider
     }
 
     /// Feed the current vterm screen text (ANSI already resolved by the
