@@ -106,6 +106,7 @@ fn is_side_effect_tool(tool: &str) -> bool {
             | "pane_snapshot"
             | "tui_screenshot"
             | "download_attachment"
+            | "agy_quota"
             // Idempotent mutations — a repeat converges to the same state.
             | "set_waiting_on"
             | "set_display_name"

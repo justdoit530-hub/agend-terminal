@@ -5095,7 +5095,6 @@ fn context_resolution_is_pattern_only_estimate_disabled_1945() {
 fn context_pct_unknown_for_backends_without_pattern() {
     for backend in [
         Backend::OpenCode,
-        Backend::Agy,
         Backend::Shell,
     ] {
         let mut t = StateTracker::new(Some(&backend));
@@ -5106,6 +5105,11 @@ fn context_pct_unknown_for_backends_without_pattern() {
             "{backend:?} has ContextProvider::Unavailable → unknown"
         );
     }
+
+    let mut t = StateTracker::new(Some(&Backend::Agy));
+    assert_eq!(t.context_provider(), ContextProvider::TranscriptEstimate { confidence: 0.55 });
+    t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
+    assert!(t.resolved_context(None).is_none());
 
     let mut t = StateTracker::new(Some(&Backend::Codex));
     assert_eq!(t.context_provider(), ContextProvider::TranscriptEstimate { confidence: 0.9 });

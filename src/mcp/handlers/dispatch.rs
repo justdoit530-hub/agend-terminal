@@ -217,6 +217,7 @@ adapter!(
     ha,
     instance::handle_restart_instance
 );
+adapter!(dispatch_agy_quota, ha, crate::api::handlers::agy_quota::handle_agy_quota);
 adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
 adapter!(
     dispatch_set_waiting_on,
@@ -628,9 +629,10 @@ mod tests {
                 "gc_dry_run",
                 "tokens",
                 "mode",
+                "agy_quota",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 37);
+        assert_eq!(crate::mcp::registry::all().len(), 38);
     }
 
     #[test]

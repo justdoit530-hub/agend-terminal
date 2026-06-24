@@ -184,6 +184,7 @@ fn is_read_only_tool(tool: &str) -> bool {
             | "tokens"
             | "pane_snapshot"
             | "tui_screenshot"
+            | "agy_quota"
     )
 }
 

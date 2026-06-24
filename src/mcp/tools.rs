@@ -422,6 +422,17 @@ pub(crate) fn def_gc_dry_run() -> Value {
     }}})
 }
 
+pub(crate) fn def_agy_quota() -> Value {
+    json!({
+        "name": "agy_quota",
+        "description": "Query Google Antigravity subscription quota. Returns remainingFraction and resetTime for each model.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {}
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,9 +612,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            37,
+            38,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
-             + ephemeral (#1967 Phase-1) = 37. Current tools: {:?}",
+             + ephemeral (#1967 Phase-1) = 37; + agy_quota = 38. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1091,6 +1102,7 @@ mod tests {
             "task_sweep_config",
             "binding_state",
             "gc_dry_run",
+            "agy_quota",
         ];
 
         let defs = tool_definitions();

@@ -174,7 +174,7 @@ fn agy_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Agy),
         },
         context_pattern: None,
-        context_provider: ContextProvider::Unavailable,
+        context_provider: ContextProvider::TranscriptEstimate { confidence: 0.55 },
         input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
@@ -513,7 +513,10 @@ mod context_pattern_tests {
         assert_eq!(provider(&Backend::KiroCli), ContextProvider::StatusLine);
         assert_eq!(provider(&Backend::Codex), ContextProvider::TranscriptEstimate { confidence: 0.9 });
         assert_eq!(provider(&Backend::OpenCode), ContextProvider::Unavailable);
-        assert_eq!(provider(&Backend::Agy), ContextProvider::Unavailable);
+        assert_eq!(
+            provider(&Backend::Agy),
+            ContextProvider::TranscriptEstimate { confidence: 0.55 }
+        );
         assert_eq!(provider(&Backend::Shell), ContextProvider::Unavailable);
         assert_eq!(
             provider(&Backend::Raw("x".into())),
@@ -525,7 +528,6 @@ mod context_pattern_tests {
     fn unavailable_context_providers_do_not_claim_a_pattern() {
         for backend in [
             Backend::OpenCode,
-            Backend::Agy,
             Backend::Shell,
             Backend::Raw("x".into()),
         ] {
