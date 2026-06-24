@@ -179,9 +179,17 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn default_base_is_non_hidden() {
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/Users/x");
         let home = PathBuf::from("/Users/x/.agend-terminal");
         let base = default_link_base(&home);
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
         // Last component is `agend-ws` and no path component is dot-prefixed
         // (that is the whole point — a hidden ancestor is what agy rejects).
         assert_eq!(base.file_name().unwrap(), "agend-ws");

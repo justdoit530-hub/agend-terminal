@@ -67,6 +67,8 @@ lto = "thin"
 codegen-units = 16
 
 [dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+
 # PTY
 portable-pty = "0.9"
 

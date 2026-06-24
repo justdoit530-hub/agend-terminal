@@ -437,6 +437,50 @@ pub(crate) fn estimate_context_pct(home: &Path, instance: &str) -> Option<f32> {
     None
 }
 
+/// Estimate Agy's context usage percentage in range 0.0..1.0
+pub(crate) fn estimate_agy_context_pct_in(home: &Path) -> Option<f32> {
+    let dir = home.join(".gemini").join("antigravity-cli");
+    let history_path = dir.join("history.jsonl");
+    if !history_path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&history_path).ok()?;
+    let mut conversation_id = None;
+    for line in content.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(cid) = v.get("conversationId").and_then(|id| id.as_str()) {
+                conversation_id = Some(cid.to_string());
+                break;
+            }
+        }
+    }
+    let conversation_id = conversation_id?;
+    let db_path = dir.join("conversations").join(format!("{}.db", conversation_id));
+    if !db_path.exists() {
+        return None;
+    }
+
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ).ok()?;
+
+    let sum_bytes: Option<i64> = conn.query_row(
+        "SELECT SUM(size) FROM gen_metadata",
+        [],
+        |row| row.get(0)
+    ).ok()?;
+
+    let sum_bytes = sum_bytes.unwrap_or(0) as f32;
+    let tokens = (sum_bytes / 1024.0) * 256.0;
+    let pct = tokens / 1_048_576.0;
+
+    Some(pct.clamp(0.0, 1.0))
+}
+
 /// Testable core of [`estimate_context_pct`]: injected projects dir + roots.
 fn estimate_context_pct_in(projects_dir: &Path, roots: &[(String, Vec<PathBuf>)]) -> Option<f32> {
     if roots.is_empty() {
@@ -2135,6 +2179,33 @@ mod context_estimate_tests {
 
         // 2200 / 200,000 = 1.1%
         assert!((pct - 1.1).abs() < 0.1, "Codex estimate, got {pct}");
+    }
+
+    #[test]
+    fn estimate_respects_agy_db_metadata() {
+        let home = tmp("agy-est-home");
+        let cli_dir = home.join(".gemini").join("antigravity-cli");
+        let conv_dir = cli_dir.join("conversations");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+
+        let history_line = r#"{"conversationId":"test-cid","workspace":"/some/ws"}"#;
+        std::fs::write(cli_dir.join("history.jsonl"), history_line).unwrap();
+
+        let db_path = conv_dir.join("test-cid.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer NOT NULL DEFAULT 0, PRIMARY KEY (idx))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, size) VALUES (1, 102400)",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        let pct = estimate_agy_context_pct_in(&home).expect("agy estimate succeeded");
+        let expected = 25600.0 / 1_048_576.0;
+        assert!((pct - expected).abs() < 1e-5, "Agy estimate: got {pct}, expected {expected}");
     }
 }
 

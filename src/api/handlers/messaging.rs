@@ -1334,10 +1334,7 @@ mod tests {
         // entry. Regression-proof: drop the workspace-stub skip and the
         // no-stray-branch assertion fails.
         fn git(dir: &std::path::Path, args: &[&str]) {
-            let _ = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output();
+            let _ = crate::git_helpers::git_ok(dir, args);
         }
         fn init_repo(dir: &std::path::Path) {
             std::fs::create_dir_all(dir).ok();
@@ -1357,12 +1354,7 @@ mod tests {
             );
         }
         fn branch_exists(dir: &std::path::Path, branch: &str) -> bool {
-            std::process::Command::new("git")
-                .args(["rev-parse", "--verify", "--quiet", branch])
-                .current_dir(dir)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+            crate::git_helpers::git_ok(dir, &["rev-parse", "--verify", "--quiet", branch])
         }
 
         let home = tmp_home("branch-stub-vs-real");
