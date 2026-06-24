@@ -138,6 +138,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] 
 # `crate::logging`; CLI commands keep stderr.
 tracing-appender = "0.2"
 arboard = "3.6.1"
+png = "0.17"
 unicode-width = "0.2"
 which = "8"
 # #2288 re-bumped sysinfo 0.38→0.39.3, which requires rustc 1.95 and broke the

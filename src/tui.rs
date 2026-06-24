@@ -11,6 +11,32 @@ use crossterm::terminal;
 use std::io::Write;
 use std::path::Path;
 
+/// Save raw RGBA bytes as a PNG file in the system temp directory.
+fn save_rgba_as_png(
+    bytes: &[u8],
+    width: usize,
+    height: usize,
+) -> anyhow::Result<std::path::PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = std::env::temp_dir().join(format!("agend_paste_{ts}.png"));
+    let file = std::fs::File::create(&path)?;
+    let mut enc = png::Encoder::new(file, width as u32, height as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    enc.write_header()?.write_image_data(bytes)?;
+    Ok(path)
+}
+
+/// Read image from system clipboard and save as PNG. Returns the file path.
+fn paste_image_from_clipboard() -> anyhow::Result<std::path::PathBuf> {
+    let mut cb = arboard::Clipboard::new()?;
+    let img = cb.get_image()?;
+    save_rgba_as_png(&img.bytes, img.width, img.height)
+}
+
 /// RAII guard for crossterm raw mode.
 struct RawModeGuard;
 impl Drop for RawModeGuard {
@@ -83,7 +109,23 @@ pub fn attach(home: &Path, name: &str) -> anyhow::Result<()> {
                         tracing::info!("detached");
                         break;
                     }
-                    // Not 'd' — send Ctrl+B + current key
+                    // Ctrl+B i — paste image from clipboard
+                    if code == KeyCode::Char('i') && modifiers.is_empty() {
+                        match paste_image_from_clipboard() {
+                            Ok(path) => {
+                                let msg = format!("[AGEND-IMAGE-PASTE: {}]\n", path.display());
+                                tracing::info!(path = %path.display(), "image paste injected");
+                                if bridge.send_input(msg.as_bytes()).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "image paste failed — no image in clipboard?");
+                            }
+                        }
+                        continue;
+                    }
+                    // Not 'd' or 'i' — send Ctrl+B + current key
                     let mut bytes = vec![0x02];
                     bytes.extend(key_to_bytes(code, modifiers));
                     if bridge.send_input(&bytes).is_err() {
