@@ -150,12 +150,15 @@ pub fn run(fleet_path_override: Option<&str>) -> Result<()> {
 /// `stage2_dispatch_available = false` below). All stages stay shadow-gated-off by
 /// default — zero behavior change unless an operator opts in.
 ///
-/// #2413 Phase B: `shadow_observe` is allowlisted out of app mode ON PURPOSE — the
-/// hook-event socket server it consumes (`shadow::start`) is started ONLY in `run_core`,
-/// so the whole Shadow Observer plane is run_core-only (the isolated quantification
-/// daemon is `start --foreground` = run_core). Running the reducer in app mode would
-/// only ever fold empty buffers. It is flag-OFF by default regardless.
-const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump", "shadow_observe"];
+/// #2413 Phase B (live-fix): `shadow_observe` was REMOVED from this allowlist (same
+/// #1720/#685 class as `recovery_dispatcher` above). The original #2433 allowlisted it
+/// out, reasoning the plane was "run_core-only" — but the LIVE fleet daemon runs
+/// `agend-terminal app` (`run_app`), NEVER `run_core`, so that gated the whole Shadow
+/// Observer DEAD in production: `observed_status` stayed null on every agent even with
+/// the flag on. The fix is symmetric to #1694(a): the reducer driver now runs in app mode
+/// (un-allowlisted), and `run_app` starts the hook-event socket server (`shadow::start`)
+/// alongside the api-activity probe. Flag-OFF by default ⇒ zero behaviour change.
+const APP_TICK_ALLOWLIST: &[&str] = &["snapshot_rotation", "thread_dump"];
 
 /// Build the per-tick handler set app-standalone runs: the shared
 /// `build_default_handlers` minus `APP_TICK_ALLOWLIST`. Extracted so the
@@ -401,6 +404,17 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // AgentCore::api_activity for false-idle detection). Self-disables if
         // `lsof` is absent.
         crate::api_activity_probe::spawn(Arc::clone(&registry));
+        // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
+        // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
+        // only other caller), so without this the whole Shadow Observer plane was dead in
+        // production (observed_status null on every agent under the flag — #1720/#685
+        // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op unless
+        // `AGEND_SHADOW_OBSERVER=1` (flag-OFF default ⇒ zero behaviour change). Owner-only
+        // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
+        // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
+        // detached accept loop that exits with the process; the stale socket is cleared on
+        // next bind (start_unix removes it before binding).
+        crate::daemon::shadow::start(&home);
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
@@ -2188,6 +2202,60 @@ mod tests {
         assert!(
             !APP_TICK_ALLOWLIST.contains(&"recovery_dispatcher"),
             "recovery_dispatcher must NOT be allowlisted out of app mode (#1694a)"
+        );
+    }
+
+    /// #2413 Phase B live-fix: the Shadow Observer reducer driver must RUN in app mode —
+    /// the live fleet daemon is app-standalone (`run_app`), never `run_core`, so
+    /// allowlisting `shadow_observe` out (as #2433 did) left `observed_status` null on
+    /// every agent in production even with the flag on (the #1720/#685 class, same as
+    /// `recovery_dispatcher` #1694a). This pins it IN the app run set so a future edit
+    /// can't silently re-gate it to run_core-only. Goes through the REAL app-mode entry
+    /// (`app_tick_handlers` = the set `run_app` actually executes), not a direct
+    /// `handler.run()` — the unit-call seam is exactly what let DUAL/CI miss the gap.
+    #[test]
+    fn shadow_observe_runs_in_app_mode_2413() {
+        let names: Vec<&str> =
+            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .iter()
+                .map(|h| h.name())
+                .collect();
+        assert!(
+            names.contains(&"shadow_observe"),
+            "shadow_observe (the reducer driver) must RUN in app mode (#2413 live-fix) — \
+             got {names:?}"
+        );
+        assert!(
+            !APP_TICK_ALLOWLIST.contains(&"shadow_observe"),
+            "shadow_observe must NOT be allowlisted out of app mode (#2413 live-fix)"
+        );
+    }
+
+    /// #2413 Phase B live-fix companion: the reducer driver is useless without the
+    /// hook-event SOCKET SERVER feeding its buffer, and `shadow::start` is the only thing
+    /// that binds it. `run_core` already calls it; this source-pins that `run_app` does
+    /// too, so the plane can't be half-wired in app mode again (driver runs, but folds an
+    /// always-empty buffer). The behavioural end-to-end (flag-on → observed_status
+    /// populated) is the operator's live dogfood; this is the cheap cross-platform guard.
+    ///
+    /// Scans ONLY the production region (before the `#[cfg(test)]` cutoff). This
+    /// assertion's own needle literal lives in the test module below, so a WHOLE-FILE
+    /// substring check would self-match and stay green even if the real `run_app` call
+    /// were deleted — the #2433 vacuous-pin class this very PR fixes (DUAL round-1 caught
+    /// it here). Mirrors `run_app_registers_event_bus_subscribers`. REVERSE-MUTATION
+    /// verified: deleting the real `shadow::start(&home)` call from run_app turns this RED.
+    #[test]
+    fn run_app_wires_shadow_socket_server_2413() {
+        let source = std::fs::read_to_string("src/app/mod.rs")
+            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
+            .expect("source file must be readable from test cwd");
+        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        assert!(
+            prod.contains("crate::daemon::shadow::start(&home)"),
+            "run_app must start the Shadow Observer hook-socket server in the PRODUCTION \
+             region (#2413 live-fix) — gating it to run_core left the whole plane dead in \
+             the app-mode live daemon. No 'crate::daemon::shadow::start(&home)' before the \
+             #[cfg(test)] cutoff"
         );
     }
 
