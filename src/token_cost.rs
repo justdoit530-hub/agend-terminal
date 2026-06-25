@@ -439,7 +439,15 @@ pub(crate) fn estimate_context_pct(home: &Path, instance: &str) -> Option<f32> {
 
 /// Estimate Agy's context usage percentage in range 0.0..1.0
 pub(crate) fn estimate_agy_context_pct_in(home: &Path) -> Option<f32> {
-    let dir = home.join(".gemini").join("antigravity-cli");
+    let mut dir = home.join(".gemini").join("antigravity-cli");
+    if !dir.join("history.jsonl").exists() {
+        if let Some(parent) = home.parent() {
+            let p_dir = parent.join(".gemini").join("antigravity-cli");
+            if p_dir.join("history.jsonl").exists() {
+                dir = p_dir;
+            }
+        }
+    }
     let history_path = dir.join("history.jsonl");
     if !history_path.exists() {
         return None;
@@ -2204,6 +2212,38 @@ mod context_estimate_tests {
         drop(conn);
 
         let pct = estimate_agy_context_pct_in(&home).expect("agy estimate succeeded");
+        let expected = 25600.0 / 1_048_576.0;
+        assert!((pct - expected).abs() < 1e-5, "Agy estimate: got {pct}, expected {expected}");
+    }
+
+    #[test]
+    fn estimate_agy_context_pct_in_fallback_parent() {
+        let parent = tmp("agy-est-parent");
+        // We create home as a subdirectory of parent (simulating the overridden AGEND_HOME)
+        let home = parent.join(".agend-agy2-home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let cli_dir = parent.join(".gemini").join("antigravity-cli");
+        let conv_dir = cli_dir.join("conversations");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+
+        let history_line = r#"{"conversationId":"test-cid","workspace":"/some/ws"}"#;
+        std::fs::write(cli_dir.join("history.jsonl"), history_line).unwrap();
+
+        let db_path = conv_dir.join("test-cid.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE gen_metadata (idx integer, data blob, size integer NOT NULL DEFAULT 0, PRIMARY KEY (idx))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, size) VALUES (1, 102400)",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        // Call it with the sub-directory (home)
+        let pct = estimate_agy_context_pct_in(&home).expect("agy estimate succeeded via parent fallback");
         let expected = 25600.0 / 1_048_576.0;
         assert!((pct - expected).abs() < 1e-5, "Agy estimate: got {pct}, expected {expected}");
     }
