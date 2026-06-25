@@ -67,6 +67,7 @@ pub enum HealthState {
     /// NOT touch `Paused`; entered ONLY via Stage 3 dispatcher.
     /// See `docs/RECOVERY-STAGES.md` §RS for the lifecycle.
     Paused,
+    Absent,
 }
 
 impl HealthState {
@@ -80,6 +81,7 @@ impl HealthState {
             Self::ErrorLoop => "error_loop",
             Self::IdleLong => "idle_long",
             Self::Paused => "paused",
+            Self::Absent => "absent",
         }
     }
 }
@@ -592,8 +594,8 @@ impl HealthTracker {
     }
 
     /// Mark successful respawn.
-    pub fn respawn_ok(&mut self) {
-        if self.state == HealthState::Recovering {
+    pub fn respawn_ok(&mut self, has_live_handle: bool) {
+        if has_live_handle && (self.state == HealthState::Recovering || self.state == HealthState::Absent) {
             self.state = HealthState::Healthy;
         }
         // Unstable stays until crash window clears
@@ -996,6 +998,7 @@ impl HealthTracker {
             HealthState::Unstable => "repeated crashes",
             HealthState::Failed => "too many crashes",
             HealthState::ErrorLoop => "error loop",
+            HealthState::Absent => "absent",
             _ => "unknown",
         }
     }
@@ -1007,8 +1010,8 @@ impl HealthTracker {
     /// crash decay must NOT exit `Paused` (only operator unpause can).
     /// `Paused` is reachable only via Stage 3 dispatcher, never via
     /// crash counter or decay paths.
-    pub fn maybe_decay(&mut self) {
-        self.maybe_decay_at(Instant::now());
+    pub fn maybe_decay(&mut self, process_alive: bool) {
+        self.maybe_decay_at(Instant::now(), process_alive);
     }
 
     /// Test-injection variant of [`Self::maybe_decay`] — accepts a
@@ -1027,7 +1030,7 @@ impl HealthTracker {
     /// Production callers should always use [`Self::maybe_decay`] which
     /// passes `Instant::now()` — zero behaviour change. Sub-task 7b PR
     /// #775 v2 hot-fix.
-    pub(crate) fn maybe_decay_at(&mut self, now: Instant) {
+    pub(crate) fn maybe_decay_at(&mut self, now: Instant, process_alive: bool) {
         if self.state == HealthState::Paused {
             return;
         }
@@ -1078,12 +1081,22 @@ impl HealthTracker {
             // or #685 Stage 2 auto-restart fires. record_crash returned
             // (false, _, _) when entering Failed, so the process is gone.
             if self.total_crashes < DEFAULT_MAX_RETRIES && self.state == HealthState::Failed {
-                self.state = HealthState::Recovering;
+                if process_alive {
+                    self.state = HealthState::Recovering;
+                } else {
+                    self.state = HealthState::Absent;
+                    tracing::debug!("maybe_decay_at: process not alive, transitioning Failed to Absent");
+                }
             }
             if self.total_crashes < 3
                 && matches!(self.state, HealthState::Unstable | HealthState::Recovering)
             {
-                self.state = HealthState::Healthy;
+                if process_alive {
+                    self.state = HealthState::Healthy;
+                } else {
+                    self.state = HealthState::Absent;
+                    tracing::debug!("maybe_decay_at: process not alive, transitioning state to Absent instead of Healthy");
+                }
             }
         }
     }
@@ -1133,7 +1146,7 @@ mod tests {
         // Many ticks within the SAME (first) window → at most ONE decay.
         let t1 = base + Duration::from_secs(31 * 60);
         for _ in 0..10 {
-            h.maybe_decay_at(t1);
+            h.maybe_decay_at(t1, true);
         }
         assert_eq!(
             h.total_crashes, 3,
@@ -1143,7 +1156,7 @@ mod tests {
         // A later window → exactly one more.
         let t2 = base + Duration::from_secs(62 * 60);
         for _ in 0..10 {
-            h.maybe_decay_at(t2);
+            h.maybe_decay_at(t2, true);
         }
         assert_eq!(
             h.total_crashes, 2,
@@ -1162,7 +1175,7 @@ mod tests {
 
         let t1 = base + Duration::from_secs(31 * 60);
         for _ in 0..10 {
-            h.maybe_decay_at(t1);
+            h.maybe_decay_at(t1, true);
         }
         assert_eq!(
             h.recovery_restart_count, 2,
@@ -1171,7 +1184,7 @@ mod tests {
 
         let t2 = base + Duration::from_secs(62 * 60);
         for _ in 0..10 {
-            h.maybe_decay_at(t2);
+            h.maybe_decay_at(t2, true);
         }
         assert_eq!(
             h.recovery_restart_count, 1,
@@ -1683,7 +1696,7 @@ mod tests {
         let mut h = HealthTracker::new();
         h.record_crash();
         assert_eq!(h.state, HealthState::Recovering);
-        h.respawn_ok();
+        h.respawn_ok(true);
         assert_eq!(h.state, HealthState::Healthy);
     }
 
@@ -1696,7 +1709,7 @@ mod tests {
 
         // Simulate respawn: clone old tracker, call respawn_ok
         let mut h2 = h.clone();
-        h2.respawn_ok();
+        h2.respawn_ok(true);
         assert_eq!(h2.total_crashes, 2); // History preserved
 
         // 3rd crash on cloned tracker should see recent=3
@@ -1713,7 +1726,7 @@ mod tests {
         h.record_crash();
         assert_eq!(h.total_crashes, 2);
         // Decay won't trigger immediately (need 30 min)
-        h.maybe_decay();
+        h.maybe_decay(true);
         assert_eq!(h.total_crashes, 2);
     }
 
@@ -2399,5 +2412,21 @@ mod tests {
             !QuotaExceeded.auto_clears_on(OperatorResolved),
             "throttle reason must not be cleared by operator-resolution"
         );
+    }
+
+    #[test]
+    fn test_failed_with_dead_pid_does_not_decay_to_healthy() {
+        let mut h = HealthTracker::new();
+        h.state = HealthState::Failed;
+        h.total_crashes = 4;
+        let base = Instant::now();
+        h.crash_times.push_back(base);
+        h.crash_decay_at = Some(base);
+
+        // Decay window elapsed, but process is dead (process_alive = false)
+        h.maybe_decay_at(base + Duration::from_secs(31 * 60), false);
+
+        // State must NOT be Healthy or Recovering; it transitions to Absent
+        assert_eq!(h.state, HealthState::Absent);
     }
 }

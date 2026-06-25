@@ -329,11 +329,17 @@ fn respawn_agent_worker(
             {
                 let r = reg.lock();
                 if let Some(handle) = respawned_id.and_then(|id| r.get(&id)) {
+                    let is_alive = handle
+                        .child
+                        .lock()
+                        .process_id()
+                        .map(crate::process::is_pid_alive)
+                        .unwrap_or(false);
                     let mut core = handle.core.lock();
                     if let Some(ref old_health) = saved_health {
                         core.health = old_health.clone();
                     }
-                    core.health.respawn_ok();
+                    core.health.respawn_ok(is_alive);
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(2));
