@@ -1404,6 +1404,9 @@ fn build_tick_infrastructure(
     // grok plane: read-only tail of ~/.grok/sessions/.../events.jsonl → Evidence → shared
     // buffer (attribution via summary.json info.cwd). No-op under AGEND_SHADOW_OBSERVER=0.
     crate::daemon::shadow::grok::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
+    // agy plane: read-only tail of transcript.jsonl → Evidence → shared buffer.
+    // No-op under AGEND_SHADOW_OBSERVER=0 (default-ON). ALSO wired into run_app (#2434 lesson).
+    crate::daemon::shadow::agy::spawn(Arc::clone(&ctx.registry), home.to_path_buf());
 
     crate::inbox::recover_half_writes(home);
     // #1988: same half-write recovery for the task-event log — quarantine a
