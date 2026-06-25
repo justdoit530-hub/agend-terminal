@@ -55,6 +55,10 @@ pub(super) fn resolve(config: &FleetConfig, fleet_dir: &Path, home: &Path) -> Ve
 fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Option<AgentDef> {
     let mut resolved = config.resolve_instance(name)?;
 
+    if let Some(custom_home) = resolved.env.get("HOME") {
+        crate::agent::ensure_library_symlink(std::path::Path::new(custom_home));
+    }
+
     if let Some(ref base_dir) = resolved.working_directory {
         std::fs::create_dir_all(base_dir).ok();
     }

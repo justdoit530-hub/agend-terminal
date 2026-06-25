@@ -755,6 +755,12 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         ..
     } = config;
 
+    if let Some(env_map) = *env {
+        if let Some(custom_home) = env_map.get("HOME") {
+            ensure_library_symlink(std::path::Path::new(custom_home));
+        }
+    }
+
     let detected_backend = Backend::from_command(backend_command);
 
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
@@ -3143,6 +3149,48 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     }
 }
+#[cfg(target_os = "macos")]
+pub fn ensure_library_symlink(custom_home: &std::path::Path) {
+    let link = custom_home.join("Library");
+    if link.is_symlink() {
+        if let Ok(target_path) = std::fs::read_link(&link) {
+            if let Ok(real_home) = std::env::var("HOME") {
+                let mut real_path = std::path::PathBuf::from(real_home);
+                if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+                    if let Some(parent) = real_path.parent() {
+                        real_path = parent.to_path_buf();
+                    }
+                }
+                let target = real_path.join("Library");
+                if target_path == target {
+                    return;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&link);
+    } else if link.exists() {
+        return;
+    }
+
+    if let Ok(real_home) = std::env::var("HOME") {
+        let mut real_path = std::path::PathBuf::from(real_home);
+        if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+            if let Some(parent) = real_path.parent() {
+                real_path = parent.to_path_buf();
+            }
+        }
+        let target = real_path.join("Library");
+        if target.exists() {
+            if let Some(parent) = link.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::os::unix::fs::symlink(&target, &link);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ensure_library_symlink(_custom_home: &std::path::Path) {}
 
 #[cfg(test)]
 #[path = "tests.rs"]
@@ -3150,3 +3198,4 @@ mod tests;
 
 #[cfg(test)]
 mod review_repro_agent_binding;
+
