@@ -3,7 +3,7 @@ use crate::inbox::{self, InboxMessage};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{MessageId, ThreadId};
+use teloxide::types::{CallbackQuery, MessageId, ThreadId};
 
 use super::error::cleanup_deleted_topic;
 use super::poll_supervisor;
@@ -111,13 +111,22 @@ async fn drive_dispatch_once(
         .clone()
         .expect("telegram bot not initialized (polling thread)");
     let state2 = Arc::clone(state);
-    let handler = Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
-        let state = Arc::clone(&state2);
-        async move {
-            handle_message(&state, &msg).await;
-            respond(())
-        }
-    });
+    let state3 = Arc::clone(state);
+    let handler = dptree::entry()
+        .branch(Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
+            let state = Arc::clone(&state2);
+            async move {
+                handle_message(&state, &msg).await;
+                respond(())
+            }
+        }))
+        .branch(Update::filter_callback_query().endpoint(move |bot: Bot, q: CallbackQuery| {
+            let state = Arc::clone(&state3);
+            async move {
+                handle_callback_query(&state, bot, &q).await;
+                respond(())
+            }
+        }));
     let listener = teloxide::update_listeners::Polling::builder(bot.clone())
         .timeout(std::time::Duration::from_secs(10))
         .build();
@@ -701,6 +710,197 @@ pub(super) fn agent_wants_raw_keystrokes(
     drop(reg);
     let guard = core.lock();
     guard.state.current.wants_raw_keystrokes()
+}
+
+async fn handle_callback_query(
+    state: &Arc<Mutex<TelegramState>>,
+    bot: Bot,
+    query: &CallbackQuery,
+) {
+    let callback_data = match &query.data {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    let msg = match &query.message {
+        Some(teloxide::types::MaybeInaccessibleMessage::Regular(m)) => m,
+        _ => return,
+    };
+
+    // Answer callback query first so the button loading spinner disappears immediately.
+    if let Err(e) = bot.answer_callback_query(query.id.clone()).await {
+        tracing::warn!(error = %e, "failed to answer callback query");
+    }
+
+    // Trust model authentication gate
+    let sender_id: Option<i64> = Some(query.from.id.0 as i64);
+    let allowlist_name: Option<String> = if query.from.username.as_deref().is_none() {
+        sender_id.and_then(|id| lock_state(state).username_for(id).map(str::to_string))
+    } else {
+        None
+    };
+    let username = query
+        .from
+        .username
+        .as_deref()
+        .or(allowlist_name.as_deref())
+        .unwrap_or("unknown");
+
+    {
+        let s = lock_state(state);
+        let allowed = match sender_id {
+            Some(id) => s.is_user_allowed(id),
+            None => false,
+        };
+        if !allowed {
+            tracing::warn!(
+                from = username,
+                user_id = ?sender_id,
+                "telegram callback query rejected by user_allowlist"
+            );
+            return;
+        }
+    }
+
+    let thread_id = msg.thread_id.map(|ThreadId(MessageId(id))| id);
+    let (instance_name, home, registry) = {
+        let mut s = lock_state(state);
+        let name = resolve_topic(&mut s, thread_id);
+        (name, s.home.clone(), s.registry.clone())
+    };
+
+    tracing::info!(
+        from = username,
+        to = %instance_name,
+        callback_data = %callback_data,
+        "inbound callback query"
+    );
+
+    // Route based on agent state: identical to handle_message
+    if agent_wants_raw_keystrokes(registry.as_ref(), &instance_name) {
+        let payload = format!("{callback_data}\n");
+        match crate::api::call(
+            &home,
+            &serde_json::json!({
+                "method": crate::api::method::INJECT,
+                "params": {"name": instance_name, "data": payload, "raw": true}
+            }),
+        ) {
+            Ok(_) => tracing::info!(
+                to = %instance_name,
+                bytes = payload.len(),
+                "routed raw callback_data keystrokes (interactive prompt)"
+            ),
+            Err(e) => tracing::warn!(
+                to = %instance_name,
+                error = %e,
+                "raw callback_data injection failed"
+            ),
+        }
+        return;
+    }
+
+    // Persist the inbound message ID
+    {
+        let entry = serde_json::json!({
+            "kind": "telegram",
+            "msg_id": msg.id.0.to_string(),
+        });
+        crate::agent_ops::update_metadata(&home, &instance_name, "pending_pickup_ids", |current| {
+            let mut ids: Vec<serde_json::Value> = current.as_array().cloned().unwrap_or_default();
+            ids.push(entry);
+            if ids.len() > 100 {
+                ids = ids.split_off(ids.len() - 100);
+            }
+            serde_json::json!(ids)
+        });
+    }
+    crate::agent_ops::save_metadata(
+        &home,
+        &instance_name,
+        "last_message_id",
+        serde_json::json!(msg.id.0),
+    );
+
+    // Inbox delivery
+    let attachments = vec![];
+    let is_short = is_short_inject(&callback_data, &attachments);
+    let pointer_only = inbox::notify::pointer_only_inject();
+
+    if is_short && !pointer_only {
+        inbox::notify_agent_with_attachments(
+            &home,
+            &instance_name,
+            &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
+            &callback_data,
+            &attachments,
+        );
+    } else {
+        let msg_obj = InboxMessage {
+            schema_version: 0,
+            id: None,
+            read_at: None,
+            delivering_at: None,
+            thread_id: None,
+            parent_id: None,
+            task_id: None,
+            force_meta: None,
+            correlation_id: None,
+            reviewed_head: None,
+            from: format!("user:{username}"),
+            text: callback_data.to_string(),
+            kind: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            channel: Some(crate::channel::ChannelKind::Telegram),
+            delivery_mode: None,
+            attachments,
+            in_reply_to_msg_id: Some(msg.id.0.to_string()),
+            in_reply_to_excerpt: {
+                let text = msg.text().or_else(|| msg.caption()).unwrap_or("");
+                let author = msg
+                    .from
+                    .as_ref()
+                    .and_then(|u| u.username.as_deref())
+                    .unwrap_or("unknown");
+                inbox::build_excerpt(text, author)
+            },
+            superseded_by: None,
+            from_id: None,
+            broadcast_context: None,
+            sequencing: None,
+            eta_minutes: None,
+            reporting_cadence: None,
+            worktree_binding_required: None,
+            pr_number: None,
+            terminal: None,
+        };
+        persist_or_log!(
+            inbox::enqueue(&home, &instance_name, msg_obj),
+            "telegram_dispatch",
+            instance_name
+        );
+        inbox::notify_agent_with_attachments(
+            &home,
+            &instance_name,
+            &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
+            &callback_data,
+            &vec![],
+        );
+    }
+
+    // Emit UxEvent::UserMsgReceived so the channel adapter can react
+    {
+        use crate::channel::binding::BindingRef;
+        use crate::channel::event::MsgRef;
+        use crate::channel::ux_event::UxEvent;
+        let origin_msg = MsgRef {
+            binding: BindingRef::new("telegram", Some(instance_name.clone()), ()),
+            id: msg.id.0.to_string(),
+        };
+        crate::channel::sink_registry::registry().emit(&UxEvent::UserMsgReceived {
+            origin_msg,
+            agent: instance_name,
+        });
+    }
 }
 
 #[cfg(test)]

@@ -28,7 +28,22 @@ pub(crate) fn def_reply() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "message": {"type": "string", "description": "The reply text to send to the user."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
-            "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
+            "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."},
+            "buttons": {
+                "type": "array",
+                "description": "Optional inline keyboard buttons (2D array: rows of buttons). Supported on channels with buttons capability.",
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string", "description": "Text displayed on the button"},
+                            "callback_data": {"type": "string", "description": "Data sent back when the button is clicked (max 64 bytes)"}
+                        },
+                        "required": ["label", "callback_data"]
+                    }
+                }
+            }
         }, "required": ["message"]}})
 }
 

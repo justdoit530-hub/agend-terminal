@@ -60,7 +60,7 @@ impl TelegramChannel {
         let caps = ChannelCapabilities {
             emits_deletion_events: false,
             threads: true,
-            buttons: false,
+            buttons: true,
             attachments: true,
             markdown: MarkdownDialect::MarkdownV2,
             max_msg_bytes: 4096,
@@ -151,16 +151,38 @@ impl crate::channel::Channel for TelegramChannel {
         let topic_id: Option<i32> = binding
             .downcast::<TelegramBindingPayload>()
             .map(|p| p.topic_id);
+        let reply_markup = msg.buttons.as_ref().map(|rows| {
+            let keyboard: Vec<Vec<teloxide::types::InlineKeyboardButton>> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|btn| {
+                            teloxide::types::InlineKeyboardButton::callback(
+                                btn.label.clone(),
+                                btn.callback_data.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            teloxide::types::InlineKeyboardMarkup::new(keyboard)
+        });
 
         match msg.attachment {
             Some(ref att) => {
                 let caption = resolve_caption(&msg.text, att);
+                let media_markup = if needs_separate_text(&msg.text, att) {
+                    None
+                } else {
+                    reply_markup.clone()
+                };
                 let msg_id = block_on_value(send_media(
                     &bot,
                     group_id,
                     topic_id,
                     att,
                     caption.as_deref(),
+                    media_markup,
                 ))?;
                 if needs_separate_text(&msg.text, att) {
                     // #1878: do NOT swallow the follow-up text send. Pre-fix this
@@ -169,13 +191,15 @@ impl crate::channel::Channel for TelegramChannel {
                     // the message body. Propagate so the caller sees the failure
                     // (its existing send-error handling: retry / surface),
                     // consistent with the media send above.
-                    block_on_value(send_with_topic(&bot, group_id, topic_id, &msg.text, None))
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "telegram: media sent (id {msg_id}) but the separate \
-                                 follow-up text failed: {e}"
-                            )
-                        })?;
+                    block_on_value(send_with_topic_capturing_id(
+                        &bot, group_id, topic_id, &msg.text, None, reply_markup,
+                    ))
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "telegram: media sent (id {msg_id}) but the separate \
+                             follow-up text failed: {e}"
+                        )
+                    })?;
                 }
                 Ok(crate::channel::MsgRef {
                     binding: build_telegram_msg_binding(topic_id),
@@ -187,7 +211,7 @@ impl crate::channel::Channel for TelegramChannel {
                     anyhow::bail!("OutMsg has no text and no attachment");
                 }
                 let msg_id = block_on_value(send_with_topic_capturing_id(
-                    &bot, group_id, topic_id, &msg.text, None,
+                    &bot, group_id, topic_id, &msg.text, None, reply_markup,
                 ))?;
                 Ok(crate::channel::MsgRef {
                     binding: build_telegram_msg_binding(topic_id),
@@ -374,9 +398,9 @@ impl crate::channel::Channel for TelegramChannel {
 
         let home = lock_state(&self.state).home.clone();
         match op {
-            crate::channel::AgentOutboundOp::Reply { text } => {
+            crate::channel::AgentOutboundOp::Reply { text, buttons } => {
                 let (msg_id, _chat_id) =
-                    try_telegram_reply_from(&home, agent, &text).map_err(ChannelError::Other)?;
+                    try_telegram_reply_from(&home, agent, &text, buttons.as_ref()).map_err(ChannelError::Other)?;
                 Ok(crate::channel::MsgRef {
                     binding: crate::channel::BindingRef::new(
                         "telegram",
@@ -559,6 +583,7 @@ mod tests {
                 "reply",
                 crate::channel::AgentOutboundOp::Reply {
                     text: "leak".to_string(),
+                    buttons: None,
                 },
             ),
             (
@@ -624,5 +649,54 @@ mod tests {
             block.contains("send_with_topic") && (block.contains('?') || block.contains("map_err")),
             "#1878: the separate follow-up text send must be PROPAGATED (? / map_err), not dropped"
         );
+    }
+
+    #[test]
+    fn test_button_serialization_to_telegram_markup() {
+        let buttons = vec![
+            vec![
+                crate::channel::ButtonDef::new("Label 1", "data_1"),
+                crate::channel::ButtonDef::new("Label 2", "data_2"),
+            ],
+            vec![
+                crate::channel::ButtonDef::new("Label 3", "data_3"),
+            ],
+        ];
+
+        let msg = crate::channel::OutMsg {
+            text: "test buttons".into(),
+            attachment: None,
+            in_reply_to: None,
+            buttons: Some(buttons),
+        };
+
+        let reply_markup = msg.buttons.as_ref().map(|rows| {
+            let keyboard: Vec<Vec<teloxide::types::InlineKeyboardButton>> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|btn| {
+                            teloxide::types::InlineKeyboardButton::callback(
+                                btn.label.clone(),
+                                btn.callback_data.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            teloxide::types::InlineKeyboardMarkup::new(keyboard)
+        });
+
+        let markup = reply_markup.expect("must serialize buttons");
+        assert_eq!(markup.inline_keyboard.len(), 2);
+        assert_eq!(markup.inline_keyboard[0].len(), 2);
+        assert_eq!(markup.inline_keyboard[0][0].text, "Label 1");
+        assert_eq!(
+            markup.inline_keyboard[0][0].kind,
+            teloxide::types::InlineKeyboardButtonKind::CallbackData("data_1".to_string())
+        );
+        assert_eq!(markup.inline_keyboard[0][1].text, "Label 2");
+        assert_eq!(markup.inline_keyboard[1].len(), 1);
+        assert_eq!(markup.inline_keyboard[1][0].text, "Label 3");
     }
 }

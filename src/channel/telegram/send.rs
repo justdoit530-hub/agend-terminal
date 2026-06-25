@@ -18,6 +18,7 @@ pub(super) async fn send_with_topic_capturing_id(
     topic_id: Option<i32>,
     text: &str,
     reply_to_msg_id: Option<i32>,
+    reply_markup: Option<teloxide::types::InlineKeyboardMarkup>,
 ) -> anyhow::Result<i32> {
     use teloxide::payloads::SendMessageSetters;
     use teloxide::prelude::Requester;
@@ -30,6 +31,9 @@ pub(super) async fn send_with_topic_capturing_id(
     }
     if let Some(mid) = reply_to_msg_id {
         req = req.reply_parameters(ReplyParameters::new(MessageId(mid)));
+    }
+    if let Some(markup) = reply_markup {
+        req = req.reply_markup(markup);
     }
     let sent = req.send().await?;
     Ok(sent.id.0)
@@ -48,7 +52,7 @@ pub(super) async fn send_with_topic(
     text: &str,
     reply_to_msg_id: Option<i32>,
 ) -> anyhow::Result<()> {
-    send_with_topic_capturing_id(bot, chat_id, topic_id, text, reply_to_msg_id)
+    send_with_topic_capturing_id(bot, chat_id, topic_id, text, reply_to_msg_id, None)
         .await
         .map(|_| ())
 }
@@ -87,6 +91,7 @@ pub(super) async fn send_media(
     topic_id: Option<i32>,
     att: &crate::channel::Attachment,
     caption: Option<&str>,
+    reply_markup: Option<teloxide::types::InlineKeyboardMarkup>,
 ) -> anyhow::Result<i32> {
     use crate::channel::AttachmentKind;
     use teloxide::prelude::Requester;
@@ -109,6 +114,9 @@ pub(super) async fn send_media(
             if let Some(tid) = thread {
                 req = req.message_thread_id(tid);
             }
+            if let Some(ref markup) = reply_markup {
+                req = req.reply_markup(markup.clone());
+            }
             req.await?.id.0
         }
         AttachmentKind::Voice => {
@@ -118,6 +126,9 @@ pub(super) async fn send_media(
             }
             if let Some(tid) = thread {
                 req = req.message_thread_id(tid);
+            }
+            if let Some(ref markup) = reply_markup {
+                req = req.reply_markup(markup.clone());
             }
             req.await?.id.0
         }
@@ -129,6 +140,9 @@ pub(super) async fn send_media(
             if let Some(tid) = thread {
                 req = req.message_thread_id(tid);
             }
+            if let Some(ref markup) = reply_markup {
+                req = req.reply_markup(markup.clone());
+            }
             req.await?.id.0
         }
         AttachmentKind::Video => {
@@ -139,12 +153,18 @@ pub(super) async fn send_media(
             if let Some(tid) = thread {
                 req = req.message_thread_id(tid);
             }
+            if let Some(ref markup) = reply_markup {
+                req = req.reply_markup(markup.clone());
+            }
             req.await?.id.0
         }
         AttachmentKind::Sticker => {
             let mut req = bot.send_sticker(chat_id, input);
             if let Some(tid) = thread {
                 req = req.message_thread_id(tid);
+            }
+            if let Some(ref markup) = reply_markup {
+                req = req.reply_markup(markup.clone());
             }
             req.await?.id.0
         }
@@ -292,6 +312,7 @@ mod tests {
             text: "see".into(),
             attachment: Some(make_attachment(crate::channel::AttachmentKind::Photo)),
             in_reply_to: None,
+            buttons: None,
         };
         let err = channel.send(&binding, msg).expect_err("no bot");
         assert!(

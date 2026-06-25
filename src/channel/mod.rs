@@ -48,7 +48,7 @@ pub mod ux_event;
 pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};
 pub use event::{
-    Attachment, AttachmentKind, ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User,
+    Attachment, AttachmentKind, ButtonDef, ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User,
 };
 pub use sink_registry::{registry, UxSinkRegistry};
 pub use ux_event::{select_action, FleetEvent, NoopUxSink, UxAction, UxEvent, UxEventSink};
@@ -413,7 +413,10 @@ pub trait Channel: Send + Sync {
 #[derive(Debug, Clone)]
 pub enum AgentOutboundOp {
     /// Free-form reply into the agent's bound topic.
-    Reply { text: String },
+    Reply {
+        text: String,
+        buttons: Option<Vec<Vec<ButtonDef>>>,
+    },
     /// Emoji reaction on a previously-observed message. `message_id` is
     /// `None` when the agent reacts to its most recent inbound message
     /// (resolved via `metadata/{instance}.json` `last_message_id`).
@@ -932,6 +935,7 @@ mod tests {
                 "agent1",
                 AgentOutboundOp::Reply {
                     text: "hi".to_string(),
+                    buttons: None,
                 },
             )
             .expect_err("default must be NotSupported");

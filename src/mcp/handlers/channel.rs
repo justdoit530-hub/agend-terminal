@@ -9,7 +9,19 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     // `message` with a clear named error, so a mis-named param no longer
     // silently becomes an empty reply.
     let text = args["message"].as_str().unwrap_or("").to_string();
-    tracing::info!(from = %instance_name, %text, "reply");
+    let buttons: Option<Vec<Vec<crate::channel::ButtonDef>>> = if let Some(v) = args.get("buttons") {
+        if v.is_null() {
+            None
+        } else {
+            match serde_json::from_value(v.clone()) {
+                Ok(b) => Some(b),
+                Err(e) => return json!({"error": format!("invalid 'buttons' format: {e}"), "code": "invalid_arguments"}),
+            }
+        }
+    } else {
+        None
+    };
+    tracing::info!(from = %instance_name, %text, ?buttons, "reply");
 
     // Sprint 59 Wave 1 PR-4 ((B) decision default with timeout):
     // dual-purpose hook on every reply call.
@@ -106,7 +118,7 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     });
     match ch.send_from_agent(
         instance_name,
-        crate::channel::AgentOutboundOp::Reply { text },
+        crate::channel::AgentOutboundOp::Reply { text, buttons },
     ) {
         Ok(msg) => {
             // #1665: reply delivered — closes the user-turn (no warn at sweep).
