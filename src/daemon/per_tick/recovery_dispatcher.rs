@@ -1202,7 +1202,7 @@ mod tests {
         tracker.recovery_restart_count = 2;
         let base = Instant::now();
         tracker.last_stage2_fired_at = Some(base);
-        tracker.maybe_decay_at(base + Duration::from_secs(31 * 60));
+        tracker.maybe_decay_at(base + Duration::from_secs(31 * 60), true);
         assert_eq!(tracker.recovery_restart_count, 1);
     }
 
@@ -1214,7 +1214,7 @@ mod tests {
         tracker.recovery_restart_count = 2;
         let base = Instant::now();
         tracker.last_stage2_fired_at = Some(base);
-        tracker.maybe_decay_at(base);
+        tracker.maybe_decay_at(base, true);
         assert_eq!(tracker.recovery_restart_count, 2);
     }
 
@@ -1231,7 +1231,7 @@ mod tests {
         tracker.recovery_restart_count = 2;
         let base = Instant::now();
         tracker.last_stage2_fired_at = Some(base);
-        tracker.maybe_decay_at(base + Duration::from_secs(31 * 60));
+        tracker.maybe_decay_at(base + Duration::from_secs(31 * 60), true);
         assert_eq!(tracker.state, HealthState::Paused);
         assert_eq!(tracker.recovery_restart_count, 2);
     }
@@ -1344,7 +1344,7 @@ mod tests {
         // exit Paused or touch the preserved counter.
         tracker.recovery_restart_count = 2;
         tracker.last_stage2_fired_at = Some(entered);
-        tracker.maybe_decay_at(entered + Duration::from_secs(31 * 60));
+        tracker.maybe_decay_at(entered + Duration::from_secs(31 * 60), true);
         assert_eq!(tracker.state, HealthState::Paused);
         assert_eq!(tracker.recovery_restart_count, 2);
         match tracker.recovery_stage_state {
