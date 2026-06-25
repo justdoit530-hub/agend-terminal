@@ -370,6 +370,25 @@ fn respawn_agent_worker(
         }
         Err(e) => {
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
+            crate::event_log::log(home, "crash_respawn_failed", &config.name, &format!("error: {e}"));
+            let msg = format!(
+                "🛑 Agent `{}` crash-respawn failed: {}",
+                config.name, e
+            );
+            crate::channel::notify_all_escalation_channels(
+                &config.name,
+                crate::channel::NotifySeverity::Error,
+                &msg,
+                false,
+            );
+            let respawned_id = crate::fleet::resolve_uuid(home, &config.name);
+            if let Some(id) = respawned_id {
+                let r = reg.lock();
+                if let Some(handle) = r.get(&id) {
+                    let mut core = handle.core.lock();
+                    core.health.respawn_failed();
+                }
+            }
         }
     }
 }
@@ -579,4 +598,55 @@ mod deleted_gate_tests_1913 {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn test_crash_respawn_failed_escalation() {
+        let home = tmp_home("failed-spawn");
+        let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let handle = make_handle(false);
+        let saved_health = handle.core.lock().health.clone();
+        reg.lock().insert(
+            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
+            handle,
+        );
+
+        let config = AgentConfig {
+            name: VICTIM.to_string(),
+            backend_command: "nonexistent-command-12345".to_string(),
+            args: vec![],
+            env: None,
+            working_dir: None,
+            worktree_source: None,
+            submit_key: "\r".to_string(),
+        };
+
+        let (crash_tx, _crash_rx) = crossbeam_channel::unbounded();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Call respawn_agent_worker directly and synchronously
+        super::respawn_agent_worker(
+            &home,
+            config,
+            std::time::Duration::ZERO,
+            Some(saved_health),
+            &reg,
+            crash_tx,
+            &shutdown,
+        );
+
+        // Verify 1: event-log.jsonl should have a crash_respawn_failed record
+        let log_content = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap();
+        assert!(log_content.contains("crash_respawn_failed"));
+
+        // Verify 2: health state in the registry should be HealthState::Failed
+        {
+            let r = reg.lock();
+            let handle = r.get(&InstanceId::parse(VICTIM_UUID).unwrap()).unwrap();
+            let core = handle.core.lock();
+            assert_eq!(core.health.state, crate::health::HealthState::Failed);
+        }
+
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
+
