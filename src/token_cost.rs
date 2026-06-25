@@ -662,7 +662,10 @@ fn estimate_codex_context_pct_in(sessions_dir: &Path, roots: &[(String, Vec<Path
         }
     }
     let (_, path) = newest?;
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
     let rows = parse_codex_rows(&content, roots, None);
     if rows.is_empty() {
         return None;

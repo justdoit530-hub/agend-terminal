@@ -66,8 +66,14 @@ impl PerTickHandler for HangDetectionHandler {
             let mut left = Vec::new();
             for handle in reg.values() {
                 let name = handle.name.as_str();
+                let process_alive = handle
+                    .child
+                    .lock()
+                    .process_id()
+                    .map(crate::process::is_pid_alive)
+                    .unwrap_or(false);
                 let mut core = handle.core.lock();
-                core.health.maybe_decay();
+                core.health.maybe_decay(process_alive);
                 let was_hung = core.health.state == crate::health::HealthState::Hung;
                 let agent_state = core.state.current;
                 let silent = core.state.last_output.elapsed();
