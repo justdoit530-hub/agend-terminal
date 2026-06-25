@@ -49,11 +49,28 @@ pub(super) fn telegram_reply_send_inner(
     instance_name: &str,
     topic_id: Option<i32>,
     text: &str,
+    buttons: Option<&Vec<Vec<crate::channel::ButtonDef>>>,
 ) -> anyhow::Result<i32> {
     #[cfg(test)]
     if let Some(err) = tests::take_forced_send_error() {
         return Err(err);
     }
+    let reply_markup = buttons.as_ref().map(|rows| {
+        let keyboard: Vec<Vec<teloxide::types::InlineKeyboardButton>> = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|btn| {
+                        teloxide::types::InlineKeyboardButton::callback(
+                            btn.label.clone(),
+                            btn.callback_data.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        teloxide::types::InlineKeyboardMarkup::new(keyboard)
+    });
     // #bughunt-r3 #2: AWAIT the send and return its real result. The previous
     // in-runtime branch spawned the send fire-and-forget and returned `Ok(0)` —
     // a fake success (msg-id 0) that also swallowed the send error inside the
@@ -65,19 +82,18 @@ pub(super) fn telegram_reply_send_inner(
     block_on_value(async {
         let bot = teloxide::Bot::new(&ch.token);
         let chat_id = teloxide::types::ChatId(ch.group_id);
-        let sent = match topic_id {
-            Some(1) | None => {
-                if topic_id.is_none() {
-                    anyhow::bail!("No topic_id for {instance_name}");
-                }
-                bot.send_message(chat_id, text).await?
+        let mut req = bot.send_message(chat_id, text);
+        if let Some(tid) = topic_id {
+            if tid != 1 {
+                req = req.message_thread_id(teloxide::types::ThreadId(MessageId(tid)));
             }
-            Some(tid) => {
-                bot.send_message(chat_id, text)
-                    .message_thread_id(teloxide::types::ThreadId(MessageId(tid)))
-                    .await?
-            }
-        };
+        } else {
+            anyhow::bail!("No topic_id for {instance_name}");
+        }
+        if let Some(markup) = reply_markup {
+            req = req.reply_markup(markup);
+        }
+        let sent = req.await?;
         Ok::<i32, anyhow::Error>(sent.id.0)
     })
 }
@@ -91,13 +107,14 @@ pub(super) fn telegram_reply_send_inner(
 /// this authority (e.g. S2d provenance per DESIGN §6) use
 /// [`try_telegram_reply_no_cleanup`] instead.
 pub(crate) fn try_telegram_reply(instance_name: &str, text: &str) -> anyhow::Result<(i32, i64)> {
-    try_telegram_reply_from(&crate::home_dir(), instance_name, text)
+    try_telegram_reply_from(&crate::home_dir(), instance_name, text, None)
 }
 
 pub(super) fn try_telegram_reply_from(
     home: &std::path::Path,
     instance_name: &str,
     text: &str,
+    buttons: Option<&Vec<Vec<crate::channel::ButtonDef>>>,
 ) -> anyhow::Result<(i32, i64)> {
     let (ch, _config) = resolve_channel_from(home)?;
     let topic_id = crate::channel::telegram::lookup_topic_for_instance(home, instance_name);
@@ -124,7 +141,7 @@ pub(super) fn try_telegram_reply_from(
     // suppressed (a synthesized `Ok` that `handle_reply` mis-records as
     // `Delivered`, defeating the #1665/#1813 missing-reply nets). Compute the
     // outcome, then `evict` on any terminal `Err`; a success keeps the key.
-    let outcome = (|| match telegram_reply_send_inner(&ch, instance_name, topic_id, text) {
+    let outcome = (|| match telegram_reply_send_inner(&ch, instance_name, topic_id, text, buttons) {
         Ok(msg_id) => Ok((msg_id, ch.group_id)),
         Err(e) => {
             // Supergroup migration must be checked before topic-deleted:
@@ -140,7 +157,7 @@ pub(super) fn try_telegram_reply_from(
                         new_chat_id = new_ch.group_id,
                         "retrying send after supergroup migration"
                     );
-                    return telegram_reply_send_inner(&new_ch, instance_name, topic_id, text)
+                    return telegram_reply_send_inner(&new_ch, instance_name, topic_id, text, buttons)
                         .map(|msg_id| (msg_id, new_ch.group_id));
                 }
             }
@@ -155,7 +172,7 @@ pub(super) fn try_telegram_reply_from(
                             new_topic = new_tid,
                             "retrying send with recreated topic"
                         );
-                        return telegram_reply_send_inner(&ch, instance_name, Some(new_tid), text)
+                        return telegram_reply_send_inner(&ch, instance_name, Some(new_tid), text, buttons)
                             .map(|msg_id| (msg_id, ch.group_id));
                     }
                 }
@@ -187,7 +204,7 @@ pub(super) fn try_telegram_reply_no_cleanup_from(
 ) -> anyhow::Result<(i32, i64)> {
     let (ch, _config) = resolve_channel_from(home)?;
     let topic_id = crate::channel::telegram::lookup_topic_for_instance(home, instance_name);
-    telegram_reply_send_inner(&ch, instance_name, topic_id, text)
+    telegram_reply_send_inner(&ch, instance_name, topic_id, text, None)
         .map(|msg_id| (msg_id, ch.group_id))
 }
 
@@ -370,7 +387,7 @@ instances:
 
         // First send: transient failure (not migration / not topic-deleted).
         set_forced_send_error(anyhow::anyhow!("transient network error"));
-        let first = try_telegram_reply_from(&home, "C", "hello operator");
+        let first = try_telegram_reply_from(&home, "C", "hello operator", None);
         assert!(
             first.is_err(),
             "first send must surface the failure: {first:?}"
@@ -380,7 +397,7 @@ instances:
         // evicted, so this REACHES the send (and fails again on the second forced
         // error); with the bug it would be deduped into `Ok((0, group_id))`.
         set_forced_send_error(anyhow::anyhow!("transient network error 2"));
-        let retry = try_telegram_reply_from(&home, "C", "hello operator");
+        let retry = try_telegram_reply_from(&home, "C", "hello operator", None);
         assert!(
             retry.is_err(),
             "HIGH-2: a retry after a failed send must ACTUALLY send (not be \
@@ -419,7 +436,7 @@ instances:
         std::env::set_var("PR57_ROUND2_FAKE_TOKEN", "fake");
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
 
-        let res = try_telegram_reply_from(&home, "B", "main-path send");
+        let res = try_telegram_reply_from(&home, "B", "main-path send", None);
         assert!(res.is_err());
 
         let reg = load_topic_registry(&home);
@@ -453,7 +470,7 @@ instances:
 
         set_forced_send_error(anyhow::anyhow!("Bad Request: message thread not found"));
 
-        let res = try_telegram_reply_from(&home, "agent-x", "hello");
+        let res = try_telegram_reply_from(&home, "agent-x", "hello", None);
         assert!(res.is_err());
 
         let reg = load_topic_registry(&home);
@@ -494,7 +511,7 @@ instances:
 
         set_forced_send_error(anyhow::anyhow!("Too Many Requests: retry after 5"));
 
-        let res = try_telegram_reply_from(&home, "agent-x", "hello");
+        let res = try_telegram_reply_from(&home, "agent-x", "hello", None);
         assert!(res.is_err());
 
         let reg = load_topic_registry(&home);
@@ -551,7 +568,7 @@ instances:
         // (fleet.yaml rewritten) rather than `is_ok()`, mirroring the
         // existing `try_telegram_reply_from_invalidates_on_topic_deleted`
         // pattern at this site.
-        let _ = try_telegram_reply_from(&home, "agent-x", "hello");
+        let _ = try_telegram_reply_from(&home, "agent-x", "hello", None);
 
         // fleet.yaml channel.group_id rewritten to the migrated id.
         assert_eq!(read_channel_group_id(&home), Some(new_id));
@@ -590,7 +607,7 @@ instances:
 
         set_forced_send_error(anyhow::anyhow!("Too Many Requests: retry after 5"));
 
-        let res = try_telegram_reply_from(&home, "agent-x", "hello");
+        let res = try_telegram_reply_from(&home, "agent-x", "hello", None);
         assert!(res.is_err(), "unrelated error must propagate");
 
         // Original group_id preserved — RetryAfter must not trigger

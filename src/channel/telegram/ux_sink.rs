@@ -167,7 +167,7 @@ mod tests {
             .clone();
         assert!(!caps.emits_deletion_events);
         assert!(caps.threads);
-        assert!(!caps.buttons);
+        assert!(caps.buttons);
         assert!(caps.attachments);
         assert_eq!(caps.markdown, MarkdownDialect::MarkdownV2);
         assert_eq!(caps.max_msg_bytes, 4096);

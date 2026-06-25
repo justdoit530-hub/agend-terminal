@@ -5707,12 +5707,19 @@ fn context_provider_derived_from_statusline_pattern_presence() {
         );
         assert_eq!(t.context_provider().source_name(), "statusline");
     }
+    // Backends that support transcript estimation (e.g. Codex, Agy)
+    for backend in [Backend::Codex, Backend::Agy] {
+        let t = StateTracker::new(Some(&backend));
+        assert!(
+            matches!(t.context_provider(), ContextProvider::TranscriptEstimate { .. }),
+            "{backend:?} supports transcript estimation → TranscriptEstimate"
+        );
+        assert_eq!(t.context_provider().source_name(), "transcript");
+    }
     // Backends with no passive context signal derive Unavailable — a silent null
     // becomes an explicit, honest "unavailable".
     for backend in [
-        Backend::Codex,
         Backend::OpenCode,
-        Backend::Agy,
         Backend::Shell,
         Backend::Raw("/opt/whatever".to_string()),
     ] {

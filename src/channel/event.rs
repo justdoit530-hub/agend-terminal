@@ -115,6 +115,21 @@ pub struct MessageRef {
     pub msg_id: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ButtonDef {
+    pub label: String,
+    pub callback_data: String,
+}
+
+impl ButtonDef {
+    pub fn new(label: impl Into<String>, callback_data: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            callback_data: callback_data.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OutMsg {
     pub text: String,
@@ -124,6 +139,9 @@ pub struct OutMsg {
     /// If set, the outbound message is a reply to this specific message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<MessageRef>,
+    /// Optional inline keyboard buttons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buttons: Option<Vec<Vec<ButtonDef>>>,
 }
 
 impl OutMsg {
@@ -132,6 +150,16 @@ impl OutMsg {
             text: t.into(),
             attachment: None,
             in_reply_to: None,
+            buttons: None,
+        }
+    }
+
+    pub fn with_buttons(text: impl Into<String>, buttons: Vec<Vec<ButtonDef>>) -> Self {
+        Self {
+            text: text.into(),
+            attachment: None,
+            in_reply_to: None,
+            buttons: Some(buttons),
         }
     }
 }
@@ -181,6 +209,7 @@ mod tests {
             text: "see attached".into(),
             attachment: Some(attachment),
             in_reply_to: None,
+            buttons: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
@@ -218,6 +247,7 @@ mod tests {
                 channel: crate::channel::ChannelKind::Telegram,
                 msg_id: "42".into(),
             }),
+            buttons: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains(r#""msg_id":"42""#), "json: {json}");

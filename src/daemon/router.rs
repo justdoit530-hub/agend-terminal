@@ -235,6 +235,7 @@ fn try_dispatch_mirror(home: &std::path::Path, name: &str, buf: &mut AgentBuffer
             name,
             crate::channel::AgentOutboundOp::Reply {
                 text: mirror_text.to_string(),
+                buttons: None,
             },
         );
         if let Err(e) = result {
