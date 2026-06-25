@@ -3507,3 +3507,121 @@ fn is_read_only_tool_allowlist() {
         );
     }
 }
+
+struct ShadowTestChannel;
+
+impl crate::channel::Channel for ShadowTestChannel {
+    fn kind(&self) -> &'static str {
+        "telegram"
+    }
+    fn caps(&self) -> &crate::channel::ChannelCapabilities {
+        static CAPS: std::sync::OnceLock<crate::channel::ChannelCapabilities> = std::sync::OnceLock::new();
+        CAPS.get_or_init(crate::channel::ChannelCapabilities::default)
+    }
+    fn poll_event(&self) -> Option<crate::channel::ChannelEvent> {
+        None
+    }
+    fn send(&self, _: &crate::channel::BindingRef, _: crate::channel::OutMsg) -> anyhow::Result<crate::channel::MsgRef> {
+        anyhow::bail!("unused")
+    }
+    fn edit(&self, _: &crate::channel::MsgRef, _: crate::channel::OutMsg) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn delete(&self, _: &crate::channel::MsgRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn create_binding(&self, _: &str, _: crate::channel::BindingOpts) -> anyhow::Result<crate::channel::BindingRef> {
+        anyhow::bail!("unused")
+    }
+    fn remove_binding(&self, _: &crate::channel::BindingRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn has_binding(&self, _: &str) -> bool {
+        false
+    }
+    fn record_binding(&self, _: &str, _: crate::channel::BindingRef, _: String) {}
+    fn take_binding(&self, _: &str) -> Option<crate::channel::BindingRef> {
+        None
+    }
+    fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+    fn create_topic(&self, _: &str) -> Result<crate::channel::TopicRef, crate::channel::ChannelError> {
+        Err(crate::channel::ChannelError::NotSupported("create_topic".into()))
+    }
+    fn notify(&self, _: &str, _: crate::channel::NotifySeverity, _: &str, _: bool) -> Result<(), crate::channel::ChannelError> {
+        Err(crate::channel::ChannelError::NotSupported("notify".into()))
+    }
+    fn send_from_agent(&self, _: &str, _: crate::channel::AgentOutboundOp) -> Result<crate::channel::MsgRef, crate::channel::ChannelError> {
+        Ok(crate::channel::MsgRef {
+            binding: crate::channel::BindingRef::new("telegram", None, ()),
+            id: "msg-123".into(),
+        })
+    }
+}
+
+#[test]
+#[serial(shadow_observer)]
+fn test_mcp_intercept_hook_plane() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_intercept_hook_test");
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
+    let agent = "test-shadow-agent";
+
+    // Setup active channel registry for reply success
+    crate::channel::reset_active_channel_for_test();
+    crate::channel::register_active_channel(std::sync::Arc::new(ShadowTestChannel));
+
+    // Pre-create fleet.yaml so handle_reply doesn't return early with error
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  test-shadow-agent:\n    backend: claude\n",
+    )
+    .ok();
+
+    // Clear any previous buffer for this agent name
+    crate::daemon::shadow::forget_agent(agent);
+
+    // Call a read-write tool (e.g. `mode`)
+    let result_mode = handle_tool("mode", &json!({"action": "get"}), agent);
+    assert!(result_mode["ok"].as_bool().unwrap_or(false));
+
+    let evs_mode = crate::daemon::shadow::peek(agent);
+    assert_eq!(evs_mode.len(), 2);
+    assert!(matches!(
+        evs_mode[0].kind,
+        crate::daemon::shadow::evidence::EvidenceKind::ToolStarted { name: Some(ref name) } if name == "mode"
+    ));
+    assert!(matches!(
+        evs_mode[1].kind,
+        crate::daemon::shadow::evidence::EvidenceKind::ToolEnded
+    ));
+
+    // Clear buffer
+    crate::daemon::shadow::forget_agent(agent);
+
+    // Call "reply" tool and verify it succeeds and generates TurnEnded
+    let result_reply = handle_tool("reply", &json!({"message": "test reply"}), agent);
+    assert!(result_reply.get("error").is_none());
+
+    let evs_reply = crate::daemon::shadow::peek(agent);
+    assert_eq!(evs_reply.len(), 3);
+    assert!(matches!(
+        evs_reply[0].kind,
+        crate::daemon::shadow::evidence::EvidenceKind::ToolStarted { name: Some(ref name) } if name == "reply"
+    ));
+    assert!(matches!(
+        evs_reply[1].kind,
+        crate::daemon::shadow::evidence::EvidenceKind::ToolEnded
+    ));
+    assert!(matches!(
+        evs_reply[2].kind,
+        crate::daemon::shadow::evidence::EvidenceKind::TurnEnded { .. }
+    ));
+
+    // Clean up
+    crate::daemon::shadow::forget_agent(agent);
+    crate::channel::reset_active_channel_for_test();
+    std::env::remove_var("AGEND_HOME");
+    std::env::remove_var("AGEND_SHADOW_OBSERVER");
+    std::fs::remove_dir_all(&home).ok();
+}
