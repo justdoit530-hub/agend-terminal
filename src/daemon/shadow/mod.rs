@@ -19,6 +19,7 @@
 
 pub mod evidence;
 pub(crate) mod gate;
+pub mod grok;
 pub mod kiro;
 pub mod opencode;
 pub mod reducer;
