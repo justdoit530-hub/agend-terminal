@@ -464,6 +464,9 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         // gating it run_core-only would leave kiro agents' observer source dead in the
         // app-mode live daemon. No-op unless the flag is on (flag-OFF ⇒ zero change).
         crate::daemon::shadow::kiro::spawn(Arc::clone(&registry), home.clone());
+        // grok plane: read-only tail of ~/.grok/sessions/.../events.jsonl (Stream plane).
+        // Owner-only + app-mode-wired for the SAME #2434 reason as kiro above.
+        crate::daemon::shadow::grok::spawn(Arc::clone(&registry), home.clone());
         // Attached mode stays unwired: that process never owns the registry,
         // and the Telegram bot (if any) runs under the other daemon which
         // already did its own attach.
