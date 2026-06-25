@@ -2956,3 +2956,34 @@ fn bootstrap_readiness_no_registry_core_deadlock_real_path() {
         ),
     }
 }
+
+#[test]
+#[cfg(target_os = "macos")]
+fn test_ensure_library_symlink_macos() {
+    let temp_dir = std::env::temp_dir().join(format!("ensure-symlink-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    super::ensure_library_symlink(&temp_dir);
+
+    let link = temp_dir.join("Library");
+    assert!(link.is_symlink());
+
+    if let Ok(target) = std::fs::read_link(&link) {
+        if let Ok(real_home) = std::env::var("HOME") {
+            let mut real_path = std::path::PathBuf::from(real_home);
+            if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+                if let Some(parent) = real_path.parent() {
+                    real_path = parent.to_path_buf();
+                }
+            }
+            let expected_target = real_path.join("Library");
+            assert_eq!(target, expected_target);
+        }
+    } else {
+        panic!("Library path is not a resolved link");
+    }
+
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
+
