@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-mod handlers;
+pub(crate) mod handlers;
 mod operator_gate;
 pub mod request_dedup;
 
@@ -602,7 +602,7 @@ fn handle_session(
         };
 
         // #1339: single operator-mode authority gate. Covers every direct method
-        // AND the `mcp_tool` tunnel (all 36 tools) at the one ingress choke point.
+        // AND the `mcp_tool` tunnel (the full MCP tool surface) at the one ingress choke point.
         // Operator-surface calls (no `instance`) are never denied; Active is a
         // passthrough. A deny short-circuits before dispatch.
         let response = if let Err(denied) =

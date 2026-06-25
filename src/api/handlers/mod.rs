@@ -3,6 +3,7 @@
 //! Each handler takes `(params, ctx)` and returns a `Value` response.
 //! `HandlerCtx` bundles the session-scoped state that handlers need.
 
+pub(crate) mod agy_quota;
 pub(crate) mod external;
 pub(crate) mod hook_event;
 pub(crate) mod instance;

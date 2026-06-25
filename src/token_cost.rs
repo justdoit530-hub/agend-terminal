@@ -398,6 +398,7 @@ const CONTEXT_ESTIMATE_HORIZON: std::time::Duration = std::time::Duration::from_
 /// assistant message is always within the final few KB; a full read of a
 /// multi-MB transcript every refresh would be wasted IO.
 const CONTEXT_TAIL_BYTES: u64 = 256 * 1024;
+const AGY_FLASH_CONTEXT_WINDOW_TOKENS: f64 = 1_048_576.0;
 
 /// Estimate `instance`'s CURRENT context usage percent from its newest Claude
 /// transcript. Uses the LAST assistant message's usage (input + cache reads +
@@ -510,7 +511,10 @@ fn estimate_context_pct_in(projects_dir: &Path, roots: &[(String, Vec<PathBuf>)]
 }
 
 /// Codex-specific context estimator: injected sessions dir + roots.
-fn estimate_codex_context_pct_in(sessions_dir: &Path, roots: &[(String, Vec<PathBuf>)]) -> Option<f32> {
+fn estimate_codex_context_pct_in(
+    sessions_dir: &Path,
+    roots: &[(String, Vec<PathBuf>)],
+) -> Option<f32> {
     if roots.is_empty() {
         return None;
     }
@@ -536,7 +540,9 @@ fn estimate_codex_context_pct_in(sessions_dir: &Path, roots: &[(String, Vec<Path
         }
     }
     let (_, path) = newest?;
-    let content = std::fs::read_to_string(&path).ok()?;
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return None;
+    };
     let rows = parse_codex_rows(&content, roots, None);
     if rows.is_empty() {
         return None;
@@ -563,6 +569,46 @@ fn estimate_codex_context_pct_in(sessions_dir: &Path, roots: &[(String, Vec<Path
         return None;
     }
     Some(pct.clamp(0.0, 100.0) as f32)
+}
+
+/// Estimate Antigravity/Agy context from the local conversation SQLite store.
+///
+/// Antigravity stores per-conversation metadata under
+/// `~/.gemini/antigravity-cli/conversations/{conversationId}.db`; the newest
+/// `history.jsonl` row names the active conversation. The community-validated
+/// heuristic is 256 tokens per KiB of `gen_metadata.size`, against Gemini 2.5
+/// Flash's 1M-token context window. Any missing file/table/value reports
+/// honestly unknown (`None`).
+pub(crate) fn estimate_agy_context_pct_in(home: &Path) -> Option<f32> {
+    let root = home.join(".gemini").join("antigravity-cli");
+    let conversation_id = latest_agy_conversation_id(&root.join("history.jsonl"))?;
+    let db_path = root
+        .join("conversations")
+        .join(format!("{conversation_id}.db"));
+    let conn = rusqlite::Connection::open(db_path).ok()?;
+    let sum_bytes: Option<i64> = conn
+        .query_row("SELECT SUM(size) FROM gen_metadata", [], |row| row.get(0))
+        .ok()?;
+    let sum_bytes = sum_bytes?;
+    if sum_bytes <= 0 {
+        return None;
+    }
+    let tokens = (sum_bytes as f64 / 1024.0) * 256.0;
+    let pct = (tokens / AGY_FLASH_CONTEXT_WINDOW_TOKENS) * 100.0;
+    Some(pct.clamp(0.0, 100.0) as f32)
+}
+
+fn latest_agy_conversation_id(history_path: &Path) -> Option<String> {
+    let Ok(content) = std::fs::read_to_string(history_path) else {
+        return None;
+    };
+    content.lines().rev().find_map(|line| {
+        let v: Value = serde_json::from_str(line).ok()?;
+        v.get("conversationId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Cheap attribution probe: does one of the file's first lines carry a `cwd`
@@ -2130,11 +2176,60 @@ mod context_estimate_tests {
         std::fs::write(day.join("rollout-x.jsonl"), content).unwrap();
 
         let roots = roots_for("dev-codex", cwd);
-        let pct = estimate_codex_context_pct_in(&sessions, &roots)
-            .expect("estimate produced for codex");
+        let pct =
+            estimate_codex_context_pct_in(&sessions, &roots).expect("estimate produced for codex");
 
         // 2200 / 200,000 = 1.1%
         assert!((pct - 1.1).abs() < 0.1, "Codex estimate, got {pct}");
+    }
+
+    #[test]
+    fn estimate_agy_context_pct_reads_latest_history_sqlite() {
+        let home = tmp("agy-sqlite");
+        let root = home.join(".gemini").join("antigravity-cli");
+        let conversations = root.join("conversations");
+        std::fs::create_dir_all(&conversations).unwrap();
+        std::fs::write(
+            root.join("history.jsonl"),
+            [
+                r#"{"conversationId":"old"}"#,
+                r#"{"conversationId":"current"}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(conversations.join("current.db")).unwrap();
+        conn.execute("CREATE TABLE gen_metadata (size INTEGER)", [])
+            .unwrap();
+        conn.execute("INSERT INTO gen_metadata (size) VALUES (1024), (3072)", [])
+            .unwrap();
+
+        let pct = estimate_agy_context_pct_in(&home).expect("agy estimate produced");
+        // 4096 bytes = 4 KiB = 1024 estimated tokens; 1024 / 1_048_576 = 0.09765625%.
+        assert!((pct - 0.09765625).abs() < 0.0001, "Agy estimate, got {pct}");
+    }
+
+    #[test]
+    fn estimate_agy_context_pct_missing_or_empty_reports_unknown() {
+        let home = tmp("agy-empty");
+        assert!(estimate_agy_context_pct_in(&home).is_none());
+
+        let root = home.join(".gemini").join("antigravity-cli");
+        let conversations = root.join("conversations");
+        std::fs::create_dir_all(&conversations).unwrap();
+        std::fs::write(
+            root.join("history.jsonl"),
+            r#"{"conversationId":"current"}"#,
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(conversations.join("current.db")).unwrap();
+        conn.execute("CREATE TABLE gen_metadata (size INTEGER)", [])
+            .unwrap();
+        assert!(
+            estimate_agy_context_pct_in(&home).is_none(),
+            "empty SUM(size) must be unknown, not 0% confidence"
+        );
     }
 }
 

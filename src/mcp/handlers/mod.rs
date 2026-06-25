@@ -182,6 +182,7 @@ fn is_read_only_tool(tool: &str) -> bool {
             | "binding_state"
             | "gc_dry_run"
             | "tokens"
+            | "agy_quota"
             | "pane_snapshot"
             | "tui_screenshot"
     )

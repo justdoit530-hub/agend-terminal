@@ -7,10 +7,11 @@
 //!
 //! Signal: `StateTracker::resolved_context`.
 //! Per-backend honesty: Claude and Kiro currently render readable status/footer
-//! context percentages (`ContextProvider::StatusLine`). Codex, OpenCode, and
-//! Agy declare `ContextProvider::Unavailable`, yield `None`, and are NEVER
-//! injected from a guessed value — the fallback is "do nothing", documented,
-//! not "guess" (multi-backend principle).
+//! context percentages (`ContextProvider::StatusLine`). Codex and Agy use
+//! conservative transcript/SQLite estimates; OpenCode declares
+//! `ContextProvider::Unavailable`, yields `None`, and is NEVER injected from a
+//! guessed value — the fallback is "do nothing", documented, not "guess"
+//! (multi-backend principle).
 //!
 //! NOISE BUDGET (hard requirement, per operator) — the #2008 four
 //! principles apply:

@@ -35,6 +35,7 @@ const FAST_TOOLS: &[&str] = &[
     "set_display_name",
     "set_description",
     "health",
+    "agy_quota",
 ];
 
 /// Tools whose slowest action spawns a process / does network I/O (~60s).
@@ -103,6 +104,7 @@ fn is_side_effect_tool(tool: &str) -> bool {
             | "gc_dry_run"
             | "mode"
             | "tokens"
+            | "agy_quota"
             | "pane_snapshot"
             | "tui_screenshot"
             | "download_attachment"
@@ -236,7 +238,7 @@ fn handle_mcp_tool_inner(
 pub(crate) fn handle_mcp_tools_list(params: &Value, ctx: &HandlerCtx) -> Value {
     // #2344: subset off the typed `role_kind` (operator-declared), NOT the
     // free-text `role` description — the old exact-match against the prose role
-    // never hit, so every agent saw all 36 tools.
+    // never hit, so every agent saw the full tool surface.
     let inst = params
         .get("instance")
         .and_then(|v| v.as_str())
@@ -247,7 +249,7 @@ pub(crate) fn handle_mcp_tools_list(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(inst) => {
             // #2344 (r6 #2367 reject + lead nuance): distinguish a MISSING fleet.yaml
             // from a present-but-malformed one. The old `FleetConfig::load(..).ok()`
-            // collapsed BOTH to `None` → the full 36-tool surface, which let a typo'd
+            // collapsed BOTH to `None` → the full tool surface, which let a typo'd
             // `role_kind: supervisor` FAIL strict parse yet still advertise every tool
             // — the D2 strict-deny hole r6 found.
             let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
@@ -470,7 +472,7 @@ mod tests {
 
     /// #2344 e2e: `handle_mcp_tools_list` subsets the surface for a fleet instance
     /// whose `role_kind` is a read/report role — the live path the MCP bridge hits.
-    /// A reviewer sees fewer than the full 36 tools; no instance → all-open.
+    /// A reviewer sees fewer than the full tool surface; no instance → all-open.
     #[test]
     fn tools_list_subsets_for_role_kind_reviewer() {
         let dir =
@@ -527,7 +529,7 @@ mod tests {
 
     /// #2344 D2 STRICT on the live bridge path (r6 #2367 reject): a fleet.yaml that
     /// is PRESENT but malformed (e.g. an unknown `role_kind`) must FAIL CLOSED in
-    /// `handle_mcp_tools_list` — NOT silently fall back to the full 36-tool surface
+    /// `handle_mcp_tools_list` — NOT silently fall back to the full tool surface
     /// (the old `.ok()` swallowed the parse error). Returns `ok: false` + an
     /// explanatory error, no `result.tools`, and does not panic.
     #[test]

@@ -142,6 +142,11 @@ pub(crate) fn def_tokens() -> Value {
     }}})
 }
 
+pub(crate) fn def_agy_quota() -> Value {
+    json!({"name": "agy_quota", "description": "Query the local Antigravity language server for per-model subscription quota remainingFraction/resetTime. Detects the hub language_server process, reads its loopback port and CSRF token locally, and does not expose the token.",
+    "inputSchema": {"type": "object", "properties": {}}})
+}
+
 pub(crate) fn def_interrupt() -> Value {
     json!({"name": "interrupt", "description": "Send ESC byte to target agent's PTY to interrupt current LLM turn. Context preserved, agent accepts next prompt.",
         "inputSchema": {"type": "object", "properties": {
@@ -601,9 +606,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            37,
+            38,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
-             + ephemeral (#1967 Phase-1) = 37. Current tools: {:?}",
+             + ephemeral (#1967 Phase-1) = 37; + agy_quota = 38. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1081,6 +1086,7 @@ mod tests {
             "delete_instance",
             "start_instance",
             "tokens",
+            "agy_quota",
             "interrupt",
             "set_display_name",
             "set_description",

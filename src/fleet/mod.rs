@@ -1077,7 +1077,7 @@ instances:
 
     /// #2344 REGRESSION PIN: a free-text `role` description with NO `role_kind`
     /// stays ALL-OPEN (opt-in) — the original bug class. Prose like "Code reviewer"
-    /// never matched a subset key, so it must surface the full 36 tools; only an
+    /// never matched a subset key, so it must surface the full tool set; only an
     /// operator-declared typed `role_kind` narrows.
     #[test]
     fn prose_role_without_role_kind_stays_all_open() {

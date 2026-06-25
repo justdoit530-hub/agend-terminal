@@ -1503,9 +1503,16 @@ impl StateTracker {
                 return Some((pct, self.context_provider));
             }
         }
-        if let crate::backend_profile::ContextProvider::TranscriptEstimate { .. } = self.context_provider {
+        if let crate::backend_profile::ContextProvider::TranscriptEstimate { .. } =
+            self.context_provider
+        {
             if let Some(home_path) = home {
-                if let Some(pct) = crate::token_cost::estimate_context_pct(home_path, &self.instance_name) {
+                let estimate = if self.backend_name == "agy" {
+                    crate::token_cost::estimate_agy_context_pct_in(home_path)
+                } else {
+                    crate::token_cost::estimate_context_pct(home_path, &self.instance_name)
+                };
+                if let Some(pct) = estimate {
                     return Some((pct, self.context_provider));
                 }
             }

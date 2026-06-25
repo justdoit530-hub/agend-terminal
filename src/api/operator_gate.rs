@@ -1,7 +1,7 @@
 //! #1339: Operator-mode authority gate — the SINGLE API-ingress enforcement
 //! point. Called once in the dispatch path (`api::serve`), before any handler,
 //! so it covers every direct API method AND the `mcp_tool` tunnel (which
-//! carries all 36 MCP tools through one arm).
+//! carries the full MCP tool surface through one arm).
 //!
 //! ## Scope — this gate governs SOCKET-INGRESS principals only.
 //! It classifies the two principals that arrive over the API socket: the
@@ -68,7 +68,7 @@ pub(crate) fn classify(op: &str, action: Option<&str>) -> OpClass {
     use OpClass::*;
     match op {
         // ── Read-only + fleet-normal coordination: never gated ──
-        "list_instances" | "binding_state" | "tokens" | "pane_snapshot"
+        "list_instances" | "binding_state" | "tokens" | "agy_quota" | "pane_snapshot"
         | "tui_screenshot" | "gc_dry_run" | "health" | "download_attachment"
         | "inbox" | "send" | "task" | "reply" | "decision" | "set_waiting_on"
         | "interrupt" | "bind_self" | "set_description" | "set_display_name"

@@ -201,6 +201,9 @@ adapter!(
 );
 adapter!(dispatch_interrupt, ha, instance::handle_interrupt);
 adapter!(dispatch_tokens, ha, crate::token_cost::handle_tokens);
+pub(crate) fn dispatch_agy_quota(_ctx: &HandlerCtx<'_>) -> Value {
+    crate::api::handlers::agy_quota::handle_agy_quota()
+}
 adapter!(
     dispatch_delete_instance,
     ha,
@@ -627,10 +630,11 @@ mod tests {
                 "binding_state",
                 "gc_dry_run",
                 "tokens",
+                "agy_quota",
                 "mode",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 37);
+        assert_eq!(crate::mcp::registry::all().len(), 38);
     }
 
     #[test]
