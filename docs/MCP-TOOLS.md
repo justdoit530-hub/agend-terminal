@@ -94,7 +94,8 @@ Replace an instance with a fresh one.
 ### `restart_instance`
 Kill and restart an instance. Default mode `resume` preserves conversation state; `fresh` starts clean (like `replace_instance`).
 - **instance**: instance to restart
-- mode (resume / fresh), reason
+- mode (resume / fresh), reason, force
+- `fresh` refuses by default if the bound worktree has uncommitted changes (#2476); commit/push or leave a task-board handoff first, or pass `force: true`.
 
 ### `list_instances`
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.

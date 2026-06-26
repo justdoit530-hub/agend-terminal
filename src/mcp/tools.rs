@@ -132,7 +132,8 @@ pub(crate) fn def_restart_instance() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to restart"},
             "mode": {"type": "string", "enum": ["resume", "fresh"], "default": "resume", "description": "resume = keep conversation (--continue/--resume); fresh = clean start"},
-            "reason": {"type": "string"}
+            "reason": {"type": "string"},
+            "force": {"type": "boolean", "description": "#2476: allow a `fresh` restart even when the bound worktree has uncommitted changes (default false refuses, to avoid stranding un-pushed groundwork)."}
         }, "required": ["instance"]}})
 }
 
@@ -1019,6 +1020,11 @@ mod tests {
             ("restart_instance", "instance", "mcp/handlers/instance.rs restart target"),
             ("restart_instance", "mode", "mcp/handlers/instance.rs restart_spawn_params --continue/--resume"),
             ("restart_instance", "reason", "mcp/handlers/instance.rs restart event"),
+            (
+                "restart_instance",
+                "force",
+                "instance_state/mod.rs fresh-restart uncommitted-work guard bypass (#2476)",
+            ),
             // ── watchdog / config / mode ──
             ("watchdog", "action", "mcp/handlers/dispatch.rs snooze/resume/status/ack"),
             ("watchdog", "duration", "mcp/handlers/dispatch.rs parse_duration_secs (snooze)"),
