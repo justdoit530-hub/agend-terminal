@@ -82,8 +82,12 @@ pub(crate) fn def_inbox() -> Value {
 }
 
 pub(crate) fn def_list_instances() -> Value {
-    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance.",
-        "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"}}}})
+    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
+    "inputSchema": {"type": "object", "properties": {
+        "instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"},
+        "verbose": {"type": "boolean", "description": "#2475: include the per-instance `observed_status.evidence` trail (omitted by default to keep routine polls small)."},
+        "include_evidence": {"type": "boolean", "description": "#2475: alias of `verbose` for this tool — include the `observed_status.evidence` trail."}
+    }}})
 }
 
 pub(crate) fn def_create_instance() -> Value {
@@ -128,7 +132,8 @@ pub(crate) fn def_restart_instance() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to restart"},
             "mode": {"type": "string", "enum": ["resume", "fresh"], "default": "resume", "description": "resume = keep conversation (--continue/--resume); fresh = clean start"},
-            "reason": {"type": "string"}
+            "reason": {"type": "string"},
+            "force": {"type": "boolean", "description": "#2476: allow a `fresh` restart even when the bound worktree has uncommitted changes (default false refuses, to avoid stranding un-pushed groundwork)."}
         }, "required": ["instance"]}})
 }
 
@@ -176,10 +181,12 @@ pub(crate) fn def_move_pane() -> Value {
 }
 
 pub(crate) fn def_pane_snapshot() -> Value {
-    json!({"name": "pane_snapshot", "description": "Read visible text from a target instance's PTY scrollback. Returns plain text (ANSI stripped). Default 100 lines, max 10000.",
+    json!({"name": "pane_snapshot", "description": "Read visible text from a target instance's PTY scrollback. Returns plain text (ANSI stripped). Default 100 lines, max 10000. #2478: pass to_file=true for diagnostic captures — full text is written under $AGEND_HOME/captures/ and the tool returns only a compact summary + path.",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to snapshot"},
-            "lines": {"type": "integer", "description": "Number of lines to return (default 100, max 10000)"}
+            "lines": {"type": "integer", "description": "Number of lines to return/capture (default 100, max 10000)"},
+            "to_file": {"type": "boolean", "description": "#2478: write the full snapshot to $AGEND_HOME/captures/ and return only a summary + file path, keeping the dump out of context."},
+            "head": {"type": "integer", "description": "#2478 to_file summary: number of leading lines to include in the returned preview (default 40)."}
         }, "required": ["instance"]}})
 }
 
@@ -216,6 +223,7 @@ pub(crate) fn def_task() -> Value {
             "status": {"type": "string", "enum": ["backlog", "open", "claimed", "in_progress", "in_review", "blocked", "verified", "done", "cancelled"]},
             "filter_assignee": {"type": "string", "description": "list: filter by assignee (alias: assignee)."}, "filter_status": {"type": "string", "description": "list: filter by status (alias: status)."}, "filter_tag": {"type": "string", "description": "Filter by tag (alias: tag)"}, "tag": {"type": "string", "description": "Alias of filter_tag (#2037)."}, "tags": {"type": "array", "items": {"type": "string"}, "description": "Task tags (for create/update)"},
             "include_history": {"type": "boolean", "description": "#806: opt in to done/cancelled in `list` response (default trims to actionable)."},
+            "verbose": {"type": "boolean", "description": "#2475 list: default is TERSE — `description`/`result` are length-capped (~200 chars) to keep routine list calls small. Set true for the full text (or fetch a single task's detail). Response carries `terse: true` when capping fired."},
             "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
             "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
             "branch": {"type": "string", "description": "Git branch the implementer should work on"},
@@ -877,6 +885,7 @@ mod tests {
             ("task", "filter_tag", "tasks/handler.rs list filter"),
             ("task", "tags", "tasks/handler.rs create/update"),
             ("task", "include_history", "tasks/handler.rs list opt-in"),
+            ("task", "verbose", "tasks/handler.rs list full-text opt-in (#2475)"),
             ("task", "limit", "tasks/handler.rs list cap"),
             ("task", "due_at", "tasks/handler.rs create deadline"),
             ("task", "branch", "tasks/handler.rs create event"),
@@ -1011,6 +1020,11 @@ mod tests {
             ("restart_instance", "instance", "mcp/handlers/instance.rs restart target"),
             ("restart_instance", "mode", "mcp/handlers/instance.rs restart_spawn_params --continue/--resume"),
             ("restart_instance", "reason", "mcp/handlers/instance.rs restart event"),
+            (
+                "restart_instance",
+                "force",
+                "instance_state/mod.rs fresh-restart uncommitted-work guard bypass (#2476)",
+            ),
             // ── watchdog / config / mode ──
             ("watchdog", "action", "mcp/handlers/dispatch.rs snooze/resume/status/ack"),
             ("watchdog", "duration", "mcp/handlers/dispatch.rs parse_duration_secs (snooze)"),
