@@ -96,6 +96,7 @@ maintained in English only.
 - [MCP↔Daemon Proxy Contract](MCP-DAEMON-PROXY-CONTRACT.md) — the bridge protocol
 - [Skill System Architecture](skill-system-architecture.md) — how skills are resolved per backend
 - [Project Feature Groups](project-feature-groups.md) — feature-to-module mapping
+- [Chat Platform API Reference](chat-platform-api-reference.md) — per-platform integration notes for writing `src/channel/` adapters
 - [Loop Engineering Mapping](loop-engineering-mapping.md) — supervisor loop responsibilities
 - [F685 Fixture Corpus](F685-FIXTURE-CORPUS.md) — state-replay fixture corpus
 - [F9 Productive-Output Gate](F9-PRODUCTIVE-OUTPUT-GATE.md) — the productive-output gate design
@@ -112,6 +113,7 @@ maintained in English only.
 - [Process: LOC Estimation Methodology](PROCESS-LOC-ESTIMATION-METHODOLOGY.md)
 - [Process: systemd / loginctl Operator Hardening](PROCESS-SYSTEMD-LOGINCTL-OPERATOR-HARDENING.md)
 - [Process: Tier-2 Dual-Review Lessons Learned](PROCESS-TIER2-DUAL-REVIEW-LESSONS-LEARNED.md)
+- [Operator PTY-Capture Queue](operator-capture-queue.md) — operator runbook for recording real-backend `.raw` fixtures
 - [Refactor Plan](REFACTOR-PLAN.md) — the active architecture-pass plan
 </details>
 

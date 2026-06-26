@@ -94,6 +94,7 @@
 - [MCP↔Daemon Proxy Contract](MCP-DAEMON-PROXY-CONTRACT.md) — bridge 協定
 - [Skill System Architecture](skill-system-architecture.md) — skill 如何依 backend 解析
 - [Project Feature Groups](project-feature-groups.md) — 功能對模組的對應
+- [Chat Platform API Reference](chat-platform-api-reference.md) — 各平台接入註記，供撰寫 `src/channel/` adapter 參考
 - [Loop Engineering Mapping](loop-engineering-mapping.md) — supervisor loop 職責
 - [F685 Fixture Corpus](F685-FIXTURE-CORPUS.md) — state-replay fixture 語料庫
 - [F9 Productive-Output Gate](F9-PRODUCTIVE-OUTPUT-GATE.md) — productive-output gate 設計
@@ -110,6 +111,7 @@
 - [Process: LOC Estimation Methodology](PROCESS-LOC-ESTIMATION-METHODOLOGY.md)
 - [Process: systemd / loginctl Operator Hardening](PROCESS-SYSTEMD-LOGINCTL-OPERATOR-HARDENING.md)
 - [Process: Tier-2 Dual-Review Lessons Learned](PROCESS-TIER2-DUAL-REVIEW-LESSONS-LEARNED.md)
+- [Operator PTY-Capture Queue](operator-capture-queue.md) — operator 錄製真 backend `.raw` fixture 的 runbook
 - [Refactor Plan](REFACTOR-PLAN.md) — 進行中的架構整理計畫
 </details>
 

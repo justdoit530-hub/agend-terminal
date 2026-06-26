@@ -100,6 +100,36 @@ graph LR
 > Gemini CLI was retired in [#1580](https://github.com/suzuke/agend-terminal/issues/1580) (it sunsets 2026-06-18 for free/Pro/Ultra tiers). Antigravity CLI (`agy`) is its official successor and a **supported** Fleet MCP backend ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)). A `gemini` backend in fleet.yaml now spawns as a generic `Raw` backend.
 > agy refuses any workspace whose path has a dot-prefixed (hidden) ancestor, so daemon agents under `~/.agend-terminal` were invisible to it. The daemon now creates a non-hidden link (`<base>/<instance>` → the hidden real workspace) and spawns agy with `$PWD` pointed at that link, clearing agy's hidden-path guard while the real files stay under `$AGEND_HOME`. `configure_agy` writes the project-scoped `.agents/mcp_config.json` + `.agents/AGENTS.md` (agy's official Customization Roots), so `agy` loads the fleet `send`/`inbox`/`task` tools like every other backend.
 
+## Feature stability
+
+Everything is **pre-alpha** (see the banner up top) — this table is *relative*
+maturity to set expectations, not a production-readiness guarantee. Tiers can
+change between minor versions.
+
+| Tier | Meaning |
+|---|---|
+| Beta | Heavily exercised, broad test coverage; behavior mostly settled |
+| Experimental | Works but young or narrowly exercised; expect rough edges + changes |
+| Opt-in | Off by default; enable via a Cargo feature or env flag |
+
+| Area | Tier | Notes |
+|---|---|---|
+| Fleet orchestration (`fleet.yaml`, PTY spawn, supervision, auto-respawn) | Beta | Core path; extensive tests |
+| Git worktree isolation | Beta | Per-agent worktree lease / release / GC |
+| MCP coordination tools (37) | Beta | `send` / `inbox` / `task` / … |
+| Task board | Beta | Append-only event log (schema v2) |
+| Telegram channel | Beta | The only fully-implemented channel |
+| Claude Code / Codex / Kiro / OpenCode backends | Beta | Tested |
+| Antigravity CLI (`agy`) backend | Experimental | Newer ([#1547](https://github.com/suzuke/agend-terminal/issues/1547)); workspace-link shim |
+| Shadow Observer state plane | Experimental | Additive, observe-only ([#2413](https://github.com/suzuke/agend-terminal/issues/2413)); kill-switch `AGEND_SHADOW_OBSERVER=0` |
+| CI watch + PR auto-close sweep | Experimental | GitHub / GitLab / Bitbucket pollers |
+| Ephemeral cross-backend workers | Experimental · opt-in | `ephemeral` tool; real backend gated by `AGEND_EPHEMERAL_REAL_BACKEND` |
+| Discord channel | Experimental · opt-in | `--features discord` |
+| Menu-bar tray | Experimental · opt-in | `--features tray` |
+
+Kill-switches and feature flags are documented in [env vars](docs/env-vars.md)
+and [configuration](docs/FEATURE-configuration.md).
+
 ## Documentation
 
 **Start here:**

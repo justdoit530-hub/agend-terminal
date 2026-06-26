@@ -97,6 +97,33 @@ graph LR
 > Gemini CLI 已於 [#1580](https://github.com/suzuke/agend-terminal/issues/1580) 退役（2026-06-18 起對免費／Pro／Ultra 方案停止服務）。其官方後繼者 Antigravity CLI（`agy`）已是受支援的 Fleet MCP backend（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）。`fleet.yaml` 內若仍指定 `gemini`，現在會以泛用的 `Raw` backend 啟動。
 > `agy` 會拒絕任何路徑帶有 dot 前綴（隱藏）祖先目錄的 workspace，因此 `~/.agend-terminal` 底下的 daemon agent 原本對它是不可見的。daemon 現在會建立一個非隱藏的連結（`<base>/<instance>` → 真正的隱藏 workspace），並把 agy 的 `$PWD` 指向該連結，藉此通過 agy 的隱藏路徑檢查，而真實檔案仍留在 `$AGEND_HOME` 底下。`configure_agy` 會寫入 project-scoped 的 `.agents/mcp_config.json` + `.agents/AGENTS.md`（agy 官方的 Customization Roots），讓 `agy` 像其他 backend 一樣載入 fleet 的 `send`／`inbox`／`task` 工具。
 
+## 功能穩定度
+
+整個專案仍是 **pre-alpha**（見頂部標示）——下表是*相對*成熟度，用來設定預期，並非 production-ready 保證。等級可能在小版本間變動。
+
+| 等級 | 意義 |
+|---|---|
+| Beta | 大量使用、測試覆蓋廣；行為大致穩定 |
+| Experimental | 可用但年輕或使用面窄；預期會有粗糙處與變動 |
+| Opt-in | 預設關閉；需以 Cargo feature 或環境變數開啟 |
+
+| 範圍 | 等級 | 備註 |
+|---|---|---|
+| Fleet 統籌（`fleet.yaml`、PTY 啟動、監督、自動重啟） | Beta | 核心路徑；測試充分 |
+| Git worktree 隔離 | Beta | per-agent worktree lease／release／GC |
+| MCP 協調工具（37 個） | Beta | `send`／`inbox`／`task`／… |
+| 任務看板 | Beta | append-only event log（schema v2） |
+| Telegram channel | Beta | 唯一完整實作的 channel |
+| Claude Code／Codex／Kiro／OpenCode backend | Beta | 已測試 |
+| Antigravity CLI（`agy`）backend | Experimental | 較新（[#1547](https://github.com/suzuke/agend-terminal/issues/1547)）；workspace-link shim |
+| Shadow Observer 狀態層 | Experimental | 附加、唯讀觀測（[#2413](https://github.com/suzuke/agend-terminal/issues/2413)）；kill-switch `AGEND_SHADOW_OBSERVER=0` |
+| CI 監看 + PR 自動關閉 sweep | Experimental | GitHub／GitLab／Bitbucket poller |
+| 跨 backend ephemeral worker | Experimental · opt-in | `ephemeral` 工具；真 backend 由 `AGEND_EPHEMERAL_REAL_BACKEND` 把關 |
+| Discord channel | Experimental · opt-in | `--features discord` |
+| 選單列 tray | Experimental · opt-in | `--features tray` |
+
+Kill-switch 與 feature flag 詳見 [環境變數](docs/env-vars.zh-TW.md) 與 [設定](docs/FEATURE-configuration.zh-TW.md)。
+
 ## 文件
 
 **從這裡開始：**
