@@ -20,8 +20,12 @@ pub struct Rule {
     pub agent_name: String,
     pub category: String,
     pub rule_text: String,
+    #[serde(default)]
+    pub trigger_count: usize,
     pub created_at: String,
 }
+
+const MEM0_SYNC_URL: &str = "http://localhost:5174/add";
 
 /// Classify a mistake using regex matching on the rejection text and parent message.
 pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Option<&'static str> {
@@ -157,50 +161,120 @@ pub fn record_mistake(
 
     // Solidify rule if threshold reached
     if count >= 3 {
-        let rules_dir = home.join("rules");
-        if let Err(e) = fs::create_dir_all(&rules_dir) {
-            tracing::warn!(?e, "failed to create rules directory");
-            return None;
-        }
-
-        let rule_id = format!("rule_{}_{}", real_agent_name, category);
-        let rule_text = get_rule_text(category);
-        let rule = Rule {
-            id: rule_id.clone(),
-            agent_name: real_agent_name.clone(),
-            category: category.to_string(),
-            rule_text: rule_text.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-
-        let rule_path = rules_dir.join(format!("{}.json", rule_id));
-        if let Ok(serialized) = serde_json::to_string_pretty(&rule) {
-            if let Err(e) = fs::write(&rule_path, serialized) {
-                tracing::warn!(?e, ?rule_path, "failed to write rule file");
-            }
-        }
-
-        // Inject rule into agent's .agents/AGENTS.md
-        if let Some(binding) = crate::binding::read(home, &real_agent_name) {
-            if let Some(worktree_path) = binding["worktree"].as_str() {
-                let agents_md_path = Path::new(worktree_path).join(".agents").join("AGENTS.md");
-                if let Err(e) = inject_rule_to_agents_md(&agents_md_path, category, rule_text) {
-                    tracing::warn!(?e, ?agents_md_path, "failed to inject rule to AGENTS.md");
-                } else {
-                    tracing::info!(
-                        ?agents_md_path,
-                        category,
-                        "solidified rule injected to AGENTS.md"
-                    );
-                }
-            }
-        }
-
-        return Some(rule_id);
+        return solidify_rule(home, &real_agent_name, category, count);
     }
 
     None
 }
+
+/// Persist a rule after repeated mistakes, inject it into AGENTS.md, and sync it to Mem0.
+pub fn solidify_rule(
+    home: &Path,
+    agent_name: &str,
+    category: &str,
+    trigger_count: usize,
+) -> Option<String> {
+    let rules_dir = home.join("rules");
+    if let Err(e) = fs::create_dir_all(&rules_dir) {
+        tracing::warn!(?e, "failed to create rules directory");
+        return None;
+    }
+
+    let rule_id = format!("rule_{}_{}", agent_name, category);
+    let rule_text = get_rule_text(category);
+    let rule = Rule {
+        id: rule_id.clone(),
+        agent_name: agent_name.to_string(),
+        category: category.to_string(),
+        rule_text: rule_text.to_string(),
+        trigger_count,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let rule_path = rules_dir.join(format!("{}.json", rule_id));
+    if let Ok(serialized) = serde_json::to_string_pretty(&rule) {
+        if let Err(e) = fs::write(&rule_path, serialized) {
+            tracing::warn!(?e, ?rule_path, "failed to write rule file");
+        }
+    }
+
+    // Inject rule into agent's .agents/AGENTS.md
+    if let Some(binding) = crate::binding::read(home, agent_name) {
+        if let Some(worktree_path) = binding["worktree"].as_str() {
+            let agents_md_path = Path::new(worktree_path).join(".agents").join("AGENTS.md");
+            if let Err(e) = inject_rule_to_agents_md(&agents_md_path, category, rule_text) {
+                tracing::warn!(?e, ?agents_md_path, "failed to inject rule to AGENTS.md");
+            } else {
+                tracing::info!(
+                    ?agents_md_path,
+                    category,
+                    "solidified rule injected to AGENTS.md"
+                );
+            }
+        }
+    }
+
+    spawn_mem0_sync(&rule);
+    Some(rule_id)
+}
+
+fn spawn_mem0_sync(rule: &Rule) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        tracing::warn!("Mem0 sync skipped: no Tokio runtime available");
+        return;
+    }
+
+    let rule_text = rule.rule_text.clone();
+    let agent_name = rule.agent_name.clone();
+    let category = rule.category.clone();
+    let count = rule.trigger_count;
+    let url = mem0_sync_url();
+    // fire-and-forget: sync rule to Mem0, non-critical
+    tokio::spawn(async move {
+        let body = mem0_sync_body(&agent_name, &rule_text, &category, count);
+        if let Err(e) = reqwest::Client::new()
+            .post(url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            tracing::warn!("Mem0 sync failed (non-fatal): {}", e);
+        }
+    });
+}
+
+fn mem0_sync_body(
+    agent_name: &str,
+    rule_text: &str,
+    category: &str,
+    trigger_count: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "content": format!(
+            "Agent {} 的規則：{}（來源：Reflexion Loop，分類：{}，觸發次數：{}）",
+            agent_name, rule_text, category, trigger_count
+        ),
+        "user_id": "reflexion"
+    })
+}
+
+#[cfg(not(test))]
+fn mem0_sync_url() -> String {
+    MEM0_SYNC_URL.to_string()
+}
+
+#[cfg(test)]
+fn mem0_sync_url() -> String {
+    MEM0_SYNC_URL_OVERRIDE
+        .lock()
+        .expect("mem0 sync url override mutex poisoned")
+        .clone()
+        .unwrap_or_else(|| MEM0_SYNC_URL.to_string())
+}
+
+#[cfg(test)]
+static MEM0_SYNC_URL_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Inject the solidified rule into the target AGENTS.md file inside the marker block.
 pub fn inject_rule_to_agents_md(
@@ -435,6 +509,7 @@ mod tests {
             rule.rule_text,
             "NEVER report VERIFIED without running cargo test"
         );
+        assert_eq!(rule.trigger_count, 3);
 
         let agents_md_path = worktree_dir.join(".agents").join("AGENTS.md");
         assert!(agents_md_path.exists());
@@ -444,6 +519,81 @@ mod tests {
         assert!(agents_md_content.contains("NEVER report VERIFIED without running cargo test"));
         assert!(agents_md_content.contains("<!-- agend-rules:end -->"));
 
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn test_solidify_triggers_mem0_sync() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test listener");
+        let addr = listener.local_addr().expect("failed to read listener addr");
+        {
+            let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                .lock()
+                .expect("mem0 sync url override mutex poisoned");
+            *override_url = Some(format!("http://{addr}/add"));
+        }
+
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("failed to accept request");
+            let mut buf = vec![0_u8; 8192];
+            let mut total = 0;
+            loop {
+                let n = socket
+                    .read(&mut buf[total..])
+                    .await
+                    .expect("failed to read request");
+                assert_ne!(n, 0, "connection closed before request body arrived");
+                total += n;
+
+                let request = String::from_utf8_lossy(&buf[..total]);
+                if let Some(header_end) = request.find("\r\n\r\n") {
+                    let content_length = request
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length: ")
+                                .or_else(|| line.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .expect("request should include content-length");
+                    if total >= header_end + 4 + content_length {
+                        socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .expect("failed to write response");
+                        return String::from_utf8_lossy(&buf[..total]).to_string();
+                    }
+                }
+            }
+        });
+
+        let home = tmp_home("mem0_sync_test");
+        let rule_id = solidify_rule(&home, "test-agent", "lint_failure", 4)
+            .expect("expected rule to solidify");
+        assert_eq!(rule_id, "rule_test-agent_lint_failure");
+
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("timed out waiting for Mem0 sync request")
+            .expect("request task failed");
+
+        assert!(request.starts_with("POST /add HTTP/1.1"));
+        assert!(request.contains("\"user_id\":\"reflexion\""));
+        assert!(request.contains("Agent test-agent"));
+        assert!(request.contains("NEVER submit code with clippy warnings or lint failures"));
+        assert!(request.contains("Reflexion Loop"));
+        assert!(request.contains("lint_failure"));
+        assert!(request.contains("4"));
+
+        {
+            let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                .lock()
+                .expect("mem0 sync url override mutex poisoned");
+            *override_url = None;
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 }
