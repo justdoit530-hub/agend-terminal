@@ -35,28 +35,32 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
         }
     }
     // Fallback regex matching for test run missing in the rejection text
-    let test_re = regex::Regex::new(r"(?i)(cargo test|test suite|unit test)").unwrap();
-    let missing_re = regex::Regex::new(r"(?i)(missing|omit|forgot|no |not run|failed to)").unwrap();
+    static TEST_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static MISSING_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BRANCH_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static LINT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+    let test_re = TEST_RE.get_or_init(|| regex::Regex::new(r"(?i)(cargo test|test suite|unit test)").expect("valid test regex"));
+    let missing_re = MISSING_RE.get_or_init(|| regex::Regex::new(r"(?i)(missing|omit|forgot|no |not run|failed to)").expect("valid missing regex"));
     if test_re.is_match(rejection_text) && missing_re.is_match(rejection_text) {
         return Some("missing_test_execution");
     }
 
     // 2. wrong_branch_target
     // PR base is suzuke/agend-terminal upstream instead of fork
-    let branch_re = regex::Regex::new(r"(?i)(suzuke/agend-terminal|upstream|base branch|suzuke)").unwrap();
+    let branch_re = BRANCH_RE.get_or_init(|| regex::Regex::new(r"(?i)(suzuke/agend-terminal|upstream|base branch|suzuke)").expect("valid branch regex"));
     if branch_re.is_match(rejection_text) {
         return Some("wrong_branch_target");
     }
 
     // 3. lint_failure
     // Rejection reason contains clippy/lint warnings
-    let lint_re = regex::Regex::new(r"(?i)(clippy|lint|warnings|cargo clippy)").unwrap();
+    let lint_re = LINT_RE.get_or_init(|| regex::Regex::new(r"(?i)(clippy|lint|warnings|cargo clippy)").expect("valid lint regex"));
     if lint_re.is_match(rejection_text) {
         return Some("lint_failure");
     }
 
-    None
-}
+    None}
 
 /// Retrieve the rule text for a given category.
 pub fn get_rule_text(category: &str) -> &'static str {
