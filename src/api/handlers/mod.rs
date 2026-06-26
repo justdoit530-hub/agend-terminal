@@ -3,6 +3,7 @@
 //! Each handler takes `(params, ctx)` and returns a `Value` response.
 //! `HandlerCtx` bundles the session-scoped state that handlers need.
 
+pub(crate) mod agy_quota;
 pub(crate) mod external;
 pub(crate) mod hook_event;
 pub(crate) mod instance;
@@ -11,7 +12,6 @@ pub(crate) mod messaging;
 pub(crate) mod query;
 pub(crate) mod team;
 pub(crate) mod verify_push;
-pub(crate) mod agy_quota;
 
 use crate::agent::{AgentRegistry, ExternalRegistry};
 use crate::api::{ApiNotifier, ConfigRegistry};

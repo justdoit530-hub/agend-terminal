@@ -3515,13 +3515,18 @@ impl crate::channel::Channel for ShadowTestChannel {
         "telegram"
     }
     fn caps(&self) -> &crate::channel::ChannelCapabilities {
-        static CAPS: std::sync::OnceLock<crate::channel::ChannelCapabilities> = std::sync::OnceLock::new();
+        static CAPS: std::sync::OnceLock<crate::channel::ChannelCapabilities> =
+            std::sync::OnceLock::new();
         CAPS.get_or_init(crate::channel::ChannelCapabilities::default)
     }
     fn poll_event(&self) -> Option<crate::channel::ChannelEvent> {
         None
     }
-    fn send(&self, _: &crate::channel::BindingRef, _: crate::channel::OutMsg) -> anyhow::Result<crate::channel::MsgRef> {
+    fn send(
+        &self,
+        _: &crate::channel::BindingRef,
+        _: crate::channel::OutMsg,
+    ) -> anyhow::Result<crate::channel::MsgRef> {
         anyhow::bail!("unused")
     }
     fn edit(&self, _: &crate::channel::MsgRef, _: crate::channel::OutMsg) -> anyhow::Result<()> {
@@ -3530,7 +3535,11 @@ impl crate::channel::Channel for ShadowTestChannel {
     fn delete(&self, _: &crate::channel::MsgRef) -> anyhow::Result<()> {
         Ok(())
     }
-    fn create_binding(&self, _: &str, _: crate::channel::BindingOpts) -> anyhow::Result<crate::channel::BindingRef> {
+    fn create_binding(
+        &self,
+        _: &str,
+        _: crate::channel::BindingOpts,
+    ) -> anyhow::Result<crate::channel::BindingRef> {
         anyhow::bail!("unused")
     }
     fn remove_binding(&self, _: &crate::channel::BindingRef) -> anyhow::Result<()> {
@@ -3544,13 +3553,28 @@ impl crate::channel::Channel for ShadowTestChannel {
         None
     }
     fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
-    fn create_topic(&self, _: &str) -> Result<crate::channel::TopicRef, crate::channel::ChannelError> {
-        Err(crate::channel::ChannelError::NotSupported("create_topic".into()))
+    fn create_topic(
+        &self,
+        _: &str,
+    ) -> Result<crate::channel::TopicRef, crate::channel::ChannelError> {
+        Err(crate::channel::ChannelError::NotSupported(
+            "create_topic".into(),
+        ))
     }
-    fn notify(&self, _: &str, _: crate::channel::NotifySeverity, _: &str, _: bool) -> Result<(), crate::channel::ChannelError> {
+    fn notify(
+        &self,
+        _: &str,
+        _: crate::channel::NotifySeverity,
+        _: &str,
+        _: bool,
+    ) -> Result<(), crate::channel::ChannelError> {
         Err(crate::channel::ChannelError::NotSupported("notify".into()))
     }
-    fn send_from_agent(&self, _: &str, _: crate::channel::AgentOutboundOp) -> Result<crate::channel::MsgRef, crate::channel::ChannelError> {
+    fn send_from_agent(
+        &self,
+        _: &str,
+        _: crate::channel::AgentOutboundOp,
+    ) -> Result<crate::channel::MsgRef, crate::channel::ChannelError> {
         Ok(crate::channel::MsgRef {
             binding: crate::channel::BindingRef::new("telegram", None, ()),
             id: "msg-123".into(),

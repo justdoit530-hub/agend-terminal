@@ -9,13 +9,16 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     // `message` with a clear named error, so a mis-named param no longer
     // silently becomes an empty reply.
     let text = args["message"].as_str().unwrap_or("").to_string();
-    let buttons: Option<Vec<Vec<crate::channel::ButtonDef>>> = if let Some(v) = args.get("buttons") {
+    let buttons: Option<Vec<Vec<crate::channel::ButtonDef>>> = if let Some(v) = args.get("buttons")
+    {
         if v.is_null() {
             None
         } else {
             match serde_json::from_value(v.clone()) {
                 Ok(b) => Some(b),
-                Err(e) => return json!({"error": format!("invalid 'buttons' format: {e}"), "code": "invalid_arguments"}),
+                Err(e) => {
+                    return json!({"error": format!("invalid 'buttons' format: {e}"), "code": "invalid_arguments"})
+                }
             }
         }
     } else {

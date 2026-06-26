@@ -466,7 +466,9 @@ pub(crate) fn estimate_agy_context_pct_in(home: &Path) -> Option<f32> {
         }
     }
     let conversation_id = conversation_id?;
-    let db_path = dir.join("conversations").join(format!("{}.db", conversation_id));
+    let db_path = dir
+        .join("conversations")
+        .join(format!("{}.db", conversation_id));
     if !db_path.exists() {
         return None;
     }
@@ -474,13 +476,12 @@ pub(crate) fn estimate_agy_context_pct_in(home: &Path) -> Option<f32> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    ).ok()?;
+    )
+    .ok()?;
 
-    let sum_bytes: Option<i64> = conn.query_row(
-        "SELECT SUM(size) FROM gen_metadata",
-        [],
-        |row| row.get(0)
-    ).ok()?;
+    let sum_bytes: Option<i64> = conn
+        .query_row("SELECT SUM(size) FROM gen_metadata", [], |row| row.get(0))
+        .ok()?;
 
     let sum_bytes = sum_bytes.unwrap_or(0) as f32;
     let tokens = (sum_bytes / 1024.0) * 256.0;
@@ -636,7 +637,10 @@ fn estimate_context_pct_in(projects_dir: &Path, roots: &[(String, Vec<PathBuf>)]
 }
 
 /// Codex-specific context estimator: injected sessions dir + roots.
-fn estimate_codex_context_pct_in(sessions_dir: &Path, roots: &[(String, Vec<PathBuf>)]) -> Option<f32> {
+fn estimate_codex_context_pct_in(
+    sessions_dir: &Path,
+    roots: &[(String, Vec<PathBuf>)],
+) -> Option<f32> {
     if roots.is_empty() {
         return None;
     }
@@ -2252,15 +2256,15 @@ mod context_estimate_tests {
         let cwd = "/virtual/workspace/dev-codex";
         let content = [
             format!(r#"{{"timestamp":"2026-06-24T00:10:18.000Z","type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#),
-            format!(r#"{{"timestamp":"2026-06-24T00:10:19.000Z","type":"turn_context","payload":{{"model":"gpt-5-codex"}}}}"#),
+            r#"{"timestamp":"2026-06-24T00:10:19.000Z","type":"turn_context","payload":{"model":"gpt-5-codex"}}"#.to_string(),
             r#"{"timestamp":"2026-06-24T00:10:22.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
             r#"{"timestamp":"2026-06-24T00:10:29.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000,"cached_input_tokens":800,"output_tokens":200,"reasoning_output_tokens":60,"total_tokens":2200},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100,"reasoning_output_tokens":30,"total_tokens":1100}}}}"#.to_string(),
         ].join("\n");
         std::fs::write(day.join("rollout-x.jsonl"), content).unwrap();
 
         let roots = roots_for("dev-codex", cwd);
-        let pct = estimate_codex_context_pct_in(&sessions, &roots)
-            .expect("estimate produced for codex");
+        let pct =
+            estimate_codex_context_pct_in(&sessions, &roots).expect("estimate produced for codex");
 
         // 2200 / 200,000 = 1.1%
         assert!((pct - 1.1).abs() < 0.1, "Codex estimate, got {pct}");
@@ -2285,12 +2289,16 @@ mod context_estimate_tests {
         conn.execute(
             "INSERT INTO gen_metadata (idx, size) VALUES (1, 102400)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         let pct = estimate_agy_context_pct_in(&home).expect("agy estimate succeeded");
         let expected = 25600.0 / 1_048_576.0;
-        assert!((pct - expected).abs() < 1e-5, "Agy estimate: got {pct}, expected {expected}");
+        assert!(
+            (pct - expected).abs() < 1e-5,
+            "Agy estimate: got {pct}, expected {expected}"
+        );
     }
 
     #[test]
@@ -2316,13 +2324,18 @@ mod context_estimate_tests {
         conn.execute(
             "INSERT INTO gen_metadata (idx, size) VALUES (1, 102400)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         // Call it with the sub-directory (home)
-        let pct = estimate_agy_context_pct_in(&home).expect("agy estimate succeeded via parent fallback");
+        let pct =
+            estimate_agy_context_pct_in(&home).expect("agy estimate succeeded via parent fallback");
         let expected = 25600.0 / 1_048_576.0;
-        assert!((pct - expected).abs() < 1e-5, "Agy estimate: got {pct}, expected {expected}");
+        assert!(
+            (pct - expected).abs() < 1e-5,
+            "Agy estimate: got {pct}, expected {expected}"
+        );
     }
 
     #[test]
@@ -2349,10 +2362,11 @@ mod context_estimate_tests {
         std::fs::write(session1_dir.join("summary.json"), summary1.to_string()).unwrap();
 
         // Write updates.jsonl for session 1 with 150,000 tokens
-        let updates1 = vec![
+        let updates1 = [
             serde_json::json!({"params": {"_meta": {"totalTokens": 100000}}}).to_string(),
             serde_json::json!({"params": {"_meta": {"totalTokens": 150000}}}).to_string(),
-        ].join("\n");
+        ]
+        .join("\n");
         std::fs::write(session1_dir.join("updates.jsonl"), updates1).unwrap();
 
         // Write summary.json for session 2 (newer)
@@ -2362,15 +2376,19 @@ mod context_estimate_tests {
         std::fs::write(session2_dir.join("summary.json"), summary2.to_string()).unwrap();
 
         // Write updates.jsonl for session 2 with 20,000 tokens (0.1 context fraction)
-        let updates2 = vec![
+        let updates2 = [
             serde_json::json!({"params": {"_meta": {"totalTokens": 10000}}}).to_string(),
             serde_json::json!({"params": {"_meta": {"totalTokens": 20000}}}).to_string(),
-        ].join("\n");
+        ]
+        .join("\n");
         std::fs::write(session2_dir.join("updates.jsonl"), updates2).unwrap();
 
         let pct = estimate_grok_context_pct_in(cwd).unwrap();
         // 20000 / 200000 = 0.1
-        assert!((pct - 0.1).abs() < 1e-5, "Grok estimate: got {pct}, expected 0.1");
+        assert!(
+            (pct - 0.1).abs() < 1e-5,
+            "Grok estimate: got {pct}, expected 0.1"
+        );
 
         // Restore original HOME
         if let Some(home) = original_home {

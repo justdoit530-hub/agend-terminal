@@ -113,20 +113,24 @@ async fn drive_dispatch_once(
     let state2 = Arc::clone(state);
     let state3 = Arc::clone(state);
     let handler = dptree::entry()
-        .branch(Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
-            let state = Arc::clone(&state2);
-            async move {
-                handle_message(&state, &msg).await;
-                respond(())
-            }
-        }))
-        .branch(Update::filter_callback_query().endpoint(move |bot: Bot, q: CallbackQuery| {
-            let state = Arc::clone(&state3);
-            async move {
-                handle_callback_query(&state, bot, &q).await;
-                respond(())
-            }
-        }));
+        .branch(
+            Update::filter_message().endpoint(move |_bot: Bot, msg: Message| {
+                let state = Arc::clone(&state2);
+                async move {
+                    handle_message(&state, &msg).await;
+                    respond(())
+                }
+            }),
+        )
+        .branch(
+            Update::filter_callback_query().endpoint(move |bot: Bot, q: CallbackQuery| {
+                let state = Arc::clone(&state3);
+                async move {
+                    handle_callback_query(&state, bot, &q).await;
+                    respond(())
+                }
+            }),
+        );
     let listener = teloxide::update_listeners::Polling::builder(bot.clone())
         .timeout(std::time::Duration::from_secs(10))
         .build();
@@ -712,11 +716,7 @@ pub(super) fn agent_wants_raw_keystrokes(
     guard.state.current.wants_raw_keystrokes()
 }
 
-async fn handle_callback_query(
-    state: &Arc<Mutex<TelegramState>>,
-    bot: Bot,
-    query: &CallbackQuery,
-) {
+async fn handle_callback_query(state: &Arc<Mutex<TelegramState>>, bot: Bot, query: &CallbackQuery) {
     let callback_data = match &query.data {
         Some(d) => d.clone(),
         None => return,
@@ -883,7 +883,7 @@ async fn handle_callback_query(
             &instance_name,
             &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
             &callback_data,
-            &vec![],
+            &[],
         );
     }
 

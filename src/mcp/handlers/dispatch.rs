@@ -217,7 +217,11 @@ adapter!(
     ha,
     instance::handle_restart_instance
 );
-adapter!(dispatch_agy_quota, ha, crate::api::handlers::agy_quota::handle_agy_quota);
+adapter!(
+    dispatch_agy_quota,
+    ha,
+    crate::api::handlers::agy_quota::handle_agy_quota
+);
 adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
 adapter!(
     dispatch_set_waiting_on,

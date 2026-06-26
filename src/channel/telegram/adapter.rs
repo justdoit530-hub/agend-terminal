@@ -192,7 +192,12 @@ impl crate::channel::Channel for TelegramChannel {
                     // (its existing send-error handling: retry / surface),
                     // consistent with the media send above.
                     block_on_value(send_with_topic_capturing_id(
-                        &bot, group_id, topic_id, &msg.text, None, reply_markup,
+                        &bot,
+                        group_id,
+                        topic_id,
+                        &msg.text,
+                        None,
+                        reply_markup,
                     ))
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -211,7 +216,12 @@ impl crate::channel::Channel for TelegramChannel {
                     anyhow::bail!("OutMsg has no text and no attachment");
                 }
                 let msg_id = block_on_value(send_with_topic_capturing_id(
-                    &bot, group_id, topic_id, &msg.text, None, reply_markup,
+                    &bot,
+                    group_id,
+                    topic_id,
+                    &msg.text,
+                    None,
+                    reply_markup,
                 ))?;
                 Ok(crate::channel::MsgRef {
                     binding: build_telegram_msg_binding(topic_id),
@@ -400,7 +410,8 @@ impl crate::channel::Channel for TelegramChannel {
         match op {
             crate::channel::AgentOutboundOp::Reply { text, buttons } => {
                 let (msg_id, _chat_id) =
-                    try_telegram_reply_from(&home, agent, &text, buttons.as_ref()).map_err(ChannelError::Other)?;
+                    try_telegram_reply_from(&home, agent, &text, buttons.as_ref())
+                        .map_err(ChannelError::Other)?;
                 Ok(crate::channel::MsgRef {
                     binding: crate::channel::BindingRef::new(
                         "telegram",
@@ -658,9 +669,7 @@ mod tests {
                 crate::channel::ButtonDef::new("Label 1", "data_1"),
                 crate::channel::ButtonDef::new("Label 2", "data_2"),
             ],
-            vec![
-                crate::channel::ButtonDef::new("Label 3", "data_3"),
-            ],
+            vec![crate::channel::ButtonDef::new("Label 3", "data_3")],
         ];
 
         let msg = crate::channel::OutMsg {

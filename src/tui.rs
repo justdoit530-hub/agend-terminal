@@ -11,7 +11,6 @@ use crossterm::terminal;
 use std::io::Write;
 use std::path::Path;
 
-
 /// RAII guard for crossterm raw mode.
 struct RawModeGuard;
 impl Drop for RawModeGuard {

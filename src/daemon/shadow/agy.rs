@@ -43,7 +43,9 @@ pub(crate) fn record_to_evidence(line: &str) -> Option<Evidence> {
             if !step.tool_calls.is_empty() {
                 let first_tool = &step.tool_calls[0];
                 let tool_name = extract_tool_name(first_tool);
-                EvidenceKind::ToolStarted { name: Some(tool_name) }
+                EvidenceKind::ToolStarted {
+                    name: Some(tool_name),
+                }
             } else {
                 EvidenceKind::Responding
             }
@@ -115,8 +117,18 @@ pub fn spawn(registry: crate::agent::AgentRegistry, home: PathBuf) {
             loop {
                 if let Some(dir) = agy_dir(&home) {
                     let history_path = dir.join("history.jsonl");
-                    tail_history(&history_path, &mut history_offset, &mut workspace_conversations);
-                    tail_transcripts(&registry, &home, &dir, &workspace_conversations, &mut transcript_cursors);
+                    tail_history(
+                        &history_path,
+                        &mut history_offset,
+                        &mut workspace_conversations,
+                    );
+                    tail_transcripts(
+                        &registry,
+                        &home,
+                        &dir,
+                        &workspace_conversations,
+                        &mut transcript_cursors,
+                    );
                 }
                 std::thread::sleep(TAIL_TICK);
             }
@@ -128,14 +140,22 @@ fn tail_history(
     offset: &mut u64,
     workspace_conversations: &mut HashMap<String, String>,
 ) {
-    let Ok(f) = std::fs::File::open(history_path) else { return; };
+    let Ok(f) = std::fs::File::open(history_path) else {
+        return;
+    };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < *offset { *offset = 0; }
-    if len <= *offset { return; }
+    if len < *offset {
+        *offset = 0;
+    }
+    if len <= *offset {
+        return;
+    }
 
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let mut reader = BufReader::new(f);
-    if reader.seek(SeekFrom::Start(*offset)).is_err() { return; }
+    if reader.seek(SeekFrom::Start(*offset)).is_err() {
+        return;
+    }
 
     let mut consumed = *offset;
     let mut line = String::new();
@@ -146,7 +166,9 @@ fn tail_history(
             Ok(n) => n,
             Err(_) => break,
         };
-        if !line.ends_with('\n') { break; }
+        if !line.ends_with('\n') {
+            break;
+        }
         consumed += n as u64;
         if let Ok(hl) = serde_json::from_str::<HistoryLine>(line.trim()) {
             if let Some(cid) = hl.conversation_id {
@@ -165,25 +187,27 @@ fn tail_transcripts(
     transcript_cursors: &mut HashMap<PathBuf, u64>,
 ) {
     let agents = live_agy_agents(registry);
-    if agents.is_empty() { return; }
+    if agents.is_empty() {
+        return;
+    }
 
     for agent_name in agents {
         let ws_path = home.join("workspace").join(&agent_name);
         let ws_str = ws_path.to_string_lossy();
 
-        let conversation_id = workspace_conversations
-            .get(ws_str.as_ref())
-            .or_else(|| {
-                workspace_conversations.iter().find_map(|(ws, cid)| {
-                    if agent_for_workspace(ws, home, &[agent_name.clone()]).is_some() {
-                        Some(cid)
-                    } else {
-                        None
-                    }
-                })
-            });
+        let conversation_id = workspace_conversations.get(ws_str.as_ref()).or_else(|| {
+            workspace_conversations.iter().find_map(|(ws, cid)| {
+                if agent_for_workspace(ws, home, std::slice::from_ref(&agent_name)).is_some() {
+                    Some(cid)
+                } else {
+                    None
+                }
+            })
+        });
 
-        let Some(cid) = conversation_id else { continue; };
+        let Some(cid) = conversation_id else {
+            continue;
+        };
         let transcript_path = agy_dir
             .join("brain")
             .join(cid)
@@ -191,22 +215,34 @@ fn tail_transcripts(
             .join("logs")
             .join("transcript.jsonl");
 
-        if !transcript_path.exists() { continue; }
+        if !transcript_path.exists() {
+            continue;
+        }
 
-        let offset = transcript_cursors.entry(transcript_path.clone()).or_insert(0);
+        let offset = transcript_cursors
+            .entry(transcript_path.clone())
+            .or_insert(0);
         drain_transcript_file(&transcript_path, offset, &agent_name);
     }
 }
 
 fn drain_transcript_file(file: &Path, offset: &mut u64, agent_name: &str) {
-    let Ok(f) = std::fs::File::open(file) else { return; };
+    let Ok(f) = std::fs::File::open(file) else {
+        return;
+    };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < *offset { *offset = 0; }
-    if len <= *offset { return; }
+    if len < *offset {
+        *offset = 0;
+    }
+    if len <= *offset {
+        return;
+    }
 
     use std::io::{BufRead, BufReader, Seek, SeekFrom};
     let mut reader = BufReader::new(f);
-    if reader.seek(SeekFrom::Start(*offset)).is_err() { return; }
+    if reader.seek(SeekFrom::Start(*offset)).is_err() {
+        return;
+    }
 
     let mut consumed = *offset;
     let mut line = String::new();
@@ -217,7 +253,9 @@ fn drain_transcript_file(file: &Path, offset: &mut u64, agent_name: &str) {
             Ok(n) => n,
             Err(_) => break,
         };
-        if !line.ends_with('\n') { break; }
+        if !line.ends_with('\n') {
+            break;
+        }
         consumed += n as u64;
         if let Some(ev) = record_to_evidence(&line) {
             super::push(agent_name, ev);
@@ -248,7 +286,9 @@ fn strip_private(p: &str) -> &str {
     }
 }
 #[cfg(not(unix))]
-fn strip_private(p: &str) -> &str { p }
+fn strip_private(p: &str) -> &str {
+    p
+}
 
 #[cfg(test)]
 mod tests {
@@ -262,27 +302,37 @@ mod tests {
     #[test]
     fn maps_agy_step_lifecycle() {
         assert_eq!(
-            kind_of(r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-25T16:04:17Z"}"#),
+            kind_of(
+                r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-25T16:04:17Z"}"#
+            ),
             Some(EvidenceKind::TurnStarted)
         );
         assert_eq!(
-            kind_of(r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-25T16:04:19Z","tool_calls":[{"name":"call_mcp_tool","args":{"ToolName":"\"task\""}}]}"#),
+            kind_of(
+                r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-25T16:04:19Z","tool_calls":[{"name":"call_mcp_tool","args":{"ToolName":"\"task\""}}]}"#
+            ),
             Some(EvidenceKind::ToolStarted {
                 name: Some("task".to_string())
             })
         );
         assert_eq!(
-            kind_of(r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-25T16:04:19Z","tool_calls":[{"name":"run_command","args":{}}]}"#),
+            kind_of(
+                r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-25T16:04:19Z","tool_calls":[{"name":"run_command","args":{}}]}"#
+            ),
             Some(EvidenceKind::ToolStarted {
                 name: Some("run_command".to_string())
             })
         );
         assert_eq!(
-            kind_of(r#"{"step_index":423,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-24T13:00:29Z"}"#),
+            kind_of(
+                r#"{"step_index":423,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-24T13:00:29Z"}"#
+            ),
             Some(EvidenceKind::Responding)
         );
         assert_eq!(
-            kind_of(r#"{"step_index":6,"source":"MODEL","type":"MCP_TOOL","status":"DONE","created_at":"2026-06-25T16:04:20Z"}"#),
+            kind_of(
+                r#"{"step_index":6,"source":"MODEL","type":"MCP_TOOL","status":"DONE","created_at":"2026-06-25T16:04:20Z"}"#
+            ),
             Some(EvidenceKind::ToolEnded)
         );
     }
@@ -290,11 +340,15 @@ mod tests {
     #[test]
     fn ignore_metadata_steps() {
         assert_eq!(
-            kind_of(r#"{"step_index":1,"source":"SYSTEM","type":"CONVERSATION_HISTORY","status":"DONE","created_at":"2026-06-25T16:04:17Z"}"#),
+            kind_of(
+                r#"{"step_index":1,"source":"SYSTEM","type":"CONVERSATION_HISTORY","status":"DONE","created_at":"2026-06-25T16:04:17Z"}"#
+            ),
             None
         );
         assert_eq!(
-            kind_of(r#"{"step_index":4,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-06-25T16:04:18Z"}"#),
+            kind_of(
+                r#"{"step_index":4,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","created_at":"2026-06-25T16:04:18Z"}"#
+            ),
             None
         );
     }
@@ -303,7 +357,7 @@ mod tests {
     fn evidence_is_stream_authority_with_timestamp() {
         let ev = record_to_evidence(
             r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-25T16:04:17Z"}"#
-        ).unwrap();
+        ).expect("failed to convert record to evidence");
         assert_eq!(ev.authority, Authority::Stream);
         assert_eq!(ev.at_ms, 1782403457000); // 2026-06-25T16:04:17Z in epoch ms
     }
@@ -317,26 +371,50 @@ mod tests {
         let home = std::env::temp_dir().join(format!("agend_agy_dog_{}", std::process::id()));
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         let ws = home.join("workspace").join("adog");
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::create_dir_all(agy_dir.join("brain").join("sess123").join(".system_generated").join("logs")).unwrap();
+        std::fs::create_dir_all(&ws).expect("failed to create ws dir");
+        std::fs::create_dir_all(
+            agy_dir
+                .join("brain")
+                .join("sess123")
+                .join(".system_generated")
+                .join("logs"),
+        )
+        .expect("failed to create logs dir");
 
         let history_path = agy_dir.join("history.jsonl");
-        let mut hist_f = std::fs::File::create(&history_path).unwrap();
-        writeln!(hist_f, r#"{{"workspace":"{}","conversationId":"sess123"}}"#, ws.to_string_lossy()).unwrap();
-        hist_f.flush().unwrap();
+        let mut hist_f =
+            std::fs::File::create(&history_path).expect("failed to create history path");
+        writeln!(
+            hist_f,
+            r#"{{"workspace":"{}","conversationId":"sess123"}}"#,
+            ws.to_string_lossy()
+        )
+        .expect("failed to write history");
+        hist_f.flush().expect("failed to flush history");
 
-        let trans_path = agy_dir.join("brain").join("sess123").join(".system_generated").join("logs").join("transcript.jsonl");
-        let mut trans_f = std::fs::File::create(&trans_path).unwrap();
-        writeln!(trans_f, "{}", r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-25T16:04:17Z"}"#).unwrap();
-        writeln!(trans_f, "{}", r#"{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-25T16:04:19Z","tool_calls":[{"name":"run_command","args":{}}]}"#).unwrap();
-        trans_f.flush().unwrap();
+        let trans_path = agy_dir
+            .join("brain")
+            .join("sess123")
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let mut trans_f =
+            std::fs::File::create(&trans_path).expect("failed to create transcript path");
+        writeln!(trans_f, r#"{{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-25T16:04:17Z"}}"#).expect("failed to write input step");
+        writeln!(trans_f, r#"{{"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-25T16:04:19Z","tool_calls":[{{"name":"run_command","args":{{}}}}]}}"#).expect("failed to write planner response step");
+        trans_f.flush().expect("failed to flush transcript");
 
         let mut hist_offset = 0u64;
         let mut trans_cursors = HashMap::new();
         let mut ws_convs = HashMap::new();
 
         tail_history(&history_path, &mut hist_offset, &mut ws_convs);
-        assert_eq!(ws_convs.get(ws.to_str().unwrap()).map(|s| s.as_str()), Some("sess123"));
+        assert_eq!(
+            ws_convs
+                .get(ws.to_str().expect("invalid workspace path"))
+                .map(|s| s.as_str()),
+            Some("sess123")
+        );
 
         let registry = crate::agent::AgentRegistry::default();
         let inst_id = crate::types::InstanceId::new();

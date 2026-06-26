@@ -63,6 +63,7 @@ mod paths;
 mod process;
 mod protocol;
 mod quickstart;
+pub(crate) mod reflexion;
 mod render;
 mod reply_ledger;
 mod runtime;

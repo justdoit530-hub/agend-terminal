@@ -476,7 +476,10 @@ fn claudecode_profile() -> BackendProfile {
 fn grok_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![
-            (AgentState::AuthError, r"(?i)not.authenticated|sign.in.to.grok|grok.login"),
+            (
+                AgentState::AuthError,
+                r"(?i)not.authenticated|sign.in.to.grok|grok.login",
+            ),
             // Active: Braille spinner present (Grok uses same spinner for both tool-use and thinking)
             (AgentState::Active, r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"),
             // Idle: "Grok Build" only appears in bottom status at idle
@@ -498,7 +501,6 @@ fn grok_profile() -> BackendProfile {
         input_line_markers: &["❯"],
     }
 }
-
 
 /// Shell / Raw — moved VERBATIM (empty patterns, default behavioral, generic
 /// productivity, Idle initial state).
@@ -548,7 +550,10 @@ mod context_pattern_tests {
         let provider = |b: &Backend| profile(b).context_provider;
         assert_eq!(provider(&Backend::ClaudeCode), ContextProvider::StatusLine);
         assert_eq!(provider(&Backend::KiroCli), ContextProvider::StatusLine);
-        assert_eq!(provider(&Backend::Codex), ContextProvider::TranscriptEstimate { confidence: 0.9 });
+        assert_eq!(
+            provider(&Backend::Codex),
+            ContextProvider::TranscriptEstimate { confidence: 0.9 }
+        );
         assert_eq!(provider(&Backend::OpenCode), ContextProvider::Unavailable);
         assert_eq!(
             provider(&Backend::Agy),
@@ -567,11 +572,7 @@ mod context_pattern_tests {
 
     #[test]
     fn unavailable_context_providers_do_not_claim_a_pattern() {
-        for backend in [
-            Backend::OpenCode,
-            Backend::Shell,
-            Backend::Raw("x".into()),
-        ] {
+        for backend in [Backend::OpenCode, Backend::Shell, Backend::Raw("x".into())] {
             let profile = profile(&backend);
             assert_eq!(profile.context_provider, ContextProvider::Unavailable);
             assert!(

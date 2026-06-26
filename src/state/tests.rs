@@ -4850,7 +4850,9 @@ const CLAUDE_STATUSLINE_FRAME: &str = "⏺ working on the thing\n\
 fn claude_context_pct_extracted_from_statusline() {
     let mut t = StateTracker::new(Some(&Backend::ClaudeCode));
     t.feed(CLAUDE_STATUSLINE_FRAME);
-    let (pct, source) = t.resolved_context(None).expect("statusline percent extracted");
+    let (pct, source) = t
+        .resolved_context(None)
+        .expect("statusline percent extracted");
     assert!((pct - 61.0).abs() < f32::EPSILON);
     assert_eq!(source, ContextProvider::StatusLine);
 }
@@ -4954,10 +4956,7 @@ fn context_resolution_is_pattern_only_estimate_disabled_1945() {
 /// screen happens to carry a Claude-style statusline string.
 #[test]
 fn context_pct_unknown_for_backends_without_pattern() {
-    for backend in [
-        Backend::OpenCode,
-        Backend::Shell,
-    ] {
+    for backend in [Backend::OpenCode, Backend::Shell] {
         let mut t = StateTracker::new(Some(&backend));
         assert_eq!(t.context_provider(), ContextProvider::Unavailable);
         t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
@@ -4968,12 +4967,18 @@ fn context_pct_unknown_for_backends_without_pattern() {
     }
 
     let mut t = StateTracker::new(Some(&Backend::Agy));
-    assert_eq!(t.context_provider(), ContextProvider::TranscriptEstimate { confidence: 0.55 });
+    assert_eq!(
+        t.context_provider(),
+        ContextProvider::TranscriptEstimate { confidence: 0.55 }
+    );
     t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
     assert!(t.resolved_context(None).is_none());
 
     let mut t = StateTracker::new(Some(&Backend::Codex));
-    assert_eq!(t.context_provider(), ContextProvider::TranscriptEstimate { confidence: 0.9 });
+    assert_eq!(
+        t.context_provider(),
+        ContextProvider::TranscriptEstimate { confidence: 0.9 }
+    );
     t.feed("  Model: X | Ctx Used: 61.0% | done\n❯");
     assert!(t.resolved_context(None).is_none());
 }
@@ -5711,7 +5716,10 @@ fn context_provider_derived_from_statusline_pattern_presence() {
     for backend in [Backend::Codex, Backend::Agy] {
         let t = StateTracker::new(Some(&backend));
         assert!(
-            matches!(t.context_provider(), ContextProvider::TranscriptEstimate { .. }),
+            matches!(
+                t.context_provider(),
+                ContextProvider::TranscriptEstimate { .. }
+            ),
             "{backend:?} supports transcript estimation → TranscriptEstimate"
         );
         assert_eq!(t.context_provider().source_name(), "transcript");
@@ -5747,7 +5755,8 @@ fn context_source_stays_pattern_while_context_provider_is_statusline() {
         .expect("a fresh statusline reading resolves");
     assert!((pct - 42.0).abs() < f32::EPSILON, "parsed percent: {pct}");
     assert_eq!(
-        provider, ContextProvider::StatusLine,
+        provider,
+        ContextProvider::StatusLine,
         "context_source must stay StatusLine"
     );
     assert_eq!(

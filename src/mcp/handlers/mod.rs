@@ -111,7 +111,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     if !instance_name.is_empty() && crate::daemon::shadow::enabled() {
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let ev = crate::daemon::shadow::evidence::Evidence {
-            kind: crate::daemon::shadow::evidence::EvidenceKind::ToolStarted { name: Some(tool.to_string()) },
+            kind: crate::daemon::shadow::evidence::EvidenceKind::ToolStarted {
+                name: Some(tool.to_string()),
+            },
             authority: crate::daemon::shadow::evidence::Authority::Hook,
             confidence: crate::daemon::shadow::evidence::Confidence::Confirmed,
             at_ms: now,
@@ -173,7 +175,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     // ─── 攔截點：Tool Call End ───
     if !instance_name.is_empty() && crate::daemon::shadow::enabled() {
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        
+
         let ev_ended = crate::daemon::shadow::evidence::Evidence {
             kind: crate::daemon::shadow::evidence::EvidenceKind::ToolEnded,
             authority: crate::daemon::shadow::evidence::Authority::Hook,
@@ -185,7 +187,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 
         if tool == "reply" && is_ok_result(&result) {
             let ev_turn_ended = crate::daemon::shadow::evidence::Evidence {
-                kind: crate::daemon::shadow::evidence::EvidenceKind::TurnEnded { stop_reason: None },
+                kind: crate::daemon::shadow::evidence::EvidenceKind::TurnEnded {
+                    stop_reason: None,
+                },
                 authority: crate::daemon::shadow::evidence::Authority::Hook,
                 confidence: crate::daemon::shadow::evidence::Confidence::Confirmed,
                 at_ms: now,

@@ -448,6 +448,10 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 return json!({"error": e});
             }
 
+            if verdict == super::comms_gates::Verdict::Rejected {
+                crate::reflexion::record_mistake(home, target, sender.as_str(), summary, args);
+            }
+
             // #1666 Phase B (WARN-first): cross-check the checkable evidence and
             // LOG (never reject) — measures the false-positive rate. See the fn.
             super::comms_gates::cross_check_and_log(

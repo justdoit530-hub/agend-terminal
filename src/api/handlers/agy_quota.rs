@@ -1,8 +1,8 @@
 //! API and MCP handler for agy subscription quota querying.
 
 use serde_json::{json, Value};
-use std::process::Command;
 use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ModelQuota {
@@ -74,7 +74,7 @@ pub(crate) fn detect_language_server() -> Option<(u16, String)> {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for part in parts {
                 if part.contains(':') {
-                    if let Some(port_str) = part.split(':').last() {
+                    if let Some(port_str) = part.split(':').next_back() {
                         if let Ok(p) = port_str.parse::<u16>() {
                             port = Some(p);
                             break;
@@ -122,7 +122,8 @@ pub(crate) async fn fetch_agy_quota() -> Option<Vec<ModelQuota>> {
     };
     let client = match reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .build() {
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("reqwest build failed: {:?}", e);
@@ -140,7 +141,8 @@ pub(crate) async fn fetch_agy_quota() -> Option<Vec<ModelQuota>> {
         .header("X-Codeium-Csrf-Token", token)
         .json(&json!({}))
         .send()
-        .await {
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("reqwest send failed: {:?}", e);
@@ -171,7 +173,8 @@ pub(crate) async fn fetch_agy_quota() -> Option<Vec<ModelQuota>> {
     let configs = match payload
         .user_status
         .and_then(|us| us.cascade_model_config_data)
-        .and_then(|cmd| cmd.client_model_configs) {
+        .and_then(|cmd| cmd.client_model_configs)
+    {
         Some(c) => c,
         None => {
             tracing::warn!("cascade_model_config_data or client_model_configs missing in payload");
