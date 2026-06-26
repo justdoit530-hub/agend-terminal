@@ -1325,7 +1325,7 @@ pub fn spawn_agent(
 
     // Register in registry
     {
-        let mut reg = registry.lock();
+        let mut reg = lock_registry(registry);
         reg.insert(
             instance_id,
             AgentHandle {
@@ -1380,7 +1380,7 @@ pub fn spawn_agent(
     let dismiss = prepare_dismiss_patterns(&dismiss);
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
-        let reg = registry.lock();
+        let reg = lock_registry(registry);
         reg.get(&instance_id)
             .map(|h| Arc::clone(&h.deleted))
             .unwrap_or_default()
@@ -1900,7 +1900,7 @@ fn wait_for_idle_inject_target(
             return None;
         }
         let core = {
-            let reg = registry.lock();
+            let reg = lock_registry(registry);
             match reg.get(&instance_id) {
                 Some(h) => std::sync::Arc::clone(&h.core),
                 None => return None, // agent gone
@@ -1915,7 +1915,7 @@ fn wait_for_idle_inject_target(
     std::thread::sleep(std::time::Duration::from_millis(500));
     // #1530/F1: snapshot the inject target under the registry lock, release it,
     // THEN inject (caller side) — never hold the registry across the blocking write.
-    let reg = registry.lock();
+    let reg = lock_registry(registry);
     reg.get(&instance_id).map(InjectTarget::from_handle)
 }
 
@@ -2241,7 +2241,7 @@ fn pty_read_loop(
 /// call multiple times during the same crash-detection sequence.
 fn sweep_child_tree(id: &crate::types::InstanceId, registry: &AgentRegistry) {
     let pid: Option<u32> = {
-        let reg = registry.lock();
+        let reg = lock_registry(registry);
         reg.get(id).and_then(|h| h.child.lock().process_id())
     };
     if let Some(pid) = pid {
@@ -2303,7 +2303,7 @@ fn wait_for_process_exit(
     registry: &AgentRegistry,
 ) -> Option<i32> {
     for _ in 0..20 {
-        let reg = registry.lock();
+        let reg = lock_registry(registry);
         if reg.get(id).is_none() {
             tracing::debug!(agent = name, "not in registry, skipping crash handling");
             return Some(0);
@@ -2326,7 +2326,7 @@ fn cleanup_agent(
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
 ) {
-    registry.lock().remove(id);
+    lock_registry(registry).remove(id);
     if let Some(ref home) = home {
         crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
     }
@@ -2352,7 +2352,7 @@ fn startup_failure_from(uptime: Option<(std::time::Duration, u64)>, last_input_a
 
 fn is_startup_failure(name: &str, id: &crate::types::InstanceId, registry: &AgentRegistry) -> bool {
     let uptime = {
-        let reg = registry.lock();
+        let reg = lock_registry(registry);
         reg.get(id)
             .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
     };
@@ -2401,7 +2401,7 @@ fn on_clean_exit_shell_fallback(
     }
 
     let (cols, rows) = {
-        let reg = registry.lock();
+        let reg = lock_registry(registry);
         reg.get(id)
             .map(|h| {
                 // registry → core order; `c` is a short non-self-IPC temporary
@@ -2483,7 +2483,7 @@ fn on_crash_exit(
 ) {
     tracing::info!(agent = name, "setting restarting state");
     {
-        let reg = registry.lock();
+        let reg = lock_registry(registry);
         if let Some(handle) = reg.get(id) {
             // registry → core order; `core` is a short non-self-IPC temporary
             // (set_restarting only) dropped on this statement. Safe per the

@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（30 個工具）
+# AgEnD MCP Tools Reference — 工具參考（37 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -8,6 +8,7 @@
 管理 task board。動作：create、list、claim、done、update。
 - **action**: create / list / claim / done / update
 - title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration
+- `list` 預設為**精簡模式**（#2475）：`description`／`result` 會限制長度（約 200 字）。傳 `verbose: true` 可取回完整文字；回應中的 `terse: true` 表示已套用精簡。
 
 ### `decision`
 管理 decision。動作：post、list、update。
@@ -74,7 +75,7 @@
 ### `create_instance`
 建立 agent instance。支援同質團隊（count + backend）和異質團隊（backends 列表）。
 - **name**: instance 或團隊的基礎名稱
-- backend, model, args, branch, working_directory, task
+- backend, model, model_tier, args, branch, working_directory, task
 - team, count, backends, layout, target_pane
 
 ### `delete_instance`
@@ -90,8 +91,15 @@
 - **instance**: 要取代的 instance
 - reason
 
+### `restart_instance`
+終止並重啟一個 instance。預設模式 `resume` 會保留對話狀態；`fresh` 則從乾淨狀態啟動（等同 `replace_instance`）。
+- **instance**: 要重啟的 instance
+- mode (resume / fresh), reason, force
+- `fresh` 預設會在 bound worktree 有未提交變更時拒絕（#2476）；請先 commit/push 或留下 task-board handoff，或傳 `force: true`。
+
 ### `list_instances`
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。
+- 預設為 **compact**（#2475）：每列會移除雜訊較大的 `observed_status.evidence` trail。傳 `verbose: true`（或 `include_evidence: true`）可包含它。
 
 ### `set_display_name`
 設定你的顯示名稱。
@@ -120,6 +128,11 @@
 讀取目標 instance PTY scrollback 中的可見文字（已去除 ANSI）。
 - **instance**: instance 名稱
 - lines（預設 100，最大 10000）
+- `to_file: true`（#2478）會把完整 snapshot 寫到 `$AGEND_HOME/captures/`，tool 只回精簡摘要與路徑，避免診斷 dump 灌進 context。
+
+### `tui_screenshot`
+將目前的 TUI 狀態擷取成 SVG 圖片。僅在 TUI 模式下可用（daemon-only 模式無效）。
+- **參數**：無。
 
 ## Worktree 與 Binding（Worktree & Binding）
 
@@ -151,6 +164,30 @@
 ### `task_sweep_config`
 設定 GitHub-PR 自動關閉的 sweep daemon。
 - repository, dry_run, pause
+
+### `ephemeral`
+管理短生命週期、跨 backend 的 ephemeral worker，獨立於受管理的簿記之外（無 roster／binding／worktree）。動作：spawn、list、reap。
+- **action**: spawn / list / reap
+- backend, workflow_id, parent, ttl_secs, token_budget, prompt, model, worker_id, all_stale
+
+### `watchdog`
+Fleet idle watchdog 控制。動作：snooze、resume、status、ack。`ack` 會抑制 fleet 警示，直到偵測到 ack 之後的 agent 活動後自動解除。
+- **action**: snooze / resume / status / ack
+- duration（例如 `2h`、`30m`；上限為 4h）
+
+### `config`
+執行期可變更的 daemon 設定。動作：get、set、list。（可用的設定 key 由 daemon 的 runtime config 推導，列於工具的即時描述中。）
+- **action**: get / set / list
+- key, value
+
+### `tokens`
+依需求統計 token 用量與估計的 USD 成本，來源為 Claude Code 與 Codex 的 session transcript。成本為估計值；OpenCode／Kiro／Gemini 尚未涵蓋。
+- **action**: summary / by_instance
+- group_by (instance / task), since（`24h` / `7d` / `90m` / `all`）, instance
+
+### `mode`
+讀取 operator 的可用性／授權模式（對 agent 為唯讀）。設定模式僅限 operator，透過 `agend-terminal mode <active|away|sleep>` CLI 操作。
+- **action**: get
 
 ### `restart_daemon`
 

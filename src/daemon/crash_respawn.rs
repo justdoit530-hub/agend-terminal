@@ -139,7 +139,7 @@ pub(super) fn handle_crash_respawn(home: &Path, crashed_name: &str, ctx: &Daemon
 
     tracing::info!(agent = %crashed_name, ?delay, "respawning");
     let saved_health = {
-        let r = ctx.registry.lock();
+        let r = agent::lock_registry(&ctx.registry);
         r.get(&instance_id).map(|h| h.core.lock().health.clone())
     };
 
@@ -385,7 +385,7 @@ fn respawn_agent_worker(
             let msg = format!("🛑 Agent `{}` crash-respawn failed: {}", config.name, e);
             crate::channel::notify_all_escalation_channels(
                 &config.name,
-                crate::channel::NotifySeverity::Error,
+                NotifySeverity::Error,
                 &msg,
                 false,
             );
@@ -642,16 +642,16 @@ mod deleted_gate_tests_1913 {
         );
 
         // Verify 1: event-log.jsonl should have a crash_respawn_failed record
-        let log_content = std::fs::read_to_string(home.join("event-log.jsonl"))
-            .expect("failed to read event-log.jsonl");
+        let log_content =
+            std::fs::read_to_string(home.join("event-log.jsonl")).expect("event-log must exist");
         assert!(log_content.contains("crash_respawn_failed"));
 
         // Verify 2: health state in the registry should be HealthState::Failed
         {
             let r = reg.lock();
             let handle = r
-                .get(&InstanceId::parse(VICTIM_UUID).expect("invalid victim uuid"))
-                .expect("missing registry handle");
+                .get(&InstanceId::parse(VICTIM_UUID).expect("valid uuid"))
+                .expect("handle must exist");
             let core = handle.core.lock();
             assert_eq!(core.health.state, crate::health::HealthState::Failed);
         }

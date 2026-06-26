@@ -55,7 +55,7 @@
 | 文件 | EN | 中文 | 內容 |
 |---|---|---|---|
 | 架構 | [EN](architecture.md) | [中文](architecture.zh-TW.md) | daemon 設計、worktree pool、健康監控、channel 生命週期 |
-| MCP 工具 | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | 全部 30 個 agent 協調 MCP 工具，依類別列出 |
+| MCP 工具 | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | 全部 37 個 agent 協調 MCP 工具，依類別列出 |
 | 環境變數 | [EN](env-vars.md) | [中文](env-vars.zh-TW.md) | 每一個 `AGEND_*` 變數與其作用 |
 | Git 行為 | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | daemon 對被啟動 agent 的 git 環境做了哪些修改 |
 | 相容性政策 | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | `$AGEND_HOME` 底下磁碟格式的穩定性保證 |
@@ -94,6 +94,7 @@
 - [MCP↔Daemon Proxy Contract](MCP-DAEMON-PROXY-CONTRACT.md) — bridge 協定
 - [Skill System Architecture](skill-system-architecture.md) — skill 如何依 backend 解析
 - [Project Feature Groups](project-feature-groups.md) — 功能對模組的對應
+- [Chat Platform API Reference](chat-platform-api-reference.md) — 各平台接入註記，供撰寫 `src/channel/` adapter 參考
 - [Loop Engineering Mapping](loop-engineering-mapping.md) — supervisor loop 職責
 - [F685 Fixture Corpus](F685-FIXTURE-CORPUS.md) — state-replay fixture 語料庫
 - [F9 Productive-Output Gate](F9-PRODUCTIVE-OUTPUT-GATE.md) — productive-output gate 設計
@@ -110,6 +111,7 @@
 - [Process: LOC Estimation Methodology](PROCESS-LOC-ESTIMATION-METHODOLOGY.md)
 - [Process: systemd / loginctl Operator Hardening](PROCESS-SYSTEMD-LOGINCTL-OPERATOR-HARDENING.md)
 - [Process: Tier-2 Dual-Review Lessons Learned](PROCESS-TIER2-DUAL-REVIEW-LESSONS-LEARNED.md)
+- [Operator PTY-Capture Queue](operator-capture-queue.md) — operator 錄製真 backend `.raw` fixture 的 runbook
 - [Refactor Plan](REFACTOR-PLAN.md) — 進行中的架構整理計畫
 </details>
 
