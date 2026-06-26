@@ -883,7 +883,7 @@ async fn handle_callback_query(
             &instance_name,
             &inbox::NotifySource::Channel(username, crate::channel::ChannelKind::Telegram),
             &callback_data,
-            &vec![],
+            &[],
         );
     }
 

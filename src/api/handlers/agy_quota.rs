@@ -74,7 +74,7 @@ pub(crate) fn detect_language_server() -> Option<(u16, String)> {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for part in parts {
                 if part.contains(':') {
-                    if let Some(port_str) = part.split(':').last() {
+                    if let Some(port_str) = part.split(':').next_back() {
                         if let Ok(p) = port_str.parse::<u16>() {
                             port = Some(p);
                             break;

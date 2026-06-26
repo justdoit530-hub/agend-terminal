@@ -175,7 +175,7 @@ fn tail_transcripts(
             .get(ws_str.as_ref())
             .or_else(|| {
                 workspace_conversations.iter().find_map(|(ws, cid)| {
-                    if agent_for_workspace(ws, home, &[agent_name.clone()]).is_some() {
+                    if agent_for_workspace(ws, home, std::slice::from_ref(&agent_name)).is_some() {
                         Some(cid)
                     } else {
                         None
