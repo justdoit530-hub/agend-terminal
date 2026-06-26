@@ -94,6 +94,14 @@ impl PerTickHandler for HangDetectionHandler {
                     pair.last_input_at_ms,
                     pair.heartbeat_at_ms,
                 );
+                tracing::debug!(
+                    target: "hang_detection",
+                    agent = %name,
+                    state = agent_state.display_name(),
+                    silent_secs = silent.as_secs(),
+                    silent_productive_secs = silent_productive.as_secs(),
+                    "hang check tick: evaluating silence"
+                );
                 if just_detected {
                     tracing::warn!(
                         agent = %name,

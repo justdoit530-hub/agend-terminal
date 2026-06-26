@@ -425,6 +425,8 @@ pub struct HealthTracker {
     /// `#[allow(dead_code)]` until the unpause sub-task lands.
     #[allow(dead_code)] // reserved for unpause sub-task (Stage 3 decay)
     pub(crate) last_stage3_fired_at: Option<Instant>,
+    /// F9 productive-silence gate active state (backend-specific)
+    pub productive_gate: bool,
 }
 
 /// #1744-H3: shared rate-limit predicate for a per-class notify cooldown stamp.
@@ -515,6 +517,7 @@ impl HealthTracker {
             recovery_restart_count: 0,
             last_stage2_fired_at: None,
             last_stage3_fired_at: None,
+            productive_gate: false,
         }
     }
 
@@ -792,9 +795,10 @@ impl HealthTracker {
         // thresholds. Active only when `AGEND_PRODUCTIVE_GATE=1` is set;
         // telemetry fires regardless for fixture-corpus measurement.
         let productive_exceeds = productive_silence_exceeds(agent_state, silent_productive);
-        let f9_gate_active = std::env::var("AGEND_PRODUCTIVE_GATE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        let f9_gate_active = self.productive_gate
+            || std::env::var("AGEND_PRODUCTIVE_GATE")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         // Shadow-mode telemetry: fires when the productive path would
         // independently flag Hung but the silent path does not. Lets the
         // fixture corpus measure F9 FP rate without affecting prod behavior

@@ -82,6 +82,8 @@ pub struct BackendProfile {
     /// error output — the content anchor excludes it. Empty = no stable prompt
     /// prefix (opencode / agy): input-line exclusion honestly unavailable.
     pub input_line_markers: &'static [&'static str],
+    /// F9 productive-silence gate enabled specifically for this backend.
+    pub productive_gate: bool,
 }
 
 /// ClaudeCode context% — matches the fleet statusline's used-form as rendered
@@ -186,6 +188,7 @@ fn agy_profile() -> BackendProfile {
         context_provider: ContextProvider::TranscriptEstimate { confidence: 0.55 },
         input_line_markers: &[],
         initial_state: AgentState::Starting,
+        productive_gate: false,
     }
 }
 
@@ -247,6 +250,7 @@ fn kirocli_profile() -> BackendProfile {
         context_provider: ContextProvider::StatusLine,
         input_line_markers: &[">"],
         initial_state: AgentState::Starting,
+        productive_gate: false,
     }
 }
 
@@ -322,6 +326,7 @@ fn opencode_profile() -> BackendProfile {
         context_provider: ContextProvider::Unavailable,
         input_line_markers: &[],
         initial_state: AgentState::Starting,
+        productive_gate: false,
     }
 }
 
@@ -382,6 +387,7 @@ fn codex_profile() -> BackendProfile {
         context_provider: ContextProvider::TranscriptEstimate { confidence: 0.9 },
         input_line_markers: &["›"],
         initial_state: AgentState::Starting,
+        productive_gate: false,
     }
 }
 
@@ -470,6 +476,7 @@ fn claudecode_profile() -> BackendProfile {
         context_provider: ContextProvider::StatusLine,
         input_line_markers: &["❯", ">"],
         initial_state: AgentState::Starting,
+        productive_gate: false,
     }
 }
 
@@ -499,6 +506,7 @@ fn grok_profile() -> BackendProfile {
         context_pattern: None,
         context_provider: ContextProvider::TranscriptEstimate { confidence: 0.7 },
         input_line_markers: &["❯"],
+        productive_gate: true,
     }
 }
 
@@ -518,6 +526,7 @@ fn empty_profile() -> BackendProfile {
         context_provider: ContextProvider::Unavailable,
         input_line_markers: &[],
         initial_state: AgentState::Idle,
+        productive_gate: false,
     }
 }
 

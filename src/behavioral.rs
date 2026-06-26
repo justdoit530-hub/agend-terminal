@@ -293,9 +293,8 @@ pub(crate) const GROK_PRODUCTIVE_MARKERS: &[&str] = &[
     r"^Saved to \S+",
     r"^Wrote \d+ bytes",
     r"^Created file: \S+",
-    "◆",
-    "❯",
-    "Thought",
+    r"^Thought for \d",
+    r"^◆\s",
 ];
 
 /// Build a `LazyLock<Vec<Regex>>` from a static markers slice. Each
@@ -921,6 +920,25 @@ mod tests {
                 source: ProductivitySource::Marker(_)
             }
         ));
+
+        // `Thought for 3s, 150 tokens` — Grok thought completion.
+        let signal_thought =
+            infer_productivity(&config, "Thought for 3s, 150 tokens\n", stale_heartbeat());
+        assert!(matches!(
+            signal_thought,
+            ProductivitySignal::Productive {
+                source: ProductivitySource::Marker(_)
+            }
+        ));
+
+        // `❯` alone should NOT trigger productive.
+        let signal_prompt = infer_productivity(&config, "❯\n", stale_heartbeat());
+        assert_eq!(signal_prompt, ProductivitySignal::NoSignal);
+
+        // Prose with `Thought` not at start should NOT trigger productive.
+        let signal_prose =
+            infer_productivity(&config, "I had a Thought today\n", stale_heartbeat());
+        assert_eq!(signal_prose, ProductivitySignal::NoSignal);
     }
 
     #[test]

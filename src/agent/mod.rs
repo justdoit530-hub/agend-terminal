@@ -1312,7 +1312,13 @@ pub fn spawn_agent(
         // instance name the instruction injection uses for `ctx.name`, so the
         // detector recomputes the SAME token the agent is told to emit.
         state: StateTracker::for_agent(detected_backend.as_ref(), name),
-        health: HealthTracker::new(),
+        health: {
+            let mut h = HealthTracker::new();
+            if let Some(ref b) = detected_backend {
+                h.productive_gate = crate::backend_profile::profile(b).productive_gate;
+            }
+            h
+        },
         api_activity: crate::agent::ApiActivity::default(),
         observed_status: None,
     }));
@@ -1680,7 +1686,13 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
             vterm: VTerm::with_pty_writer(config.cols, config.rows, Arc::clone(&pty_writer)),
             subscribers: Vec::new(),
             state: StateTracker::for_agent(detected_backend.as_ref(), config.name),
-            health: HealthTracker::new(),
+            health: {
+                let mut h = HealthTracker::new();
+                if let Some(ref b) = detected_backend {
+                    h.productive_gate = crate::backend_profile::profile(b).productive_gate;
+                }
+                h
+            },
             api_activity: crate::agent::ApiActivity::default(),
             observed_status: None,
         }));
