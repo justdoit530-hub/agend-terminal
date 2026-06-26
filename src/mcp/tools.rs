@@ -643,9 +643,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            38,
+            39,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
-             + ephemeral (#1967 Phase-1) = 37; + agy_quota = 38. Current tools: {:?}",
+             + ephemeral (#1967 Phase-1) = 37; + agy_quota = 38; + list_rules = 39. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1141,6 +1141,7 @@ mod tests {
             "binding_state",
             "gc_dry_run",
             "agy_quota",
+            "list_rules",
         ];
 
         let defs = tool_definitions();

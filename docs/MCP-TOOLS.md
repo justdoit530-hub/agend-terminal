@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (37 tools)
+# AgEnD MCP Tools Reference (39 tools)
 
 ## Action-based Tools
 
@@ -196,3 +196,15 @@ Request graceful daemon restart. Daemon exits with code 42; wrapper script resta
 **Note**: All agent PTY sessions will be interrupted. Persistent state (tasks, bindings, ci_watch) survives; in-flight inbox messages may be lost.
 
 **Parameters**: None.
+
+### `agy_quota`
+
+Query Google Antigravity subscription quota. Returns `remainingFraction` and `resetTime` for each model tier.
+
+**Parameters**: None.
+
+### `list_rules`
+
+List Reflexion rules solidified for a specific agent/worker (MistakeNotebook output).
+
+- **agent_name** (required): worker instance name to query

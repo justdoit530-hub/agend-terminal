@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（37 個工具）
+# AgEnD MCP Tools Reference — 工具參考（39 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -196,3 +196,15 @@ Fleet idle watchdog 控制。動作：snooze、resume、status、ack。`ack` 會
 **注意**：所有 agent 的 PTY session 都會被中斷。持久化狀態（task、binding、ci_watch）會保留；傳輸中的 inbox 訊息可能會遺失。
 
 **參數**：無。
+
+### `agy_quota`
+
+查詢 Google Antigravity 訂閱配額。回傳各模型層級的 `remainingFraction` 與 `resetTime`。
+
+**參數**：無。
+
+### `list_rules`
+
+列出指定 agent/worker 已固化的 Reflexion 規則（MistakeNotebook 輸出）。
+
+- **agent_name**（必填）：要查詢的 worker instance 名稱

@@ -267,6 +267,7 @@ static ALL_TOOLS: [ToolEntry; 39] = [
         name: "list_rules",
         definition: super::tools::def_list_rules,
         handler: super::handlers::dispatch::dispatch_list_rules,
+        class: ToolClass::READ_ONLY,
     },
     ToolEntry {
         name: "create_instance",
@@ -479,6 +480,7 @@ static ALL_TOOLS: [ToolEntry; 39] = [
         name: "agy_quota",
         definition: super::tools::def_agy_quota,
         handler: super::handlers::dispatch::dispatch_agy_quota,
+        class: ToolClass::READ_ONLY,
     },
 ];
 

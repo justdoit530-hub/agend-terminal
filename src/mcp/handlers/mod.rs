@@ -107,6 +107,21 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);
     let instance_name: &str = sender.as_ref().map(Sender::as_str).unwrap_or("");
 
+    // MCP intercept Hook plane (PR #17): ToolStarted before dispatch.
+    if !instance_name.is_empty() && crate::daemon::shadow::enabled() {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let ev = crate::daemon::shadow::evidence::Evidence {
+            kind: crate::daemon::shadow::evidence::EvidenceKind::ToolStarted {
+                name: Some(tool.to_string()),
+            },
+            authority: crate::daemon::shadow::evidence::Authority::Hook,
+            confidence: crate::daemon::shadow::evidence::Confidence::Confirmed,
+            at_ms: now,
+            ttl_ms: 0,
+        };
+        crate::daemon::shadow::push(instance_name, ev);
+    }
+
     // Implicit heartbeat: any MCP tool call = agent is alive.
     // Sprint 23 P0 F6 fix: update in-memory pair lock atomically with the
     // disk write so supervisor's pair-read during stale-decay never sees
@@ -151,17 +166,39 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         instance_name,
         sender: &sender,
     };
-    if let Some(value) = dispatch::try_dispatch(tool, &dispatch_ctx) {
-        return value;
+    let result = if let Some(value) = dispatch::try_dispatch(tool, &dispatch_ctx) {
+        value
+    } else {
+        json!({"error": format!("unknown tool: {tool}")})
+    };
+
+    // MCP intercept Hook plane (PR #17): ToolEnded + TurnEnded on reply after dispatch.
+    if !instance_name.is_empty() && crate::daemon::shadow::enabled() {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let ev_ended = crate::daemon::shadow::evidence::Evidence {
+            kind: crate::daemon::shadow::evidence::EvidenceKind::ToolEnded,
+            authority: crate::daemon::shadow::evidence::Authority::Hook,
+            confidence: crate::daemon::shadow::evidence::Confidence::Confirmed,
+            at_ms: now,
+            ttl_ms: 0,
+        };
+        crate::daemon::shadow::push(instance_name, ev_ended);
+
+        if tool == "reply" && is_ok_result(&result) {
+            let ev_turn_ended = crate::daemon::shadow::evidence::Evidence {
+                kind: crate::daemon::shadow::evidence::EvidenceKind::TurnEnded {
+                    stop_reason: None,
+                },
+                authority: crate::daemon::shadow::evidence::Authority::Hook,
+                confidence: crate::daemon::shadow::evidence::Confidence::Confirmed,
+                at_ms: now,
+                ttl_ms: 0,
+            };
+            crate::daemon::shadow::push(instance_name, ev_turn_ended);
+        }
     }
 
-    // #694 BLOCK 2 fully migrated — all registered MCP tools flow
-    // through `dispatch::try_dispatch` above. The inline match is gone;
-    // a reached-this-line tool name must be unregistered. (Defensive
-    // catch-all — `every_advertised_tool_is_routed_somewhere` in
-    // dispatch.rs::tests pins that every tool in `tool_definitions()`
-    // is routed by `dispatch.rs`.)
-    json!({"error": format!("unknown tool: {tool}")})
+    result
 }
 
 /// arch F5 (t-…47102): MCP tools that are PURE QUERIES — no state change, no
