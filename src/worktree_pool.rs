@@ -625,6 +625,7 @@ pub(crate) use gc::{
 
 mod target_sweep;
 #[cfg(test)]
+#[allow(unused_imports)] // Unix-only target_sweep tests use these seams; Windows may not.
 pub(crate) use target_sweep::{
     safe_managed_root, target_sweep_candidates_with_roster, target_sweep_run_with_roster,
     validate_target_for_delete,
