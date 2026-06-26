@@ -107,6 +107,8 @@ pub fn spawn(registry: crate::agent::AgentRegistry, home: PathBuf) {
     if !super::enabled() {
         return;
     }
+    // fire-and-forget: detached read-only tail of agy transcript.jsonl. Owns no daemon
+    // state, holds no lock across I/O, exits when the process does. (§10.5)
     let _ = std::thread::Builder::new()
         .name("shadow-agy-tail".into())
         .spawn(move || {

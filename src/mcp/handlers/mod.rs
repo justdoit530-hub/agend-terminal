@@ -107,7 +107,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     let sender: Option<Sender> = Sender::new(instance_name).or_else(Sender::from_env);
     let instance_name: &str = sender.as_ref().map(Sender::as_str).unwrap_or("");
 
-    // ─── 攔截點：Tool Call Start ───
+    // MCP intercept Hook plane (PR #17): ToolStarted before dispatch.
     if !instance_name.is_empty() && crate::daemon::shadow::enabled() {
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let ev = crate::daemon::shadow::evidence::Evidence {
@@ -172,10 +172,9 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         json!({"error": format!("unknown tool: {tool}")})
     };
 
-    // ─── 攔截點：Tool Call End ───
+    // MCP intercept Hook plane (PR #17): ToolEnded + TurnEnded on reply after dispatch.
     if !instance_name.is_empty() && crate::daemon::shadow::enabled() {
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-
         let ev_ended = crate::daemon::shadow::evidence::Evidence {
             kind: crate::daemon::shadow::evidence::EvidenceKind::ToolEnded,
             authority: crate::daemon::shadow::evidence::Authority::Hook,
@@ -214,17 +213,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
 /// `action` — those keep the full path rather than coupling this chokepoint to
 /// each tool's per-action semantics (the minority of read actions pay the IO).
 fn is_read_only_tool(tool: &str) -> bool {
-    matches!(
-        tool,
-        "list_instances"
-            | "binding_state"
-            | "gc_dry_run"
-            | "tokens"
-            | "pane_snapshot"
-            | "tui_screenshot"
-            | "agy_quota"
-            | "list_rules"
-    )
+    crate::mcp::registry::read_only_disk_skip(tool)
 }
 
 #[cfg(test)]

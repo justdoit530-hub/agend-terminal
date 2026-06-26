@@ -608,6 +608,7 @@ mod tests {
                 "send",
                 "inbox",
                 "list_instances",
+                "list_rules",
                 "create_instance",
                 "delete_instance",
                 "start_instance",
@@ -643,7 +644,7 @@ mod tests {
                 "agy_quota",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 38);
+        assert_eq!(crate::mcp::registry::all().len(), 39);
     }
 
     #[test]

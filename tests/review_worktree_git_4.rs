@@ -83,8 +83,8 @@ fn has_conditional_removal_cwd(body: &str) -> bool {
 
 #[test]
 fn gc_remove_one_worktree_remove_has_mandatory_cwd_worktree_git_4() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/worktree_pool.rs");
-    let src = std::fs::read_to_string(&path).expect("read src/worktree_pool.rs");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/worktree_pool/gc.rs");
+    let src = std::fs::read_to_string(&path).expect("read src/worktree_pool/gc.rs");
     let body = fn_body(&src, "fn gc_remove_one(");
 
     // Sanity: the body really is the git-worktree-remove path.

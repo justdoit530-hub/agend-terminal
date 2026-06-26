@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (30 tools)
+# AgEnD MCP Tools Reference (39 tools)
 
 ## Action-based Tools
 
@@ -8,6 +8,7 @@
 Manage task board. Actions: create, list, claim, done, update.
 - **action**: create / list / claim / done / update
 - title, description, id, assignee, priority, status, branch, depends_on, filter_status, filter_assignee, result, due_at, duration
+- `list` is **terse by default** (#2475): `description` / `result` are length-capped (~200 chars). Pass `verbose: true` for full text; response carries `terse: true` when capping fired.
 
 ### `decision`
 Manage decisions. Actions: post, list, update.
@@ -74,7 +75,7 @@ Download a file attachment (telegram multimedia). Returns local path.
 ### `create_instance`
 Create agent instance(s). Supports homogeneous teams (count + backend) and heterogeneous teams (backends list).
 - **name**: instance or team base name
-- backend, model, args, branch, working_directory, task
+- backend, model, model_tier, args, branch, working_directory, task
 - team, count, backends, layout, target_pane
 
 ### `delete_instance`
@@ -90,8 +91,15 @@ Replace an instance with a fresh one.
 - **instance**: instance to replace
 - reason
 
+### `restart_instance`
+Kill and restart an instance. Default mode `resume` preserves conversation state; `fresh` starts clean (like `replace_instance`).
+- **instance**: instance to restart
+- mode (resume / fresh), reason, force
+- `fresh` refuses by default if the bound worktree has uncommitted changes (#2476); commit/push or leave a task-board handoff first, or pass `force: true`.
+
 ### `list_instances`
 List all active agent instances. Pass optional `instance` for detailed info on a single instance.
+- **compact by default** (#2475): each row drops the noisy `observed_status.evidence` trail. Pass `verbose: true` (or `include_evidence: true`) to include it.
 
 ### `set_display_name`
 Set your display name.
@@ -120,6 +128,11 @@ Move an instance's pane into a different tab in the TUI.
 Read visible text from a target instance's PTY scrollback (ANSI stripped).
 - **instance**: instance name
 - lines (default 100, max 10000)
+- `to_file: true` (#2478) writes the full snapshot under `$AGEND_HOME/captures/` and returns only a compact summary + path, keeping diagnostic dumps out of context.
+
+### `tui_screenshot`
+Capture the current TUI state as an SVG image. Only works in TUI mode (not daemon-only).
+- **Parameters**: None.
 
 ## Worktree & Binding
 
@@ -152,6 +165,30 @@ List Phase 4 GC candidates without deleting. Non-destructive.
 Configure GitHub-PR auto-close sweep daemon.
 - repository, dry_run, pause
 
+### `ephemeral`
+Manage short-lived cross-backend ephemeral workers outside managed bookkeeping (no roster/binding/worktree). Actions: spawn, list, reap.
+- **action**: spawn / list / reap
+- backend, workflow_id, parent, ttl_secs, token_budget, prompt, model, worker_id, all_stale
+
+### `watchdog`
+Fleet idle watchdog control. Actions: snooze, resume, status, ack. `ack` suppresses fleet alerts until post-ack agent activity is detected, then auto-clears.
+- **action**: snooze / resume / status / ack
+- duration (e.g. `2h`, `30m`; clamped to max 4h)
+
+### `config`
+Runtime-mutable daemon configuration. Actions: get, set, list. (Available keys are derived from the daemon's runtime config and listed in the live tool description.)
+- **action**: get / set / list
+- key, value
+
+### `tokens`
+On-demand token usage + estimated USD cost from Claude Code + Codex session transcripts. Cost is an estimate; OpenCode/Kiro/Gemini are not yet covered.
+- **action**: summary / by_instance
+- group_by (instance / task), since (`24h` / `7d` / `90m` / `all`), instance
+
+### `mode`
+Read the operator availability/authority mode (read-only for agents). Setting the mode is operator-only via the `agend-terminal mode <active|away|sleep>` CLI.
+- **action**: get
+
 ### `restart_daemon`
 
 Request graceful daemon restart. Daemon exits with code 42; wrapper script restarts it. Idempotent.
@@ -159,3 +196,15 @@ Request graceful daemon restart. Daemon exits with code 42; wrapper script resta
 **Note**: All agent PTY sessions will be interrupted. Persistent state (tasks, bindings, ci_watch) survives; in-flight inbox messages may be lost.
 
 **Parameters**: None.
+
+### `agy_quota`
+
+Query Google Antigravity subscription quota. Returns `remainingFraction` and `resetTime` for each model tier.
+
+**Parameters**: None.
+
+### `list_rules`
+
+List Reflexion rules solidified for a specific agent/worker (MistakeNotebook output).
+
+- **agent_name** (required): worker instance name to query

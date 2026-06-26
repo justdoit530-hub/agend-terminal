@@ -56,7 +56,7 @@ process notes are English-only.
 | Document | EN | 中文 | What it covers |
 |---|---|---|---|
 | Architecture | [EN](architecture.md) | [中文](architecture.zh-TW.md) | Daemon design, worktree pool, health monitor, channel lifecycle |
-| MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | All 30 agent-coordination MCP tools, by category |
+| MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | All 37 agent-coordination MCP tools, by category |
 | Environment Variables | [EN](env-vars.md) | [中文](env-vars.zh-TW.md) | Every `AGEND_*` variable and its effect |
 | Git Behavior | [EN](GIT-BEHAVIOR.md) | [中文](GIT-BEHAVIOR.zh-TW.md) | What the daemon changes in a spawned agent's git env |
 | Compatibility Policy | [EN](COMPATIBILITY.md) | [中文](COMPATIBILITY.zh-TW.md) | On-disk format stability guarantees under `$AGEND_HOME` |
@@ -96,6 +96,7 @@ maintained in English only.
 - [MCP↔Daemon Proxy Contract](MCP-DAEMON-PROXY-CONTRACT.md) — the bridge protocol
 - [Skill System Architecture](skill-system-architecture.md) — how skills are resolved per backend
 - [Project Feature Groups](project-feature-groups.md) — feature-to-module mapping
+- [Chat Platform API Reference](chat-platform-api-reference.md) — per-platform integration notes for writing `src/channel/` adapters
 - [Loop Engineering Mapping](loop-engineering-mapping.md) — supervisor loop responsibilities
 - [F685 Fixture Corpus](F685-FIXTURE-CORPUS.md) — state-replay fixture corpus
 - [F9 Productive-Output Gate](F9-PRODUCTIVE-OUTPUT-GATE.md) — the productive-output gate design
@@ -112,6 +113,7 @@ maintained in English only.
 - [Process: LOC Estimation Methodology](PROCESS-LOC-ESTIMATION-METHODOLOGY.md)
 - [Process: systemd / loginctl Operator Hardening](PROCESS-SYSTEMD-LOGINCTL-OPERATOR-HARDENING.md)
 - [Process: Tier-2 Dual-Review Lessons Learned](PROCESS-TIER2-DUAL-REVIEW-LESSONS-LEARNED.md)
+- [Operator PTY-Capture Queue](operator-capture-queue.md) — operator runbook for recording real-backend `.raw` fixtures
 - [Refactor Plan](REFACTOR-PLAN.md) — the active architecture-pass plan
 </details>
 
