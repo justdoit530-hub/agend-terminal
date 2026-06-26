@@ -405,6 +405,30 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
     let reason = args["reason"].as_str().unwrap_or("manual restart");
     let mode = args["mode"].as_str().unwrap_or("resume");
 
+    // #2476: a `fresh` restart DROPS the agent's in-memory context (that is its
+    // value — it releases a stale prompt cache while a dev idles waiting on
+    // review/CI). But fresh-restart-as-routine must not silently discard
+    // UNCOMMITTED groundwork in the agent's bound worktree. Pre-flight: if the
+    // bound worktree has uncommitted changes, refuse unless `force:true`, telling
+    // the caller to push / leave a board handoff first. `resume` is unaffected
+    // (it keeps context), and an unbound agent has no worktree to protect.
+    if mode != "resume" && !args["force"].as_bool().unwrap_or(false) {
+        if let Some(wt) = crate::binding::read(home, name)
+            .and_then(|b| b["worktree"].as_str().map(std::path::PathBuf::from))
+        {
+            if wt.exists() && crate::worktree::has_uncommitted_changes(&wt) {
+                return json!({
+                    "error": "refusing fresh restart: bound worktree has uncommitted changes \
+                              that a context drop would strand. Commit/push (or leave a task-board \
+                              handoff) first, then retry — or pass force:true to drop context anyway.",
+                    "name": name,
+                    "worktree": wt.display().to_string(),
+                    "code": "uncommitted_work_at_risk",
+                });
+            }
+        }
+    }
+
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     let config = match crate::fleet::FleetConfig::load(&fleet_path) {
         Ok(c) => c,
@@ -510,6 +534,94 @@ pub(super) fn resolve_team_layout(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn dirty_worktree(tag: &str) -> std::path::PathBuf {
+        let wt = std::env::temp_dir().join(format!(
+            "agend-2476-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&wt).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&wt)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git");
+        };
+        git(&["init", "-b", "main"]);
+        // Untracked file → `git status --porcelain` non-empty → work-at-risk.
+        std::fs::write(wt.join("wip.txt"), "uncommitted groundwork").unwrap();
+        wt
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn bind_worktree(home: &std::path::Path, agent: &str, wt: &std::path::Path) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::json!({"worktree": wt.display().to_string()}).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// #2476: a `fresh` restart must refuse when the bound worktree has
+    /// uncommitted changes (context drop would strand them), unless `force`.
+    /// `resume` keeps context so it is never guarded.
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn fresh_restart_guards_uncommitted_worktree_2476() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-2476-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let wt = dirty_worktree("wt");
+        bind_worktree(&home, "dev", &wt);
+
+        // fresh + dirty + no force → refused at the guard (before any spawn).
+        let refused = handle_restart_instance(
+            &home,
+            &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+        );
+        assert_eq!(
+            refused["code"], "uncommitted_work_at_risk",
+            "got: {refused}"
+        );
+
+        // force bypasses the guard (proceeds past it — a later error is NOT the guard).
+        let forced = handle_restart_instance(
+            &home,
+            &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        );
+        assert_ne!(
+            forced["code"], "uncommitted_work_at_risk",
+            "force must bypass: {forced}"
+        );
+
+        // resume keeps context → never guarded.
+        let resumed = handle_restart_instance(
+            &home,
+            &serde_json::json!({"instance": "dev", "mode": "resume"}),
+        );
+        assert_ne!(
+            resumed["code"], "uncommitted_work_at_risk",
+            "resume must not guard: {resumed}"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::remove_dir_all(&wt).ok();
+    }
 
     // #1625: every restart, regardless of mode, must carry the same-tab layout
     // hint so the respawned pane returns to its original tab (the fresh path

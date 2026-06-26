@@ -94,7 +94,8 @@
 ### `restart_instance`
 終止並重啟一個 instance。預設模式 `resume` 會保留對話狀態；`fresh` 則從乾淨狀態啟動（等同 `replace_instance`）。
 - **instance**: 要重啟的 instance
-- mode (resume / fresh), reason
+- mode (resume / fresh), reason, force
+- `fresh` 預設會在 bound worktree 有未提交變更時拒絕（#2476）；請先 commit/push 或留下 task-board handoff，或傳 `force: true`。
 
 ### `list_instances`
 列出所有作用中的 agent instance。可選擇性傳入 `instance` 以取得單一 instance 的詳細資訊。
