@@ -449,7 +449,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             }
 
             if verdict == super::comms_gates::Verdict::Rejected {
-                crate::reflexion::record_mistake(home, sender.as_str(), target, summary, args);
+                crate::reflexion::record_mistake(home, target, sender.as_str(), summary, args);
             }
 
             // #1666 Phase B (WARN-first): cross-check the checkable evidence and

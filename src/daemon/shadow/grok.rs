@@ -52,11 +52,7 @@ struct GrokRecord {
 /// agent-state transition. PURE — unit-tested against real line shapes, no I/O.
 pub(crate) fn record_to_evidence(line: &str, now_ms: u64) -> Option<Evidence> {
     let rec: GrokRecord = serde_json::from_str(line.trim()).ok()?;
-    let at_ms = rec
-        .ts
-        .as_deref()
-        .and_then(parse_iso_ms)
-        .unwrap_or(now_ms);
+    let at_ms = rec.ts.as_deref().and_then(parse_iso_ms).unwrap_or(now_ms);
     let kind = match rec.event_type.as_str() {
         "turn_started" => EvidenceKind::TurnStarted,
         "first_token" => EvidenceKind::Responding,
@@ -129,7 +125,11 @@ fn grok_sessions_root() -> Option<PathBuf> {
     let base = std::env::var("GROK_HOME")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".grok")))?;
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".grok"))
+        })?;
     Some(base.join("sessions"))
 }
 
@@ -313,27 +313,37 @@ mod tests {
             Some(EvidenceKind::Responding)
         );
         assert_eq!(
-            kind_of(r#"{"ts":"2026-06-25T05:04:46.497Z","type":"tool_started","tool_name":"Glob"}"#),
+            kind_of(
+                r#"{"ts":"2026-06-25T05:04:46.497Z","type":"tool_started","tool_name":"Glob"}"#
+            ),
             Some(EvidenceKind::ToolStarted {
                 name: Some("Glob".into())
             })
         );
         assert_eq!(
-            kind_of(r#"{"ts":"2026-06-25T05:04:46.507Z","type":"tool_completed","tool_name":"Read","outcome":"success"}"#),
+            kind_of(
+                r#"{"ts":"2026-06-25T05:04:46.507Z","type":"tool_completed","tool_name":"Read","outcome":"success"}"#
+            ),
             Some(EvidenceKind::ToolEnded)
         );
         assert_eq!(
-            kind_of(r#"{"ts":"2026-06-25T05:06:41.597Z","type":"turn_ended","outcome":"completed"}"#),
+            kind_of(
+                r#"{"ts":"2026-06-25T05:06:41.597Z","type":"turn_ended","outcome":"completed"}"#
+            ),
             Some(EvidenceKind::TurnEnded {
                 stop_reason: Some("completed".into())
             })
         );
         assert_eq!(
-            kind_of(r#"{"ts":"2026-06-25T05:04:46.498Z","type":"permission_requested","tool_name":"Glob"}"#),
+            kind_of(
+                r#"{"ts":"2026-06-25T05:04:46.498Z","type":"permission_requested","tool_name":"Glob"}"#
+            ),
             Some(EvidenceKind::ApprovalRequired)
         );
         assert_eq!(
-            kind_of(r#"{"ts":"2026-06-25T05:04:44.552Z","type":"phase_changed","phase":"permission_prompt"}"#),
+            kind_of(
+                r#"{"ts":"2026-06-25T05:04:44.552Z","type":"phase_changed","phase":"permission_prompt"}"#
+            ),
             Some(EvidenceKind::ApprovalRequired)
         );
     }
@@ -341,11 +351,15 @@ mod tests {
     #[test]
     fn noisy_phase_changed_and_unknown_types_are_none() {
         assert_eq!(
-            kind_of(r#"{"ts":"2026-06-25T05:04:44.552Z","type":"phase_changed","phase":"streaming_reasoning"}"#),
+            kind_of(
+                r#"{"ts":"2026-06-25T05:04:44.552Z","type":"phase_changed","phase":"streaming_reasoning"}"#
+            ),
             None
         );
         assert_eq!(
-            kind_of(r#"{"ts":"2026-06-25T05:04:44.552Z","type":"phase_changed","phase":"waiting_for_model"}"#),
+            kind_of(
+                r#"{"ts":"2026-06-25T05:04:44.552Z","type":"phase_changed","phase":"waiting_for_model"}"#
+            ),
             None
         );
         assert_eq!(kind_of(r#"{"type":"mcp_server_connected"}"#), None);

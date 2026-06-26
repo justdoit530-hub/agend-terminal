@@ -48,7 +48,8 @@ pub mod ux_event;
 pub use binding::BindingRef;
 pub use caps::{ChannelCapabilities, MarkdownDialect, MentionStyle, NativeSeeAllHint, RateBudget};
 pub use event::{
-    Attachment, AttachmentKind, ButtonDef, ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason, User,
+    Attachment, AttachmentKind, ButtonDef, ChannelEvent, MsgPayload, MsgRef, OutMsg, RevokeReason,
+    User,
 };
 pub use sink_registry::{registry, UxSinkRegistry};
 pub use ux_event::{select_action, FleetEvent, NoopUxSink, UxAction, UxEvent, UxEventSink};

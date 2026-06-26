@@ -157,8 +157,14 @@ pub(super) fn try_telegram_reply_from(
                         new_chat_id = new_ch.group_id,
                         "retrying send after supergroup migration"
                     );
-                    return telegram_reply_send_inner(&new_ch, instance_name, topic_id, text, buttons)
-                        .map(|msg_id| (msg_id, new_ch.group_id));
+                    return telegram_reply_send_inner(
+                        &new_ch,
+                        instance_name,
+                        topic_id,
+                        text,
+                        buttons,
+                    )
+                    .map(|msg_id| (msg_id, new_ch.group_id));
                 }
             }
             if let Some(stale_tid) = topic_id {
@@ -172,8 +178,14 @@ pub(super) fn try_telegram_reply_from(
                             new_topic = new_tid,
                             "retrying send with recreated topic"
                         );
-                        return telegram_reply_send_inner(&ch, instance_name, Some(new_tid), text, buttons)
-                            .map(|msg_id| (msg_id, ch.group_id));
+                        return telegram_reply_send_inner(
+                            &ch,
+                            instance_name,
+                            Some(new_tid),
+                            text,
+                            buttons,
+                        )
+                        .map(|msg_id| (msg_id, ch.group_id));
                     }
                 }
             }

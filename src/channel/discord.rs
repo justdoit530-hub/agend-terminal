@@ -1026,7 +1026,10 @@ mod tests {
         let result = crate::channel::Channel::send_from_agent(
             &ch,
             "unknown-agent",
-            crate::channel::AgentOutboundOp::Reply { text: "hi".into(), buttons: None },
+            crate::channel::AgentOutboundOp::Reply {
+                text: "hi".into(),
+                buttons: None,
+            },
         );
         let err = result.expect_err("unbound instance must error");
         let err_msg = format!("{err}");
@@ -1044,7 +1047,10 @@ mod tests {
         let result = crate::channel::Channel::send_from_agent(
             &ch,
             "any-agent",
-            crate::channel::AgentOutboundOp::Reply { text: "hi".into(), buttons: None },
+            crate::channel::AgentOutboundOp::Reply {
+                text: "hi".into(),
+                buttons: None,
+            },
         );
         let err = result.expect_err("unauthorized channel must reject");
         let err_msg = format!("{err}");

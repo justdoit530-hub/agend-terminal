@@ -376,11 +376,13 @@ fn respawn_agent_worker(
         }
         Err(e) => {
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
-            crate::event_log::log(home, "crash_respawn_failed", &config.name, &format!("error: {e}"));
-            let msg = format!(
-                "🛑 Agent `{}` crash-respawn failed: {}",
-                config.name, e
+            crate::event_log::log(
+                home,
+                "crash_respawn_failed",
+                &config.name,
+                &format!("error: {e}"),
             );
+            let msg = format!("🛑 Agent `{}` crash-respawn failed: {}", config.name, e);
             crate::channel::notify_all_escalation_channels(
                 &config.name,
                 crate::channel::NotifySeverity::Error,
@@ -612,10 +614,8 @@ mod deleted_gate_tests_1913 {
         let reg: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let handle = make_handle(false);
         let saved_health = handle.core.lock().health.clone();
-        reg.lock().insert(
-            InstanceId::parse(VICTIM_UUID).expect("valid uuid"),
-            handle,
-        );
+        reg.lock()
+            .insert(InstanceId::parse(VICTIM_UUID).expect("valid uuid"), handle);
 
         let config = AgentConfig {
             name: VICTIM.to_string(),
@@ -642,13 +642,16 @@ mod deleted_gate_tests_1913 {
         );
 
         // Verify 1: event-log.jsonl should have a crash_respawn_failed record
-        let log_content = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap();
+        let log_content = std::fs::read_to_string(home.join("event-log.jsonl"))
+            .expect("failed to read event-log.jsonl");
         assert!(log_content.contains("crash_respawn_failed"));
 
         // Verify 2: health state in the registry should be HealthState::Failed
         {
             let r = reg.lock();
-            let handle = r.get(&InstanceId::parse(VICTIM_UUID).unwrap()).unwrap();
+            let handle = r
+                .get(&InstanceId::parse(VICTIM_UUID).expect("invalid victim uuid"))
+                .expect("missing registry handle");
             let core = handle.core.lock();
             assert_eq!(core.health.state, crate::health::HealthState::Failed);
         }
@@ -656,4 +659,3 @@ mod deleted_gate_tests_1913 {
         std::fs::remove_dir_all(&home).ok();
     }
 }
-

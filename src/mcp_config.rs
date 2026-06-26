@@ -826,9 +826,7 @@ pub fn configure(working_dir: &Path, command: &str, instance_name: Option<&str>)
         Some(crate::backend::Backend::Shell)
         | Some(crate::backend::Backend::GrokCli)
         | Some(crate::backend::Backend::Raw(_))
-        | None => {
-            return
-        }
+        | None => return,
     };
 
     if let Err(e) = result {

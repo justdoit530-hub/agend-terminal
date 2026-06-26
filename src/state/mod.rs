@@ -1237,7 +1237,9 @@ impl StateTracker {
                 return Some((pct, self.context_provider));
             }
         }
-        if let crate::backend_profile::ContextProvider::TranscriptEstimate { .. } = self.context_provider {
+        if let crate::backend_profile::ContextProvider::TranscriptEstimate { .. } =
+            self.context_provider
+        {
             if let Some(home_path) = home {
                 if self.backend_name == "antigravity-cli" {
                     if let Some(pct) = crate::token_cost::estimate_agy_context_pct_in(home_path) {
@@ -1245,14 +1247,20 @@ impl StateTracker {
                     }
                 } else if self.backend_name == "grok" {
                     let roots = crate::token_cost::instance_roots(home_path);
-                    if let Some((_, paths)) = roots.into_iter().find(|(name, _)| name == &self.instance_name) {
+                    if let Some((_, paths)) = roots
+                        .into_iter()
+                        .find(|(name, _)| name == &self.instance_name)
+                    {
                         if let Some(cwd) = paths.first() {
-                            if let Some(pct) = crate::token_cost::estimate_grok_context_pct_in(cwd) {
+                            if let Some(pct) = crate::token_cost::estimate_grok_context_pct_in(cwd)
+                            {
                                 return Some((pct * 100.0, self.context_provider));
                             }
                         }
                     }
-                } else if let Some(pct) = crate::token_cost::estimate_context_pct(home_path, &self.instance_name) {
+                } else if let Some(pct) =
+                    crate::token_cost::estimate_context_pct(home_path, &self.instance_name)
+                {
                     return Some((pct, self.context_provider));
                 }
             }

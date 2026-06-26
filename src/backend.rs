@@ -1534,7 +1534,9 @@ mod tests {
         let submit_key = ["\r"; 8];
         let inject_prefix = ["", "", "", "\r", "", "\r", "", ""];
         let typed_inject = [false, false, true, true, true, true, false, false];
-        let quit_command = ["/exit", "/quit", "exit", "/exit", "exit", "/exit", "exit", "exit"];
+        let quit_command = [
+            "/exit", "/quit", "exit", "/exit", "exit", "/exit", "exit", "exit",
+        ];
         let instructions_shared = [false, false, true, true, true, true, false, false];
         let inject_on_ready = [false; 8];
         let ready_timeout = [30u64, 30, 20, 45, 20, 20, 10, 10];

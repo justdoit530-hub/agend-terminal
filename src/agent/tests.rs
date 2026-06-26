@@ -2968,7 +2968,7 @@ fn bootstrap_readiness_no_registry_core_deadlock_real_path() {
 fn test_ensure_library_symlink_macos() {
     let temp_dir = std::env::temp_dir().join(format!("ensure-symlink-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
 
     super::ensure_library_symlink(&temp_dir);
 
@@ -2978,7 +2978,11 @@ fn test_ensure_library_symlink_macos() {
     if let Ok(target) = std::fs::read_link(&link) {
         if let Ok(real_home) = std::env::var("HOME") {
             let mut real_path = std::path::PathBuf::from(real_home);
-            if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+            if real_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|s| s.starts_with('.'))
+            {
                 if let Some(parent) = real_path.parent() {
                     real_path = parent.to_path_buf();
                 }
@@ -2990,19 +2994,20 @@ fn test_ensure_library_symlink_macos() {
         panic!("Library path is not a resolved link");
     }
 
-    std::fs::remove_dir_all(&temp_dir).unwrap();
+    std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 fn test_ensure_library_symlink_real_dir_macos() {
-    let temp_dir = std::env::temp_dir().join(format!("ensure-symlink-dir-test-{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("ensure-symlink-dir-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
 
     // Create a real directory for Library
     let custom_lib = temp_dir.join("Library");
-    std::fs::create_dir_all(&custom_lib).unwrap();
+    std::fs::create_dir_all(&custom_lib).expect("failed to create custom lib");
 
     super::ensure_library_symlink(&temp_dir);
 
@@ -3011,11 +3016,15 @@ fn test_ensure_library_symlink_real_dir_macos() {
 
     // keychains_link should be a symlink (if the real Keychains exists)
     let keychains_link = custom_lib.join("Keychains");
-    
+
     // Let's resolve real_path and real_lib
     if let Ok(real_home) = std::env::var("HOME") {
         let mut real_path = std::path::PathBuf::from(real_home);
-        if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+        if real_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|s| s.starts_with('.'))
+        {
             if let Some(parent) = real_path.parent() {
                 real_path = parent.to_path_buf();
             }
@@ -3031,31 +3040,30 @@ fn test_ensure_library_symlink_real_dir_macos() {
         }
     }
 
-    std::fs::remove_dir_all(&temp_dir).unwrap();
+    std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
 }
 
 #[test]
 #[cfg(target_os = "macos")]
 fn test_ensure_library_symlink_existing_symlink_macos() {
-    let temp_dir = std::env::temp_dir().join(format!("ensure-symlink-exist-test-{}", std::process::id()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("ensure-symlink-exist-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&temp_dir);
-    std::fs::create_dir_all(&temp_dir).unwrap();
+    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
 
     // Create a symlink pointing somewhere else
     let custom_lib = temp_dir.join("Library");
     let dummy_target = temp_dir.join("Dummy");
-    std::fs::create_dir_all(&dummy_target).unwrap();
-    std::os::unix::fs::symlink(&dummy_target, &custom_lib).unwrap();
+    std::fs::create_dir_all(&dummy_target).expect("failed to create dummy target");
+    std::os::unix::fs::symlink(&dummy_target, &custom_lib).expect("failed to create symlink");
 
     super::ensure_library_symlink(&temp_dir);
 
     // In Case 2: Library 已是 symlink → 不動
     // So custom_lib should still point to dummy_target
     assert!(custom_lib.is_symlink());
-    let target = std::fs::read_link(&custom_lib).unwrap();
+    let target = std::fs::read_link(&custom_lib).expect("failed to read link");
     assert_eq!(target, dummy_target);
 
-    std::fs::remove_dir_all(&temp_dir).unwrap();
+    std::fs::remove_dir_all(&temp_dir).expect("failed to remove temp dir");
 }
-
-

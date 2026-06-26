@@ -3217,15 +3217,23 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
 pub fn ensure_library_symlink(custom_home: &std::path::Path) {
     use std::os::unix::fs::symlink;
 
-    let Ok(real_home) = std::env::var("HOME") else { return };
+    let Ok(real_home) = std::env::var("HOME") else {
+        return;
+    };
     let mut real_path = std::path::PathBuf::from(real_home);
-    if real_path.file_name().and_then(|n| n.to_str()).is_some_and(|s| s.starts_with('.')) {
+    if real_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|s| s.starts_with('.'))
+    {
         if let Some(parent) = real_path.parent() {
             real_path = parent.to_path_buf();
         }
     }
     let real_lib = real_path.join("Library");
-    if !real_lib.exists() { return }
+    if !real_lib.exists() {
+        return;
+    }
 
     let custom_lib = custom_home.join("Library");
 
@@ -3256,7 +3264,6 @@ pub fn ensure_library_symlink(custom_home: &std::path::Path) {
     }
 }
 
-
 #[cfg(not(target_os = "macos"))]
 pub fn ensure_library_symlink(_custom_home: &std::path::Path) {}
 
@@ -3266,4 +3273,3 @@ mod tests;
 
 #[cfg(test)]
 mod review_repro_agent_binding;
-

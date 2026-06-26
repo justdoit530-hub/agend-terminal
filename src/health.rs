@@ -595,7 +595,9 @@ impl HealthTracker {
 
     /// Mark successful respawn.
     pub fn respawn_ok(&mut self, has_live_handle: bool) {
-        if has_live_handle && (self.state == HealthState::Recovering || self.state == HealthState::Absent) {
+        if has_live_handle
+            && (self.state == HealthState::Recovering || self.state == HealthState::Absent)
+        {
             self.state = HealthState::Healthy;
         }
         // Unstable stays until crash window clears
@@ -1085,7 +1087,9 @@ impl HealthTracker {
                     self.state = HealthState::Recovering;
                 } else {
                     self.state = HealthState::Absent;
-                    tracing::debug!("maybe_decay_at: process not alive, transitioning Failed to Absent");
+                    tracing::debug!(
+                        "maybe_decay_at: process not alive, transitioning Failed to Absent"
+                    );
                 }
             }
             if self.total_crashes < 3
