@@ -3477,7 +3477,7 @@ fn non_read_only_tool_still_writes_usage_and_disk_heartbeat() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// The allowlist is exactly the six pure-query tools; mutating + action-based
+/// The allowlist is exactly the pure-query tools; mutating + action-based
 /// tools are excluded (they keep the full path).
 #[test]
 fn is_read_only_tool_allowlist() {
@@ -3488,6 +3488,7 @@ fn is_read_only_tool_allowlist() {
         "tokens",
         "pane_snapshot",
         "tui_screenshot",
+        "list_rules",
     ] {
         assert!(is_read_only_tool(t), "{t} must be classified read-only");
     }
@@ -3506,6 +3507,53 @@ fn is_read_only_tool_allowlist() {
             "{t} must NOT be classified read-only"
         );
     }
+}
+
+#[test]
+fn test_list_rules_via_mcp() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_list_rules_test");
+    std::env::set_var("AGEND_HOME", &home);
+
+    let rules_dir = home.join("rules");
+    std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+    let rule = crate::reflexion::Rule {
+        id: "rule_test_cat".to_string(),
+        agent_name: "test-worker".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Don't forget tests".to_string(),
+        created_at: "2026-06-26T12:00:00Z".to_string(),
+        trigger_count: 3,
+    };
+    std::fs::write(
+        rules_dir.join("rule_test.json"),
+        serde_json::to_string(&rule).expect("failed to serialize rule"),
+    )
+    .expect("failed to write rule");
+
+    let result = handle_tool(
+        "list_rules",
+        &json!({"agent_name": "test-worker"}),
+        "test-worker",
+    );
+
+    let rules = result.as_array().expect("rules array");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["rule_id"], "rule_test_cat");
+    assert_eq!(rules[0]["agent_name"], "test-worker");
+    assert_eq!(rules[0]["category"], "missing_test_execution");
+    assert_eq!(rules[0]["rule_text"], "Don't forget tests");
+    assert_eq!(rules[0]["trigger_count"], 3);
+
+    let bad_result = handle_tool("list_rules", &json!({}), "test-worker");
+    assert!(
+        bad_result.get("error").is_some(),
+        "must return error for missing agent_name"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
 }
 
 struct ShadowTestChannel;

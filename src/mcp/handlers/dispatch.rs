@@ -258,6 +258,13 @@ adapter!(
     instance::handle_set_display_name
 );
 adapter!(dispatch_pane_snapshot, ha, instance::handle_pane_snapshot);
+pub(crate) fn dispatch_list_rules(ctx: &HandlerCtx<'_>) -> Value {
+    let agent_name = match ctx.args.get("agent_name").and_then(|v| v.as_str()) {
+        Some(name) => name,
+        None => return json!({"error": "missing required parameter 'agent_name'"}),
+    };
+    json!(crate::reflexion::list_rules(ctx.home, agent_name))
+}
 adapter!(
     dispatch_task_sweep_config,
     ha,

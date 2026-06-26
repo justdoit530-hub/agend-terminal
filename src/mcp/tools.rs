@@ -101,6 +101,13 @@ pub(crate) fn def_list_instances() -> Value {
         "inputSchema": {"type": "object", "properties": {"instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"}}}})
 }
 
+pub(crate) fn def_list_rules() -> Value {
+    json!({"name": "list_rules", "description": "List Reflexion rules solidified for a specific agent/worker.",
+        "inputSchema": {"type": "object", "properties": {
+            "agent_name": {"type": "string", "description": "The name of the agent/worker to query rules for."}
+        }, "required": ["agent_name"]}})
+}
+
 pub(crate) fn def_create_instance() -> Value {
     json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"agy\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=agy, all grouped in one tab.",
     "inputSchema": {"type": "object", "properties": {
