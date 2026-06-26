@@ -158,6 +158,40 @@ fn check_quota_gate(
             json!({"ok": false, "error": "target backend quota exceeded", "code": "quota_exceeded"}),
         );
     }
+    // Active Gemini quota check for agy workers (cockpit-tools API integration).
+    if crate::quota_provider::target_is_agy(home, target) {
+        match crate::quota_provider::check_sync(home, target) {
+            Ok(state) if crate::quota_provider::should_block_dispatch(&state) => {
+                tracing::warn!(
+                    target,
+                    ?state,
+                    "quota_provider: dispatch blocked — exhausted"
+                );
+                return Err(json!({
+                    "ok": false,
+                    "error": "target Gemini quota exhausted (weekly cap)",
+                    "code": "quota_exceeded",
+                    "quota_state": format!("{state:?}"),
+                }));
+            }
+            Ok(crate::quota_provider::QuotaState::RateLimited {
+                reset_at,
+                pct_remaining,
+                ..
+            }) => {
+                tracing::info!(
+                    target,
+                    %reset_at,
+                    pct_remaining,
+                    "quota_provider: target rate-limited but dispatch allowed"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(target, error = %e, "quota_provider: check failed, dispatch proceeds (fail-open)");
+            }
+        }
+    }
     Ok(())
 }
 
