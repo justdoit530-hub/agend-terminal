@@ -498,7 +498,6 @@ fn estimate_context_pct_in(projects_dir: &Path, roots: &[(String, Vec<PathBuf>)]
     None
 }
 
-
 /// Cheap attribution probe: does one of the file's first lines carry a `cwd`
 /// belonging to the instance's roots? Reads only the head — full-content
 /// attribution is the estimator's tail read.

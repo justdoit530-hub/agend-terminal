@@ -376,11 +376,13 @@ fn respawn_agent_worker(
         }
         Err(e) => {
             tracing::warn!(agent = %config.name, error = %e, "respawn failed");
-            crate::event_log::log(home, "crash_respawn_failed", &config.name, &format!("error: {e}"));
-            let msg = format!(
-                "🛑 Agent `{}` crash-respawn failed: {}",
-                config.name, e
+            crate::event_log::log(
+                home,
+                "crash_respawn_failed",
+                &config.name,
+                &format!("error: {e}"),
             );
+            let msg = format!("🛑 Agent `{}` crash-respawn failed: {}", config.name, e);
             crate::channel::notify_all_escalation_channels(
                 &config.name,
                 NotifySeverity::Error,
