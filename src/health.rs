@@ -599,6 +599,11 @@ impl HealthTracker {
         // Unstable stays until crash window clears
     }
 
+    /// Mark a failed respawn attempt — the agent could not be restarted.
+    pub fn respawn_failed(&mut self) {
+        self.state = HealthState::Failed;
+    }
+
     /// Calculate exponential backoff delay.
     fn backoff_delay(&self) -> Duration {
         if self.total_crashes == 0 {
