@@ -3444,7 +3444,7 @@ mod tests {
         use crate::health::HealthTracker;
         let mut health = HealthTracker::new();
         // maybe_decay on a fresh tracker should not panic or change state.
-        health.maybe_decay();
+        health.maybe_decay(true);
         assert_eq!(
             health.state.display_name(),
             "healthy",
