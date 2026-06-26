@@ -16,13 +16,29 @@ pub struct Mistake {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
+    #[serde(alias = "id", rename = "rule_id")]
     pub id: String,
     pub agent_name: String,
     pub category: String,
     pub rule_text: String,
+    pub created_at: String,
     #[serde(default)]
     pub trigger_count: usize,
-    pub created_at: String,
+}
+
+/// List all solidified rules for a specific agent.
+pub fn list_rules(home: &Path, agent_name: &str) -> Vec<Rule> {
+    let rules_dir = home.join("rules");
+    let Ok(entries) = fs::read_dir(&rules_dir) else {
+        return vec![];
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|content| serde_json::from_str::<Rule>(&content).ok())
+        .filter(|rule| rule.agent_name == agent_name)
+        .collect()
 }
 
 const MEM0_SYNC_URL: &str = "http://localhost:5174/add";
@@ -594,6 +610,57 @@ mod tests {
                 .expect("mem0 sync url override mutex poisoned");
             *override_url = None;
         }
+    }
+
+    #[test]
+    fn test_list_rules_filters_by_agent() {
+        let home = tmp_home("list_rules_test");
+        let rules_dir = home.join("rules");
+        std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+        let rule_a = Rule {
+            id: "rule_agent_a_cat".to_string(),
+            agent_name: "Agent-A".to_string(),
+            category: "missing_test_execution".to_string(),
+            rule_text: "Don't forget tests".to_string(),
+            created_at: "2026-06-26T12:00:00Z".to_string(),
+            trigger_count: 3,
+        };
+        let rule_b = Rule {
+            id: "rule_agent_b_cat".to_string(),
+            agent_name: "Agent-B".to_string(),
+            category: "lint_failure".to_string(),
+            rule_text: "No lint warnings".to_string(),
+            created_at: "2026-06-26T12:05:00Z".to_string(),
+            trigger_count: 4,
+        };
+
+        std::fs::write(
+            rules_dir.join("rule_agent_a.json"),
+            serde_json::to_string(&rule_a).expect("failed to serialize rule A"),
+        )
+        .expect("failed to write rule A");
+        std::fs::write(
+            rules_dir.join("rule_agent_b.json"),
+            serde_json::to_string(&rule_b).expect("failed to serialize rule B"),
+        )
+        .expect("failed to write rule B");
+
+        let rules_a = list_rules(&home, "Agent-A");
+        assert_eq!(rules_a.len(), 1);
+        assert_eq!(rules_a[0].id, "rule_agent_a_cat");
+        assert_eq!(rules_a[0].agent_name, "Agent-A");
+        assert_eq!(rules_a[0].trigger_count, 3);
+
+        let rules_b = list_rules(&home, "Agent-B");
+        assert_eq!(rules_b.len(), 1);
+        assert_eq!(rules_b[0].id, "rule_agent_b_cat");
+        assert_eq!(rules_b[0].agent_name, "Agent-B");
+        assert_eq!(rules_b[0].trigger_count, 4);
+
+        let rules_c = list_rules(&home, "Agent-C");
+        assert!(rules_c.is_empty());
+
         std::fs::remove_dir_all(&home).ok();
     }
 }

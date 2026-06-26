@@ -143,7 +143,7 @@ pub(crate) fn tool_subset_for_role(
     }
 }
 
-static ALL_TOOLS: [ToolEntry; 38] = [
+static ALL_TOOLS: [ToolEntry; 39] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -171,6 +171,11 @@ static ALL_TOOLS: [ToolEntry; 38] = [
         name: "list_instances",
         definition: super::tools::def_list_instances,
         handler: super::handlers::dispatch::dispatch_list_instances,
+    },
+    ToolEntry {
+        name: "list_rules",
+        definition: super::tools::def_list_rules,
+        handler: super::handlers::dispatch::dispatch_list_rules,
     },
     ToolEntry {
         name: "create_instance",
@@ -368,9 +373,9 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_38_byte_identical() {
+    fn full_capability_roles_surface_all_39_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
-        assert_eq!(all_names.len(), 38, "registry baseline is 38 tools");
+        assert_eq!(all_names.len(), 39, "registry baseline is 39 tools");
         for role in [
             None,
             Some(RoleKind::Orchestrator),
@@ -381,7 +386,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 38 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 39 tools in registry order (default-all-open)"
             );
         }
     }
