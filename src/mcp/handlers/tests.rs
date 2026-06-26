@@ -3632,9 +3632,9 @@ impl crate::channel::Channel for ShadowTestChannel {
 
 #[test]
 #[serial(shadow_observer)]
-fn test_mcp_intercept_hook_plane() {
+fn test_handle_tool_does_not_emit_hook_intercept_evidence() {
     let _g = fleet_test_guard();
-    let home = tmp_home("mcp_intercept_hook_test");
+    let home = tmp_home("mcp_no_hook_intercept_test");
     std::env::set_var("AGEND_HOME", &home);
     std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
     let agent = "test-shadow-agent";
@@ -3650,47 +3650,22 @@ fn test_mcp_intercept_hook_plane() {
     )
     .ok();
 
-    // Clear any previous buffer for this agent name
     crate::daemon::shadow::forget_agent(agent);
 
-    // Call a read-write tool (e.g. `mode`)
     let result_mode = handle_tool("mode", &json!({"action": "get"}), agent);
     assert!(result_mode["ok"].as_bool().unwrap_or(false));
+    assert!(
+        crate::daemon::shadow::peek(agent).is_empty(),
+        "handle_tool must not push ToolStarted/ToolEnded — shadow/mod.rs hook socket is authoritative"
+    );
 
-    let evs_mode = crate::daemon::shadow::peek(agent);
-    assert_eq!(evs_mode.len(), 2);
-    assert!(matches!(
-        evs_mode[0].kind,
-        crate::daemon::shadow::evidence::EvidenceKind::ToolStarted { name: Some(ref name) } if name == "mode"
-    ));
-    assert!(matches!(
-        evs_mode[1].kind,
-        crate::daemon::shadow::evidence::EvidenceKind::ToolEnded
-    ));
-
-    // Clear buffer
-    crate::daemon::shadow::forget_agent(agent);
-
-    // Call "reply" tool and verify it succeeds and generates TurnEnded
     let result_reply = handle_tool("reply", &json!({"message": "test reply"}), agent);
     assert!(result_reply.get("error").is_none());
+    assert!(
+        crate::daemon::shadow::peek(agent).is_empty(),
+        "handle_tool must not push TurnEnded — prevents double-counting with shadow/mod.rs"
+    );
 
-    let evs_reply = crate::daemon::shadow::peek(agent);
-    assert_eq!(evs_reply.len(), 3);
-    assert!(matches!(
-        evs_reply[0].kind,
-        crate::daemon::shadow::evidence::EvidenceKind::ToolStarted { name: Some(ref name) } if name == "reply"
-    ));
-    assert!(matches!(
-        evs_reply[1].kind,
-        crate::daemon::shadow::evidence::EvidenceKind::ToolEnded
-    ));
-    assert!(matches!(
-        evs_reply[2].kind,
-        crate::daemon::shadow::evidence::EvidenceKind::TurnEnded { .. }
-    ));
-
-    // Clean up
     crate::daemon::shadow::forget_agent(agent);
     crate::channel::reset_active_channel_for_test();
     std::env::remove_var("AGEND_HOME");
