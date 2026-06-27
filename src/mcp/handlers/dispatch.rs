@@ -27,6 +27,7 @@
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::Duration;
 
 use super::{
     binding_state, channel, ci, comms, ephemeral, force_release, gc, instance, restart, schedule,
@@ -304,22 +305,70 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
         let mut modified_args = ctx.args.clone();
         if let Some(agent_name) = modified_args["assignee"].as_str() {
             if !agent_name.is_empty() {
+                let original_message = modified_args["description"].as_str().unwrap_or("");
+                let mut sections = vec![original_message.to_string()];
                 let rules = crate::reflexion::list_rules(ctx.home, agent_name);
                 if !rules.is_empty() {
-                    let original_message = modified_args["description"].as_str().unwrap_or("");
                     let rules_text = rules
                         .iter()
                         .map(|r| format!("- {}", r.rule_text))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    let new_message = format!("{}\n\n[適用規則]\n{}", original_message, rules_text);
-                    modified_args["description"] = json!(new_message);
+                    sections.push(format!("[適用規則]\n{rules_text}"));
+                }
+                if let Some(mem0_context) = dispatch_mem0_context(agent_name, original_message) {
+                    sections.push(mem0_context);
+                }
+                if sections.len() > 1 {
+                    modified_args["description"] = json!(sections.join("\n\n"));
                 }
             }
         }
         task::handle_task(ctx.home, &modified_args, ctx.instance_name)
     } else {
         task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+    }
+}
+
+fn dispatch_mem0_context(agent_name: &str, message: &str) -> Option<String> {
+    let message_prefix: String = message.chars().take(100).collect();
+    let query = format!("{agent_name} {message_prefix}");
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+        return None;
+    }
+    tokio::task::block_in_place(|| handle.block_on(search_mem0_context(&query)))
+}
+
+async fn search_mem0_context(query: &str) -> Option<String> {
+    let base_url =
+        std::env::var("MEM0_HTTP_URL").unwrap_or_else(|_| "http://localhost:5174".to_string());
+    let url = format!("{}/search", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let response = client
+        .post(url)
+        .json(&json!({
+            "query": query,
+            "limit": 3,
+            "user_id": "neo",
+        }))
+        .send()
+        .await
+        .ok()?;
+    let body: Value = response.json().await.ok()?;
+    let memories = body["results"]
+        .as_array()?
+        .iter()
+        .filter_map(|result| result["memory"].as_str())
+        .map(|memory| format!("- {memory}"))
+        .collect::<Vec<_>>();
+    if memories.is_empty() {
+        None
+    } else {
+        Some(format!("[過去經驗]\n{}", memories.join("\n")))
     }
 }
 
