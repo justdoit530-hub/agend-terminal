@@ -3621,6 +3621,43 @@ fn test_dispatch_task_injects_rules() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn test_dispatch_mem0_graceful_fail() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_dispatch_mem0_graceful_fail_test");
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("MEM0_HTTP_URL", "http://127.0.0.1:1");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let started = std::time::Instant::now();
+    let result = runtime.block_on(async {
+        handle_tool(
+            "task",
+            &json!({
+                "action": "create",
+                "title": "Mem0 graceful fail task",
+                "description": "Original description",
+                "assignee": "test-agent",
+            }),
+            "operator",
+        )
+    });
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "Mem0 failure should not block task creation beyond the request timeout"
+    );
+    assert!(result.get("error").is_none());
+    assert_eq!(result["task"]["description"], "Original description");
+
+    std::env::remove_var("MEM0_HTTP_URL");
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 struct ShadowTestChannel;
 
 impl crate::channel::Channel for ShadowTestChannel {
