@@ -12,6 +12,33 @@ pub struct Mistake {
     pub category: String,
     pub rejection_reason: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub corrected_at: Option<String>,
+}
+
+pub fn mark_mistake_corrected(home: &Path, agent_name: &str, category: &str) {
+    let mistakes_dir = home.join("mistakes");
+    let Ok(entries) = fs::read_dir(&mistakes_dir) else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    for entry in entries.filter_map(Result::ok) {
+        if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if let Ok(mut m) = serde_json::from_str::<Mistake>(&content) {
+                    if m.agent_name == agent_name
+                        && m.category == category
+                        && m.corrected_at.is_none()
+                    {
+                        m.corrected_at = Some(now.clone());
+                        if let Ok(serialized) = serde_json::to_string_pretty(&m) {
+                            let _ = fs::write(entry.path(), serialized);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +186,7 @@ pub fn record_mistake(
         category: category.to_string(),
         rejection_reason: rejection_text,
         timestamp: chrono::Utc::now().to_rfc3339(),
+        corrected_at: None,
     };
 
     let filepath = mistakes_dir.join(format!("{}.json", mistake.id));
@@ -232,6 +260,32 @@ pub fn solidify_rule(
     category: &str,
     trigger_count: usize,
 ) -> Option<String> {
+    let mistakes_dir = home.join("mistakes");
+    let mut recent_mistakes = Vec::new();
+    if let Ok(entries) = fs::read_dir(&mistakes_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(m) = serde_json::from_str::<Mistake>(&content) {
+                        if m.agent_name == agent_name && m.category == category {
+                            recent_mistakes.push(m);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let has_correction = recent_mistakes.iter().any(|m| m.corrected_at.is_some());
+    if !has_correction {
+        tracing::debug!(
+            agent_name,
+            category,
+            "solidify skipped: no successful correction yet"
+        );
+        return None;
+    }
+
     let rules_dir = home.join("rules");
     if let Err(e) = fs::create_dir_all(&rules_dir) {
         tracing::warn!(?e, "failed to create rules directory");
@@ -617,6 +671,8 @@ mod tests {
         );
         assert!(rule_id.is_none(), "Threshold not reached yet");
 
+        mark_mistake_corrected(&home, agent, "missing_test_execution");
+
         let rule_id = record_mistake(
             &home,
             "general",
@@ -708,6 +764,23 @@ mod tests {
         });
 
         let home = tmp_home("mem0_sync_test");
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+        let mock_mistake = Mistake {
+            id: "mock_mstk_1".to_string(),
+            task_id: None,
+            agent_name: "test-agent".to_string(),
+            category: "lint_failure".to_string(),
+            rejection_reason: "mock".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        std::fs::write(
+            mistakes_dir.join("mock_mstk_1.json"),
+            serde_json::to_string(&mock_mistake).expect("failed to serialize mock mistake"),
+        )
+        .expect("failed to write mock mistake");
+
         let rule_id = solidify_rule(&home, "test-agent", "lint_failure", 4)
             .expect("expected rule to solidify");
         assert_eq!(rule_id, "rule_test-agent_lint_failure");
@@ -828,6 +901,8 @@ mod tests {
             Some("wrong_pr_repo"),
         );
         assert!(rule_id.is_none());
+        mark_mistake_corrected(&home, agent, "wrong_pr_repo");
+
         let rule_id = record_mistake(
             &home,
             "general",
@@ -869,6 +944,22 @@ mod tests {
         .expect("failed to init AGENTS.md");
 
         // No active binding is set up.
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+        let mock_mistake = Mistake {
+            id: "mock_mstk_2".to_string(),
+            task_id: None,
+            agent_name: agent.to_string(),
+            category: "missing_test_execution".to_string(),
+            rejection_reason: "mock".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        std::fs::write(
+            mistakes_dir.join("mock_mstk_2.json"),
+            serde_json::to_string(&mock_mistake).expect("failed to serialize mock mistake 2"),
+        )
+        .expect("failed to write mock mistake 2");
 
         let rule_id = solidify_rule(&home, agent, "missing_test_execution", 3)
             .expect("expected solidified rule ID");
@@ -951,6 +1042,7 @@ mod tests {
             category: "lint_failure".to_string(),
             rejection_reason: "old failure".to_string(),
             timestamp: old_timestamp,
+            corrected_at: None,
         };
         let mistakes_dir = home.join("mistakes");
         std::fs::create_dir_all(&mistakes_dir).expect("create mistakes dir");
@@ -975,6 +1067,8 @@ mod tests {
         );
 
         // 4. Record third mistake (now)
+        mark_mistake_corrected(&home, agent, "lint_failure");
+
         let rule_id = record_mistake(
             &home,
             "general",
@@ -998,6 +1092,7 @@ mod tests {
             category: "lint_failure".to_string(),
             rejection_reason: "very old failure".to_string(),
             timestamp: very_old_timestamp,
+            corrected_at: None,
         };
         let very_old_path = mistakes_dir.join(format!("{}.json", very_old_mistake_id));
         std::fs::write(
@@ -1022,6 +1117,81 @@ mod tests {
                 .exists(),
             "35-day-old mistake should NOT be cleaned up"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_disconfirming_gate_blocks_without_correction() {
+        let home = tmp_home("gate_blocks_test");
+        let agent = "test-agent-gate";
+        let category = "lint_failure";
+
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+
+        for i in 1..=3 {
+            let m = Mistake {
+                id: format!("mstk_{}", i),
+                task_id: None,
+                agent_name: agent.to_string(),
+                category: category.to_string(),
+                rejection_reason: "clippy warning".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                corrected_at: None,
+            };
+            std::fs::write(
+                mistakes_dir.join(format!("{}.json", m.id)),
+                serde_json::to_string(&m).expect("failed to serialize mistake"),
+            )
+            .expect("failed to write mistake");
+        }
+
+        let rule_id = solidify_rule(&home, agent, category, 3);
+        assert!(
+            rule_id.is_none(),
+            "Should be blocked because there is no correction"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_disconfirming_gate_allows_after_correction() {
+        let home = tmp_home("gate_allows_test");
+        let agent = "test-agent-gate";
+        let category = "lint_failure";
+
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+
+        for i in 1..=3 {
+            let m = Mistake {
+                id: format!("mstk_{}", i),
+                task_id: None,
+                agent_name: agent.to_string(),
+                category: category.to_string(),
+                rejection_reason: "clippy warning".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                corrected_at: None,
+            };
+            std::fs::write(
+                mistakes_dir.join(format!("{}.json", m.id)),
+                serde_json::to_string(&m).expect("failed to serialize mistake"),
+            )
+            .expect("failed to write mistake");
+        }
+
+        mark_mistake_corrected(&home, agent, category);
+
+        // Solidify should now succeed
+        let rule_id = solidify_rule(&home, agent, category, 3);
+        assert!(
+            rule_id.is_some(),
+            "Should solidify rule since mistake is corrected"
+        );
+        let rule_id_str = rule_id.expect("expected solidified rule");
+        assert_eq!(rule_id_str, format!("rule_{}_{}", agent, category));
 
         std::fs::remove_dir_all(&home).ok();
     }
