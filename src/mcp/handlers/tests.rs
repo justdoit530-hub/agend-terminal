@@ -395,16 +395,16 @@ fn verified_report_result_records_success() {
         "VERIFIED report_result should succeed: {result}"
     );
 
-    let successes_path = home.join("successes").join("sender.json");
+    let successes_path = home.join("successes").join("target.json");
     assert!(
         successes_path.exists(),
-        "VERIFIED report should record a success for the reporting agent"
+        "VERIFIED report should record a success for the reviewed worker"
     );
     let successes: Vec<crate::reflexion::Success> =
         serde_json::from_str(&std::fs::read_to_string(successes_path).expect("read successes"))
             .expect("deserialize successes");
     assert_eq!(successes.len(), 1);
-    assert_eq!(successes[0].agent_name, "sender");
+    assert_eq!(successes[0].agent_name, "target");
     assert_eq!(successes[0].category, "clean_review");
     assert!(successes[0].summary.starts_with("VERIFIED"));
 
