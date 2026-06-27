@@ -461,7 +461,7 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
 
             if verdict == super::comms_gates::Verdict::Verified {
                 if let Some(category) = args.get("category").and_then(|v| v.as_str()) {
-                    crate::reflexion::mark_mistake_corrected(home, sender.as_str(), category);
+                    crate::reflexion::mark_mistake_corrected(home, target, category);
                 }
             }
 
