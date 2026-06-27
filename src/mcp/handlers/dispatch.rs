@@ -27,6 +27,7 @@
 use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use super::{
@@ -333,34 +334,80 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
 fn dispatch_mem0_context(agent_name: &str, message: &str) -> Option<String> {
     let message_prefix: String = message.chars().take(100).collect();
     let query = format!("{agent_name} {message_prefix}");
-    let handle = tokio::runtime::Handle::try_current().ok()?;
-    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-        return None;
+    let worker = match std::thread::Builder::new()
+        .name("agend-mem0-dispatch".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to build Mem0 dispatch lookup runtime");
+                    return None;
+                }
+            };
+            rt.block_on(search_mem0_context(&query))
+        }) {
+        Ok(worker) => worker,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to spawn Mem0 dispatch lookup thread");
+            return None;
+        }
+    };
+    match worker.join() {
+        Ok(context) => context,
+        Err(_) => {
+            tracing::warn!("Mem0 dispatch lookup thread panicked");
+            None
+        }
     }
-    tokio::task::block_in_place(|| handle.block_on(search_mem0_context(&query)))
 }
 
 async fn search_mem0_context(query: &str) -> Option<String> {
     let base_url =
         std::env::var("MEM0_HTTP_URL").unwrap_or_else(|_| "http://localhost:5174".to_string());
     let url = format!("{}/search", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .ok()?;
-    let response = client
+    let user_id = std::env::var("MEM0_USER_ID").unwrap_or_else(|_| "neo".to_string());
+    let client = mem0_http_client()?;
+    let response = match client
         .post(url)
         .json(&json!({
             "query": query,
             "limit": 3,
-            "user_id": "neo",
+            "user_id": user_id,
         }))
         .send()
         .await
-        .ok()?;
-    let body: Value = response.json().await.ok()?;
-    let memories = body["results"]
-        .as_array()?
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(error = %err, "Mem0 dispatch lookup request failed");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            status = %response.status(),
+            "Mem0 dispatch lookup returned non-success status"
+        );
+        return None;
+    }
+    let body: Value = match response.json().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(error = %err, "Mem0 dispatch lookup response was not valid JSON");
+            return None;
+        }
+    };
+    let results = match body["results"].as_array() {
+        Some(results) => results,
+        None => {
+            tracing::warn!("Mem0 dispatch lookup response missing results array");
+            return None;
+        }
+    };
+    let memories = results
         .iter()
         .filter_map(|result| result["memory"].as_str())
         .map(|memory| format!("- {memory}"))
@@ -370,6 +417,24 @@ async fn search_mem0_context(query: &str) -> Option<String> {
     } else {
         Some(format!("[過去經驗]\n{}", memories.join("\n")))
     }
+}
+
+fn mem0_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            match reqwest::Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+            {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to build Mem0 dispatch HTTP client");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 action_adapter!(dispatch_ci, "ci", [
