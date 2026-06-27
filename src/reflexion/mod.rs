@@ -224,6 +224,7 @@ pub fn solidify_rule(
     }
 
     // Inject rule into agent's .agents/AGENTS.md
+    let mut injected = false;
     if let Some(binding) = crate::binding::read(home, agent_name) {
         if let Some(worktree_path) = binding["worktree"].as_str() {
             let agents_md_path = Path::new(worktree_path).join(".agents").join("AGENTS.md");
@@ -235,6 +236,32 @@ pub fn solidify_rule(
                     category,
                     "solidified rule injected to AGENTS.md"
                 );
+                injected = true;
+            }
+        }
+    }
+
+    if !injected {
+        // Fallback: scan ~/.agend/worktrees/<agent_name>/
+        let worktrees_base = home.join("worktrees").join(agent_name);
+        if let Ok(entries) = fs::read_dir(&worktrees_base) {
+            for entry in entries.filter_map(Result::ok) {
+                let agents_md = entry.path().join(".agents").join("AGENTS.md");
+                if agents_md.exists() {
+                    if let Err(e) = inject_rule_to_agents_md(&agents_md, category, rule_text) {
+                        tracing::warn!(
+                            ?e,
+                            ?agents_md,
+                            "failed to inject rule to AGENTS.md via fallback"
+                        );
+                    } else {
+                        tracing::info!(
+                            ?agents_md,
+                            category,
+                            "solidified rule injected to AGENTS.md via fallback"
+                        );
+                    }
+                }
             }
         }
     }
@@ -745,6 +772,42 @@ mod tests {
             rule.rule_text,
             "NEVER open a PR to suzuke/agend-terminal; always use justdoit530-hub/agend-terminal"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_solidify_rule_fallback_worktree_scan() {
+        let home = tmp_home("solidify_fallback_test");
+        let agent = "fallback-agent";
+
+        // Create the worktree folder under ~/.agend/worktrees/<agent_name>/some_worktree/
+        let worktree_dir = home.join("worktrees").join(agent).join("mock_worktree_1");
+        std::fs::create_dir_all(worktree_dir.join(".agents")).expect("failed to create agents dir");
+
+        let agents_md_path = worktree_dir.join(".agents").join("AGENTS.md");
+        std::fs::write(
+            &agents_md_path,
+            "<!-- agend-rules:start -->\n<!-- agend-rules:end -->",
+        )
+        .expect("failed to init AGENTS.md");
+
+        // No active binding is set up.
+
+        let rule_id = solidify_rule(&home, agent, "missing_test_execution", 3)
+            .expect("expected solidified rule ID");
+        assert_eq!(rule_id, format!("rule_{}_missing_test_execution", agent));
+
+        // The rule should still be written to rules/
+        let rule_path = home.join("rules").join(format!("{}.json", rule_id));
+        assert!(rule_path.exists());
+
+        // And it should have fallback-injected into the mock worktree's AGENTS.md
+        let agents_md_content =
+            std::fs::read_to_string(&agents_md_path).expect("failed to read AGENTS.md");
+        assert!(agents_md_content.contains("<!-- agend-rules:start -->"));
+        assert!(agents_md_content.contains("NEVER report VERIFIED without running cargo test"));
+        assert!(agents_md_content.contains("<!-- agend-rules:end -->"));
 
         std::fs::remove_dir_all(&home).ok();
     }
