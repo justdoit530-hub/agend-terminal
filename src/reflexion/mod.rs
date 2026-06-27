@@ -168,15 +168,20 @@ pub fn record_mistake(
         }
     }
 
-    // Count mistakes of same agent and category
+    // Count mistakes of same agent and category within 30 days
     let mut count = 0;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
     if let Ok(entries) = fs::read_dir(&mistakes_dir) {
         for entry in entries.filter_map(Result::ok) {
             if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
                 if let Ok(content) = fs::read_to_string(entry.path()) {
                     if let Ok(m) = serde_json::from_str::<Mistake>(&content) {
                         if m.agent_name == real_agent_name && m.category == category {
-                            count += 1;
+                            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
+                                if ts.with_timezone(&chrono::Utc) >= cutoff {
+                                    count += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -185,11 +190,39 @@ pub fn record_mistake(
     }
 
     // Solidify rule if threshold reached
-    if count >= 3 {
-        return solidify_rule(home, &real_agent_name, &category, count);
-    }
+    let rule_id = if count >= 3 {
+        solidify_rule(home, &real_agent_name, &category, count)
+    } else {
+        None
+    };
 
-    None
+    cleanup_old_mistakes(home);
+
+    rule_id
+}
+
+/// Delete mistake files older than 90 days to prevent unbounded growth.
+pub fn cleanup_old_mistakes(home: &Path) {
+    let mistakes_dir = home.join("mistakes");
+    let Ok(entries) = fs::read_dir(&mistakes_dir) else {
+        return;
+    };
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(90);
+    for entry in entries.filter_map(Result::ok) {
+        if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if let Ok(m) = serde_json::from_str::<Mistake>(&content) {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
+                        if ts.with_timezone(&chrono::Utc) < cutoff {
+                            if let Err(e) = fs::remove_file(entry.path()) {
+                                tracing::warn!(?e, path = ?entry.path(), "failed to delete old mistake file");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Persist a rule after repeated mistakes, inject it into AGENTS.md, and sync it to Mem0.
@@ -808,6 +841,126 @@ mod tests {
         assert!(agents_md_content.contains("<!-- agend-rules:start -->"));
         assert!(agents_md_content.contains("NEVER report VERIFIED without running cargo test"));
         assert!(agents_md_content.contains("<!-- agend-rules:end -->"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_mistakes_30_day_cutoff_and_90_day_cleanup() {
+        let home = tmp_home("expiry_test");
+        let agent = "test-agent-expiry";
+
+        let worktree_dir = home.join("mock_worktree");
+        std::fs::create_dir_all(&worktree_dir).expect("failed to create mock worktree");
+        let binding_dir = home.join("runtime").join(agent);
+        std::fs::create_dir_all(&binding_dir).expect("failed to create binding dir");
+        let binding_json = json!({
+            "worktree": worktree_dir.to_str().expect("invalid worktree path"),
+            "branch": "feat/mock-branch-expiry"
+        });
+        std::fs::write(
+            binding_dir.join("binding.json"),
+            serde_json::to_string(&binding_json).expect("failed to serialize binding json"),
+        )
+        .expect("failed to write binding.json");
+
+        let args = json!({
+            "correlation_id": "task-expiry",
+            "artifacts": "evidence of failure"
+        });
+
+        // 1. Record first mistake (now)
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED: clippy warnings",
+            &args,
+            Some("lint_failure"),
+        );
+        assert!(rule_id.is_none());
+
+        // 2. Manually write a mistake from 35 days ago
+        let old_mistake_id = "mstk_old_35_days";
+        let old_timestamp = (chrono::Utc::now() - chrono::Duration::days(35)).to_rfc3339();
+        let old_mistake = Mistake {
+            id: old_mistake_id.to_string(),
+            task_id: Some("task-expiry".to_string()),
+            agent_name: agent.to_string(),
+            category: "lint_failure".to_string(),
+            rejection_reason: "old failure".to_string(),
+            timestamp: old_timestamp,
+        };
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("create mistakes dir");
+        std::fs::write(
+            mistakes_dir.join(format!("{}.json", old_mistake_id)),
+            serde_json::to_string_pretty(&old_mistake).expect("serialize old mistake"),
+        )
+        .expect("write old mistake");
+
+        // 3. Record second mistake (now)
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED: clippy fails",
+            &args,
+            Some("lint_failure"),
+        );
+        assert!(
+            rule_id.is_none(),
+            "Count should be 2 within 30 days (excluding 35-day-old one)"
+        );
+
+        // 4. Record third mistake (now)
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED: cargo clippy failed",
+            &args,
+            Some("lint_failure"),
+        );
+        assert!(
+            rule_id.is_some(),
+            "Count should reach 3 within 30 days (excluding 35-day-old one)"
+        );
+
+        // 5. Manually write a mistake from 95 days ago
+        let very_old_mistake_id = "mstk_very_old_95_days";
+        let very_old_timestamp = (chrono::Utc::now() - chrono::Duration::days(95)).to_rfc3339();
+        let very_old_mistake = Mistake {
+            id: very_old_mistake_id.to_string(),
+            task_id: Some("task-expiry".to_string()),
+            agent_name: agent.to_string(),
+            category: "lint_failure".to_string(),
+            rejection_reason: "very old failure".to_string(),
+            timestamp: very_old_timestamp,
+        };
+        let very_old_path = mistakes_dir.join(format!("{}.json", very_old_mistake_id));
+        std::fs::write(
+            &very_old_path,
+            serde_json::to_string_pretty(&very_old_mistake).expect("serialize very old mistake"),
+        )
+        .expect("write very old mistake");
+
+        assert!(very_old_path.exists());
+
+        // 6. Call cleanup_old_mistakes
+        cleanup_old_mistakes(&home);
+
+        // 7. Verify very old mistake is deleted, but 35-day-old mistake remains
+        assert!(
+            !very_old_path.exists(),
+            "95-day-old mistake should be cleaned up"
+        );
+        assert!(
+            mistakes_dir
+                .join(format!("{}.json", old_mistake_id))
+                .exists(),
+            "35-day-old mistake should NOT be cleaned up"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
