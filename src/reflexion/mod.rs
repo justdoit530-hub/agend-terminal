@@ -853,6 +853,63 @@ mod tests {
     }
 
     #[test]
+    fn test_record_success_no_solidify_before_threshold() {
+        let home = tmp_home("record_success_before_threshold_test");
+        let agent = "success-agent";
+
+        let first = record_success(&home, "reviewer", agent, "First clean review", "clean_review");
+        assert!(first.is_some(), "first success should be recorded");
+        let second = record_success(
+            &home,
+            "reviewer",
+            agent,
+            "Second clean review",
+            "clean_review",
+        );
+        assert!(second.is_some(), "second success should be recorded");
+
+        let successes_path = home.join("successes").join(format!("{agent}.json"));
+        let successes: Vec<Success> = serde_json::from_str(
+            &std::fs::read_to_string(&successes_path).expect("read successes"),
+        )
+        .expect("deserialize successes");
+        assert_eq!(successes.len(), 2);
+        assert!(!home
+            .join("rules")
+            .join(format!("{agent}_success_clean_review.json"))
+            .exists());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_solidify_success_pattern_at_threshold() {
+        let home = tmp_home("solidify_success_pattern_test");
+        let agent = "success-agent-threshold";
+
+        assert!(record_success(&home, "reviewer", agent, "First pass", "clean_review").is_some());
+        assert!(record_success(&home, "reviewer", agent, "Second pass", "clean_review").is_some());
+        assert!(record_success(&home, "reviewer", agent, "Third pass", "clean_review").is_some());
+
+        let rule_path = home
+            .join("rules")
+            .join(format!("{agent}_success_clean_review.json"));
+        assert!(rule_path.exists(), "third success should solidify a rule");
+        let rule: Rule = serde_json::from_str(
+            &std::fs::read_to_string(rule_path).expect("read success rule"),
+        )
+        .expect("deserialize success rule");
+        assert_eq!(rule.id, format!("sp-{agent}-clean_review"));
+        assert_eq!(rule.agent_name, agent);
+        assert_eq!(rule.category, "success_clean_review");
+        assert_eq!(rule.trigger_count, 3);
+        assert!(rule.rule_text.contains("PATTERN: clean_review"));
+        assert!(rule.rule_text.contains("Third pass"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn test_solidify_rule_fallback_worktree_scan() {
         let home = tmp_home("solidify_fallback_test");
         let agent = "fallback-agent";
