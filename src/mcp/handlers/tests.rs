@@ -3662,10 +3662,14 @@ fn test_dispatch_task_injects_rules() {
 
 #[test]
 fn test_dispatch_mem0_graceful_fail() {
+    let _env = crate::daemon::test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _g = fleet_test_guard();
     let home = tmp_home("mcp_dispatch_mem0_graceful_fail_test");
     std::env::set_var("AGEND_HOME", &home);
     std::env::set_var("MEM0_HTTP_URL", "http://127.0.0.1:1");
+    std::env::set_var("MEM0_USER_ID", "test-user");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3693,8 +3697,96 @@ fn test_dispatch_mem0_graceful_fail() {
     assert_eq!(result["task"]["description"], "Original description");
 
     std::env::remove_var("MEM0_HTTP_URL");
+    std::env::remove_var("MEM0_USER_ID");
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_dispatch_mem0_injects_without_existing_tokio_runtime() {
+    let _env = crate::daemon::test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_dispatch_mem0_plain_thread_test");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mem0 test server");
+    let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept mem0 request");
+        let request = read_http_request(&mut stream);
+        assert!(request.contains("POST /search"), "request was {request}");
+        assert!(
+            request.contains(r#""user_id":"dispatch-user""#),
+            "request was {request}"
+        );
+        let body = r#"{"results":[{"memory":"Use a local runtime for dispatch Mem0 lookup"}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        use std::io::Write;
+        stream
+            .write_all(response.as_bytes())
+            .expect("write mem0 response");
+    });
+
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("MEM0_HTTP_URL", base_url);
+    std::env::set_var("MEM0_USER_ID", "dispatch-user");
+
+    let result = handle_tool(
+        "task",
+        &json!({
+            "action": "create",
+            "title": "Mem0 inject task",
+            "description": "Original description",
+            "assignee": "test-agent",
+        }),
+        "operator",
+    );
+
+    assert!(result.get("error").is_none(), "{result}");
+    let description = result["task"]["description"]
+        .as_str()
+        .expect("description string");
+    assert!(description.contains("Original description"));
+    assert!(description.contains("[過去經驗]"));
+    assert!(description.contains("- Use a local runtime for dispatch Mem0 lookup"));
+
+    server.join().expect("mem0 test server");
+    std::env::remove_var("MEM0_HTTP_URL");
+    std::env::remove_var("MEM0_USER_ID");
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    let mut tmp = [0; 1024];
+    loop {
+        let read = stream.read(&mut tmp).expect("read mem0 request");
+        assert_ne!(read, 0, "mem0 client closed before request completed");
+        buf.extend_from_slice(&tmp[..read]);
+        if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let full_len = header_end + 4 + content_length;
+            if buf.len() >= full_len {
+                return String::from_utf8_lossy(&buf[..full_len]).into_owned();
+            }
+        }
+    }
 }
 
 struct ShadowTestChannel;
