@@ -303,6 +303,9 @@ pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -
         return None;
     }
 
+    // Inject success pattern rule into agent's .agents/AGENTS.md
+    inject_rule_to_agents_md_for_binding(home, agent_name, &rule_category, &rule_text);
+
     let vault = obsidian_vault_path();
     inject_rule_to_obsidian(&vault, agent_name, &rule_category, &rule_text, recent.len());
     spawn_mem0_sync(&rule);
@@ -366,6 +369,22 @@ pub fn solidify_rule(
     }
 
     // Inject rule into agent's .agents/AGENTS.md
+    inject_rule_to_agents_md_for_binding(home, agent_name, category, rule_text);
+
+    spawn_mem0_sync(&rule);
+    let vault = obsidian_vault_path();
+    inject_rule_to_obsidian(&vault, agent_name, category, rule_text, trigger_count);
+    Some(rule_id)
+}
+
+/// Inject a rule/pattern into the agent's AGENTS.md files,
+/// either via the active binding or scanning all fallback worktrees.
+pub fn inject_rule_to_agents_md_for_binding(
+    home: &Path,
+    agent_name: &str,
+    category: &str,
+    rule_text: &str,
+) {
     let mut injected = false;
     if let Some(binding) = crate::binding::read(home, agent_name) {
         if let Some(worktree_path) = binding["worktree"].as_str() {
@@ -407,11 +426,6 @@ pub fn solidify_rule(
             }
         }
     }
-
-    spawn_mem0_sync(&rule);
-    let vault = obsidian_vault_path();
-    inject_rule_to_obsidian(&vault, agent_name, category, rule_text, trigger_count);
-    Some(rule_id)
 }
 
 fn obsidian_vault_path() -> std::path::PathBuf {
@@ -1002,6 +1016,16 @@ mod tests {
         let home = tmp_home("solidify_success_pattern_test");
         let agent = "success-agent-threshold";
 
+        // Setup mock fallback worktree
+        let worktree_dir = home.join("worktrees").join(agent).join("mock_worktree_1");
+        std::fs::create_dir_all(worktree_dir.join(".agents")).expect("failed to create agents dir");
+        let agents_md_path = worktree_dir.join(".agents").join("AGENTS.md");
+        std::fs::write(
+            &agents_md_path,
+            "<!-- agend-rules:start -->\n<!-- agend-rules:end -->",
+        )
+        .expect("failed to init AGENTS.md");
+
         assert!(record_success(&home, "reviewer", agent, "First pass", "clean_review").is_some());
         assert!(record_success(&home, "reviewer", agent, "Second pass", "clean_review").is_some());
         assert!(record_success(&home, "reviewer", agent, "Third pass", "clean_review").is_some());
@@ -1019,6 +1043,14 @@ mod tests {
         assert_eq!(rule.trigger_count, 3);
         assert!(rule.rule_text.contains("PATTERN: clean_review"));
         assert!(rule.rule_text.contains("Third pass"));
+
+        // Verify rule injected to mock worktree's AGENTS.md
+        let agents_md_content =
+            std::fs::read_to_string(&agents_md_path).expect("failed to read AGENTS.md");
+        assert!(agents_md_content.contains("<!-- agend-rules:start -->"));
+        assert!(agents_md_content.contains("success_clean_review"));
+        assert!(agents_md_content.contains("PATTERN: clean_review"));
+        assert!(agents_md_content.contains("<!-- agend-rules:end -->"));
 
         std::fs::remove_dir_all(&home).ok();
     }
