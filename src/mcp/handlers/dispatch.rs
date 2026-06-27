@@ -265,6 +265,28 @@ pub(crate) fn dispatch_list_rules(ctx: &HandlerCtx<'_>) -> Value {
     };
     json!(crate::reflexion::list_rules(ctx.home, agent_name))
 }
+pub(crate) fn dispatch_record_mistake(ctx: &HandlerCtx<'_>) -> Value {
+    let summary = match ctx.args.get("summary").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return json!({"error": "missing required parameter 'summary'"}),
+    };
+    let agent_name = match ctx.args.get("agent_name").and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => return json!({"error": "missing required parameter 'agent_name'"}),
+    };
+    let category = ctx.args.get("category").and_then(|v| v.as_str());
+    let reporter = ctx
+        .sender
+        .as_ref()
+        .map(|s| s.as_str())
+        .unwrap_or("anonymous");
+
+    let rule_id = crate::reflexion::record_mistake(
+        ctx.home, reporter, agent_name, summary, ctx.args, category,
+    );
+
+    json!({ "rule_id": rule_id })
+}
 adapter!(
     dispatch_task_sweep_config,
     ha,
@@ -609,6 +631,7 @@ mod tests {
                 "inbox",
                 "list_instances",
                 "list_rules",
+                "record_mistake",
                 "create_instance",
                 "delete_instance",
                 "start_instance",
@@ -644,7 +667,7 @@ mod tests {
                 "agy_quota",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 39);
+        assert_eq!(crate::mcp::registry::all().len(), 40);
     }
 
     #[test]
