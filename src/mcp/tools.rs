@@ -112,6 +112,25 @@ pub(crate) fn def_list_rules() -> Value {
         }, "required": ["agent_name"]}})
 }
 
+pub(crate) fn def_record_mistake() -> Value {
+    json!({
+        "name": "record_mistake",
+        "description": "Record a mistake to trigger the Reflexion loop.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "The summary of the mistake/rejection reason."},
+                "agent_name": {"type": "string", "description": "The name of the agent/worker that committed the mistake."},
+                "category": {"type": "string", "description": "Optional category hint to override regex classification."},
+                "artifacts": {"type": "string", "description": "Optional logs or artifacts related to the mistake."},
+                "parent_id": {"type": "string", "description": "Optional parent message ID."},
+                "correlation_id": {"type": "string", "description": "Optional task ID."}
+            },
+            "required": ["summary", "agent_name"]
+        }
+    })
+}
+
 pub(crate) fn def_create_instance() -> Value {
     json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"agy\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=agy, all grouped in one tab.",
     "inputSchema": {"type": "object", "properties": {
@@ -643,9 +662,9 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            39,
+            40,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
-             + ephemeral (#1967 Phase-1) = 37; + agy_quota = 38; + list_rules = 39. Current tools: {:?}",
+             + ephemeral (#1967 Phase-1) = 37; + agy_quota = 38; + list_rules = 39; + record_mistake = 40. Current tools: {:?}",
             tools
                 .iter()
                 .filter_map(|t| t["name"].as_str())
@@ -1142,6 +1161,7 @@ mod tests {
             "gc_dry_run",
             "agy_quota",
             "list_rules",
+            "record_mistake",
         ];
 
         let defs = tool_definitions();

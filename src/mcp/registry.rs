@@ -229,7 +229,7 @@ pub(crate) fn tool_subset_for_role(
     }
 }
 
-static ALL_TOOLS: [ToolEntry; 39] = [
+static ALL_TOOLS: [ToolEntry; 40] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
@@ -268,6 +268,12 @@ static ALL_TOOLS: [ToolEntry; 39] = [
         definition: super::tools::def_list_rules,
         handler: super::handlers::dispatch::dispatch_list_rules,
         class: ToolClass::READ_ONLY,
+    },
+    ToolEntry {
+        name: "record_mistake",
+        definition: super::tools::def_record_mistake,
+        handler: super::handlers::dispatch::dispatch_record_mistake,
+        class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
         name: "create_instance",

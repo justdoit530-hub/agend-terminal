@@ -101,6 +101,11 @@ pub fn get_rule_text(category: &str) -> &'static str {
         "missing_test_execution" => "NEVER report VERIFIED without running cargo test",
         "wrong_branch_target" => "NEVER open a PR targeting the upstream suzuke/agend-terminal repo; always target your own fork justdoit530-hub/agend-terminal",
         "lint_failure" => "NEVER submit code with clippy warnings or lint failures; run cargo clippy before submitting",
+        "missing_evidence" => "NEVER report VERIFIED/REJECTED without an ### Evidence block",
+        "missing_fire_and_forget" => "NEVER use tokio::spawn without // fire-and-forget: <reason> comment",
+        "wrong_pr_repo" => "NEVER open a PR to suzuke/agend-terminal; always use justdoit530-hub/agend-terminal",
+        "hardcoded_secret" => "NEVER hardcode secrets or API keys in source code; read from environment variables",
+        "wrong_branch_base" => "NEVER base a feature branch on a stale or wrong base branch",
         _ => "NEVER repeat this mistake category",
     }
 }
@@ -112,6 +117,7 @@ pub fn record_mistake(
     agent_name: &str,
     summary: &str,
     args: &Value,
+    category_hint: Option<&str>,
 ) -> Option<String> {
     let _ = reporter; // Keep for signature compatibility
     let parent_id = args["parent_id"].as_str();
@@ -130,7 +136,10 @@ pub fn record_mistake(
     }
 
     let rejection_text = format!("{}\n{}", summary, args["artifacts"].as_str().unwrap_or(""));
-    let category = classify_mistake(&rejection_text, parent_text)?;
+    let category = match category_hint {
+        Some(cat) => cat.to_string(),
+        None => classify_mistake(&rejection_text, parent_text)?.to_string(),
+    };
 
     let mistakes_dir = home.join("mistakes");
     if let Err(e) = fs::create_dir_all(&mistakes_dir) {
@@ -177,7 +186,7 @@ pub fn record_mistake(
 
     // Solidify rule if threshold reached
     if count >= 3 {
-        return solidify_rule(home, &real_agent_name, category, count);
+        return solidify_rule(home, &real_agent_name, &category, count);
     }
 
     None
@@ -491,10 +500,18 @@ mod tests {
             agent,
             "REJECTED: no cargo test executed",
             &args,
+            None,
         );
         assert!(rule_id.is_none(), "Threshold not reached yet");
 
-        let rule_id = record_mistake(&home, "general", agent, "REJECTED: missing test run", &args);
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED: missing test run",
+            &args,
+            None,
+        );
         assert!(rule_id.is_none(), "Threshold not reached yet");
 
         let rule_id = record_mistake(
@@ -503,6 +520,7 @@ mod tests {
             agent,
             "REJECTED: did not run cargo test",
             &args,
+            None,
         );
         assert!(
             rule_id.is_some(),
@@ -660,6 +678,73 @@ mod tests {
 
         let rules_c = list_rules(&home, "Agent-C");
         assert!(rules_c.is_empty());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_record_mistake_with_category_hint() {
+        let home = tmp_home("record_mistake_hint_test");
+        let agent = "test-agent-hint";
+
+        let worktree_dir = home.join("mock_worktree");
+        std::fs::create_dir_all(&worktree_dir).expect("failed to create mock worktree");
+        let binding_dir = home.join("runtime").join(agent);
+        std::fs::create_dir_all(&binding_dir).expect("failed to create binding dir");
+        let binding_json = json!({
+            "worktree": worktree_dir.to_str().expect("invalid worktree path"),
+            "branch": "feat/mock-branch-hint"
+        });
+        std::fs::write(
+            binding_dir.join("binding.json"),
+            serde_json::to_string(&binding_json).expect("failed to serialize binding json"),
+        )
+        .expect("failed to write binding.json");
+
+        let args = json!({
+            "correlation_id": "task-abc-hint",
+            "artifacts": "evidence of wrong repo"
+        });
+
+        // 3 mistakes are needed to trigger solidification
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED: opened PR to wrong repo",
+            &args,
+            Some("wrong_pr_repo"),
+        );
+        assert!(rule_id.is_none());
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED: wrong pr repo",
+            &args,
+            Some("wrong_pr_repo"),
+        );
+        assert!(rule_id.is_none());
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED: pr to wrong repo again",
+            &args,
+            Some("wrong_pr_repo"),
+        );
+
+        let rule_id_str = rule_id.expect("expected solidified rule ID");
+        assert_eq!(rule_id_str, format!("rule_{}_wrong_pr_repo", agent));
+
+        let rule_path = home.join("rules").join(format!("{}.json", rule_id_str));
+        assert!(rule_path.exists());
+        let rule_content = std::fs::read_to_string(&rule_path).expect("failed to read rule file");
+        let rule: Rule = serde_json::from_str(&rule_content).expect("failed to deserialize rule");
+        assert_eq!(
+            rule.rule_text,
+            "NEVER open a PR to suzuke/agend-terminal; always use justdoit530-hub/agend-terminal"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
