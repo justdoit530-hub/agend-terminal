@@ -300,7 +300,50 @@ pub fn solidify_rule(
     }
 
     spawn_mem0_sync(&rule);
+    let vault = obsidian_vault_path();
+    inject_rule_to_obsidian(&vault, agent_name, category, rule_text, trigger_count);
     Some(rule_id)
+}
+
+fn obsidian_vault_path() -> std::path::PathBuf {
+    std::env::var("AGEND_OBSIDIAN_VAULT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(
+                "/Users/neo/Library/Mobile Documents/iCloud~md~obsidian/Documents/agend-terminal",
+            )
+        })
+}
+
+fn yaml_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn inject_rule_to_obsidian(
+    vault: &Path,
+    agent_name: &str,
+    category: &str,
+    rule_text: &str,
+    trigger_count: usize,
+) {
+    let rules_dir = vault.join("Rules");
+    if let Err(e) = fs::create_dir_all(&rules_dir) {
+        tracing::warn!(?e, "failed to create Obsidian Rules dir");
+        return;
+    }
+    let filename = format!("{agent_name}_{category}.md");
+    let quoted_rule = rule_text.replace('\n', "\n> ");
+    let content = format!(
+        "---\nagent: {}\ncategory: {}\ntrigger_count: {trigger_count}\nupdated_at: {}\n---\n\n# Rule: {category}\n\n**Agent:** {agent_name}\n**Category:** {category}\n**Triggered:** {trigger_count} times\n\n## Rule\n\n> {quoted_rule}\n",
+        yaml_quote(agent_name),
+        yaml_quote(category),
+        chrono::Utc::now().to_rfc3339()
+    );
+    if let Err(e) = fs::write(rules_dir.join(&filename), content) {
+        tracing::warn!(?e, filename, "failed to write Obsidian rule");
+    } else {
+        tracing::info!(filename, "rule synced to Obsidian");
+    }
 }
 
 fn spawn_mem0_sync(rule: &Rule) {
@@ -843,6 +886,24 @@ mod tests {
         assert!(agents_md_content.contains("<!-- agend-rules:end -->"));
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_inject_rule_to_obsidian() {
+        let tmp = tmp_home("obsidian_inject_test");
+        inject_rule_to_obsidian(
+            &tmp,
+            "test-agent",
+            "lint_failure",
+            "NEVER submit clippy warnings",
+            3,
+        );
+        let md = tmp.join("Rules").join("test-agent_lint_failure.md");
+        assert!(md.exists());
+        let content = std::fs::read_to_string(md).expect("failed to read Obsidian rule file");
+        assert!(content.contains("NEVER submit clippy warnings"));
+        assert!(content.contains("agent: \"test-agent\""));
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
