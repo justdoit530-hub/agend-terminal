@@ -504,9 +504,9 @@ mod tests {
     /// ENTIRE registry in registry order — zero behavior change. If this breaks,
     /// default-all-open regressed.
     #[test]
-    fn full_capability_roles_surface_all_39_byte_identical() {
+    fn full_capability_roles_surface_all_40_byte_identical() {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
-        assert_eq!(all_names.len(), 39, "registry baseline is 39 tools");
+        assert_eq!(all_names.len(), 40, "registry baseline is 40 tools");
         for role in [
             None,
             Some(RoleKind::Orchestrator),
@@ -517,7 +517,7 @@ mod tests {
             assert_eq!(
                 names(role),
                 all_names,
-                "role {role:?} must surface all 39 tools in registry order (default-all-open)"
+                "role {role:?} must surface all 40 tools in registry order (default-all-open)"
             );
         }
     }

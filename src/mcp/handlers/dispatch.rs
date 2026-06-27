@@ -299,7 +299,29 @@ adapter!(dispatch_restart_daemon, h, restart::handle_restart_daemon);
 // handler. Unknown actions produce tool-specific error JSON.
 // ---------------------------------------------------------------------
 
-adapter!(dispatch_task, hai, task::handle_task);
+pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
+    if ctx.args["action"].as_str() == Some("create") {
+        let mut modified_args = ctx.args.clone();
+        if let Some(agent_name) = modified_args["assignee"].as_str() {
+            if !agent_name.is_empty() {
+                let rules = crate::reflexion::list_rules(ctx.home, agent_name);
+                if !rules.is_empty() {
+                    let original_message = modified_args["description"].as_str().unwrap_or("");
+                    let rules_text = rules
+                        .iter()
+                        .map(|r| format!("- {}", r.rule_text))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let new_message = format!("{}\n\n[適用規則]\n{}", original_message, rules_text);
+                    modified_args["description"] = json!(new_message);
+                }
+            }
+        }
+        task::handle_task(ctx.home, &modified_args, ctx.instance_name)
+    } else {
+        task::handle_task(ctx.home, ctx.args, ctx.instance_name)
+    }
+}
 
 action_adapter!(dispatch_ci, "ci", [
     "watch"   => ci::handle_watch_ci,   hai;

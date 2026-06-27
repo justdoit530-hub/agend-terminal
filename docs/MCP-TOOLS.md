@@ -1,6 +1,6 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (39 tools)
+# AgEnD MCP Tools Reference (40 tools)
 
 ## Action-based Tools
 
@@ -208,3 +208,14 @@ Query Google Antigravity subscription quota. Returns `remainingFraction` and `re
 List Reflexion rules solidified for a specific agent/worker (MistakeNotebook output).
 
 - **agent_name** (required): worker instance name to query
+
+### `record_mistake`
+
+Record a mistake to trigger the Reflexion loop.
+
+- **summary** (required): The summary of the mistake/rejection reason.
+- **agent_name** (required): The name of the agent/worker that committed the mistake.
+- **category** (optional): Optional category hint to override regex classification.
+- **artifacts** (optional): Optional logs or artifacts related to the mistake.
+- **parent_id** (optional): Optional parent message ID.
+- **correlation_id** (optional): Optional task ID.

@@ -3556,6 +3556,71 @@ fn test_list_rules_via_mcp() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn test_dispatch_task_injects_rules() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_dispatch_task_inject_rules_test");
+    std::env::set_var("AGEND_HOME", &home);
+
+    let rules_dir = home.join("rules");
+    std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+    let rule = crate::reflexion::Rule {
+        id: "rule_inject_test".to_string(),
+        agent_name: "test-agent".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Always run tests before push".to_string(),
+        created_at: "2026-06-26T12:00:00Z".to_string(),
+        trigger_count: 1,
+    };
+    std::fs::write(
+        rules_dir.join("rule_inject.json"),
+        serde_json::to_string(&rule).expect("failed to serialize rule"),
+    )
+    .expect("failed to write rule");
+
+    // Call dispatch_task to create a task for "test-agent"
+    let result = handle_tool(
+        "task",
+        &json!({
+            "action": "create",
+            "title": "Test Task",
+            "description": "Original description",
+            "assignee": "test-agent",
+        }),
+        "operator",
+    );
+
+    // Verify it succeeded and description was modified
+    assert!(result.get("error").is_none());
+    let description = result["task"]["description"]
+        .as_str()
+        .expect("description string");
+    assert!(description.contains("Original description"));
+    assert!(description.contains("[適用規則]"));
+    assert!(description.contains("- Always run tests before push"));
+
+    // Test when rules exist but assignee is different (should not inject)
+    let result2 = handle_tool(
+        "task",
+        &json!({
+            "action": "create",
+            "title": "Test Task 2",
+            "description": "Original description 2",
+            "assignee": "other-agent",
+        }),
+        "operator",
+    );
+    assert!(result2.get("error").is_none());
+    let description2 = result2["task"]["description"]
+        .as_str()
+        .expect("description string 2");
+    assert_eq!(description2, "Original description 2");
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 struct ShadowTestChannel;
 
 impl crate::channel::Channel for ShadowTestChannel {

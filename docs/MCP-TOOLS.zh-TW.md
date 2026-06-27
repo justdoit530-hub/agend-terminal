@@ -1,6 +1,6 @@
 [English](MCP-TOOLS.md)
 
-# AgEnD MCP Tools Reference — 工具參考（39 個工具）
+# AgEnD MCP Tools Reference — 工具參考（40 個工具）
 
 ## 動作型工具（Action-based Tools）
 
@@ -208,3 +208,14 @@ Fleet idle watchdog 控制。動作：snooze、resume、status、ack。`ack` 會
 列出指定 agent/worker 已固化的 Reflexion 規則（MistakeNotebook 輸出）。
 
 - **agent_name**（必填）：要查詢的 worker instance 名稱
+
+### `record_mistake`
+
+記錄一個錯誤以觸發 Reflexion 迴圈。
+
+- **summary**（必填）：錯誤或拒絕原因的摘要。
+- **agent_name**（必填）：犯錯的 agent/worker 名稱。
+- **category**（選填）：用於覆蓋正則表達式分類的類別提示。
+- **artifacts**（選填）：與錯誤相關的日誌或產物。
+- **parent_id**（選填）：父訊息 ID。
+- **correlation_id**（選填）：任務 ID。
