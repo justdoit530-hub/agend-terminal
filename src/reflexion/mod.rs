@@ -42,6 +42,15 @@ pub fn mark_mistake_corrected(home: &Path, agent_name: &str, category: &str) {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Success {
+    pub success_id: String,
+    pub agent_name: String,
+    pub category: String,
+    pub summary: String,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rule {
     #[serde(alias = "id", rename = "rule_id")]
     pub id: String,
@@ -229,6 +238,109 @@ pub fn record_mistake(
     rule_id
 }
 
+pub fn record_success(
+    home: &Path,
+    _reporter: &str,
+    agent_name: &str,
+    summary: &str,
+    category: &str,
+) -> Option<String> {
+    let successes_dir = home.join("successes");
+    if let Err(e) = fs::create_dir_all(&successes_dir) {
+        tracing::warn!(?e, "failed to create successes directory");
+        return None;
+    }
+
+    let path = successes_dir.join(format!("{agent_name}.json"));
+    let mut successes: Vec<Success> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default();
+    let success_id = format!(
+        "s-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        uuid::Uuid::new_v4().simple()
+    );
+    successes.push(Success {
+        success_id: success_id.clone(),
+        agent_name: agent_name.to_string(),
+        category: category.to_string(),
+        summary: summary.to_string(),
+        recorded_at: chrono::Utc::now().to_rfc3339(),
+    });
+
+    let serialized = serde_json::to_string_pretty(&successes).ok()?;
+    if let Err(e) = fs::write(&path, serialized) {
+        tracing::warn!(?e, ?path, "failed to write success file");
+        return None;
+    }
+
+    tracing::info!(agent_name, category, "success recorded");
+    solidify_success_pattern(home, agent_name, category);
+    Some(success_id)
+}
+
+pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -> Option<String> {
+    let path = home.join("successes").join(format!("{agent_name}.json"));
+    let successes: Vec<Success> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default();
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+    let recent = successes
+        .iter()
+        .filter(|success| success.category == category)
+        .filter(|success| {
+            chrono::DateTime::parse_from_rfc3339(&success.recorded_at)
+                .map(|recorded_at| recorded_at.with_timezone(&chrono::Utc) > cutoff)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if recent.len() < 3 {
+        return None;
+    }
+
+    let rule_category = format!("success_{category}");
+    let rule_id = format!("sp-{agent_name}-{category}");
+    let rule_path = home
+        .join("rules")
+        .join(format!("{agent_name}_{rule_category}.json"));
+    if rule_path.exists() {
+        return None;
+    }
+
+    let rule_text = format!("PATTERN: {category} — {}", recent.last()?.summary);
+    let rule = Rule {
+        id: rule_id.clone(),
+        agent_name: agent_name.to_string(),
+        category: rule_category.clone(),
+        rule_text: rule_text.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        trigger_count: recent.len(),
+    };
+
+    if let Some(parent) = rule_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!(?e, ?parent, "failed to create success rules directory");
+            return None;
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&rule).ok()?;
+    if let Err(e) = fs::write(&rule_path, serialized) {
+        tracing::warn!(?e, ?rule_path, "failed to write success rule");
+        return None;
+    }
+
+    // Inject success pattern rule into agent's .agents/AGENTS.md
+    inject_rule_to_agents_md_for_binding(home, agent_name, &rule_category, &rule_text);
+
+    let vault = obsidian_vault_path();
+    inject_rule_to_obsidian(&vault, agent_name, &rule_category, &rule_text, recent.len());
+    spawn_mem0_sync(&rule);
+    tracing::info!(agent_name, category, "success pattern solidified");
+    Some(rule_id)
+}
+
 /// Delete mistake files older than 90 days to prevent unbounded growth.
 pub fn cleanup_old_mistakes(home: &Path) {
     let mistakes_dir = home.join("mistakes");
@@ -311,6 +423,22 @@ pub fn solidify_rule(
     }
 
     // Inject rule into agent's .agents/AGENTS.md
+    inject_rule_to_agents_md_for_binding(home, agent_name, category, rule_text);
+
+    spawn_mem0_sync(&rule);
+    let vault = obsidian_vault_path();
+    inject_rule_to_obsidian(&vault, agent_name, category, rule_text, trigger_count);
+    Some(rule_id)
+}
+
+/// Inject a rule/pattern into the agent's AGENTS.md files,
+/// either via the active binding or scanning all fallback worktrees.
+pub fn inject_rule_to_agents_md_for_binding(
+    home: &Path,
+    agent_name: &str,
+    category: &str,
+    rule_text: &str,
+) {
     let mut injected = false;
     if let Some(binding) = crate::binding::read(home, agent_name) {
         if let Some(worktree_path) = binding["worktree"].as_str() {
@@ -352,11 +480,6 @@ pub fn solidify_rule(
             }
         }
     }
-
-    spawn_mem0_sync(&rule);
-    let vault = obsidian_vault_path();
-    inject_rule_to_obsidian(&vault, agent_name, category, rule_text, trigger_count);
-    Some(rule_id)
 }
 
 fn obsidian_vault_path() -> std::path::PathBuf {
@@ -923,6 +1046,86 @@ mod tests {
             rule.rule_text,
             "NEVER open a PR to suzuke/agend-terminal; always use justdoit530-hub/agend-terminal"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_record_success_no_solidify_before_threshold() {
+        let home = tmp_home("record_success_before_threshold_test");
+        let agent = "success-agent";
+
+        let first = record_success(
+            &home,
+            "reviewer",
+            agent,
+            "First clean review",
+            "clean_review",
+        );
+        assert!(first.is_some(), "first success should be recorded");
+        let second = record_success(
+            &home,
+            "reviewer",
+            agent,
+            "Second clean review",
+            "clean_review",
+        );
+        assert!(second.is_some(), "second success should be recorded");
+
+        let successes_path = home.join("successes").join(format!("{agent}.json"));
+        let successes: Vec<Success> = serde_json::from_str(
+            &std::fs::read_to_string(&successes_path).expect("read successes"),
+        )
+        .expect("deserialize successes");
+        assert_eq!(successes.len(), 2);
+        assert!(!home
+            .join("rules")
+            .join(format!("{agent}_success_clean_review.json"))
+            .exists());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_solidify_success_pattern_at_threshold() {
+        let home = tmp_home("solidify_success_pattern_test");
+        let agent = "success-agent-threshold";
+
+        // Setup mock fallback worktree
+        let worktree_dir = home.join("worktrees").join(agent).join("mock_worktree_1");
+        std::fs::create_dir_all(worktree_dir.join(".agents")).expect("failed to create agents dir");
+        let agents_md_path = worktree_dir.join(".agents").join("AGENTS.md");
+        std::fs::write(
+            &agents_md_path,
+            "<!-- agend-rules:start -->\n<!-- agend-rules:end -->",
+        )
+        .expect("failed to init AGENTS.md");
+
+        assert!(record_success(&home, "reviewer", agent, "First pass", "clean_review").is_some());
+        assert!(record_success(&home, "reviewer", agent, "Second pass", "clean_review").is_some());
+        assert!(record_success(&home, "reviewer", agent, "Third pass", "clean_review").is_some());
+
+        let rule_path = home
+            .join("rules")
+            .join(format!("{agent}_success_clean_review.json"));
+        assert!(rule_path.exists(), "third success should solidify a rule");
+        let rule: Rule =
+            serde_json::from_str(&std::fs::read_to_string(rule_path).expect("read success rule"))
+                .expect("deserialize success rule");
+        assert_eq!(rule.id, format!("sp-{agent}-clean_review"));
+        assert_eq!(rule.agent_name, agent);
+        assert_eq!(rule.category, "success_clean_review");
+        assert_eq!(rule.trigger_count, 3);
+        assert!(rule.rule_text.contains("PATTERN: clean_review"));
+        assert!(rule.rule_text.contains("Third pass"));
+
+        // Verify rule injected to mock worktree's AGENTS.md
+        let agents_md_content =
+            std::fs::read_to_string(&agents_md_path).expect("failed to read AGENTS.md");
+        assert!(agents_md_content.contains("<!-- agend-rules:start -->"));
+        assert!(agents_md_content.contains("success_clean_review"));
+        assert!(agents_md_content.contains("PATTERN: clean_review"));
+        assert!(agents_md_content.contains("<!-- agend-rules:end -->"));
 
         std::fs::remove_dir_all(&home).ok();
     }

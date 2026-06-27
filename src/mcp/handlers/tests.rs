@@ -374,6 +374,45 @@ fn report_result_emits_with_correlation_id() {
 }
 
 #[test]
+fn verified_report_result_records_success() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("fleet_report_verified_success");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "message": "VERIFIED\n### Evidence\nran: cargo test -> passed",
+            "request_kind": "report",
+            "summary": "VERIFIED\n### Evidence\nran: cargo test -> passed",
+            "correlation_id": "T-success-record",
+            "category": "clean_review",
+        }),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&result),
+        "VERIFIED report_result should succeed: {result}"
+    );
+
+    let successes_path = home.join("successes").join("target.json");
+    assert!(
+        successes_path.exists(),
+        "VERIFIED report should record a success for the reviewed worker"
+    );
+    let successes: Vec<crate::reflexion::Success> =
+        serde_json::from_str(&std::fs::read_to_string(successes_path).expect("read successes"))
+            .expect("deserialize successes");
+    assert_eq!(successes.len(), 1);
+    assert_eq!(successes[0].agent_name, "target");
+    assert_eq!(successes[0].category, "clean_review");
+    assert!(successes[0].summary.starts_with("VERIFIED"));
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn bind_persists_across_kind_report_reply() {
     // Sprint 53 P0-Y: regression guard for the auto-unbind bug general m-42
     // surfaced. Pre-fix `handle_report_result` ran `binding::unbind(home,
