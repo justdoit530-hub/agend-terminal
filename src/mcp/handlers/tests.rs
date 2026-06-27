@@ -400,10 +400,9 @@ fn verified_report_result_records_success() {
         successes_path.exists(),
         "VERIFIED report should record a success for the reporting agent"
     );
-    let successes: Vec<crate::reflexion::Success> = serde_json::from_str(
-        &std::fs::read_to_string(successes_path).expect("read successes"),
-    )
-    .expect("deserialize successes");
+    let successes: Vec<crate::reflexion::Success> =
+        serde_json::from_str(&std::fs::read_to_string(successes_path).expect("read successes"))
+            .expect("deserialize successes");
     assert_eq!(successes.len(), 1);
     assert_eq!(successes[0].agent_name, "sender");
     assert_eq!(successes[0].category, "clean_review");

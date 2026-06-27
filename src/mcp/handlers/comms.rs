@@ -458,6 +458,10 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     None,
                 );
             }
+            if verdict == super::comms_gates::Verdict::Verified {
+                let category = args["category"].as_str().unwrap_or("general");
+                crate::reflexion::record_success(home, target, sender.as_str(), summary, category);
+            }
 
             // #1666 Phase B (WARN-first): cross-check the checkable evidence and
             // LOG (never reject) — measures the false-positive rate. See the fn.
