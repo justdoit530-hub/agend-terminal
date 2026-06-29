@@ -718,9 +718,9 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_mistake_unknown_falls_back_to_general() {
+    fn test_classify_mistake_unknown_falls_back_to_unclassified() {
         let rejection = "The report missed the operational nuance in this workflow.";
-        assert_eq!(classify_mistake(rejection, None), Some("general"));
+        assert_eq!(classify_mistake(rejection, None), Some("unclassified"));
     }
 
     #[test]
@@ -774,7 +774,7 @@ mod tests {
         )
         .expect("deserialize mistake");
         assert_eq!(mistake.agent_name, agent);
-        assert_eq!(mistake.category, "general");
+        assert_eq!(mistake.category, "unclassified");
 
         std::fs::remove_dir_all(&home).ok();
     }
