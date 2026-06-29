@@ -128,7 +128,7 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
         return Some("lint_failure");
     }
 
-    Some("general")
+    Some("unclassified")
 }
 
 /// Retrieve the rule text for a given category.
