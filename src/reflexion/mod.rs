@@ -128,7 +128,7 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
         return Some("lint_failure");
     }
 
-    None
+    Some("general")
 }
 
 /// Retrieve the rule text for a given category.
@@ -160,16 +160,7 @@ pub fn record_mistake(
     let parent_msg = parent_id.and_then(|pid| crate::inbox::find_message(home, pid));
     let parent_text = parent_msg.as_ref().map(|m| m.text.as_str());
 
-    // Resolve the actual agent name from parent message sender if possible
-    let mut real_agent_name = agent_name.to_string();
-    if let Some(ref p_msg) = parent_msg {
-        let from = p_msg.from.trim();
-        if let Some(stripped) = from.strip_prefix("from:") {
-            real_agent_name = stripped.to_string();
-        } else {
-            real_agent_name = from.to_string();
-        }
-    }
+    let real_agent_name = agent_name.to_string();
 
     let rejection_text = format!("{}\n{}", summary, args["artifacts"].as_str().unwrap_or(""));
     let category = match category_hint {
