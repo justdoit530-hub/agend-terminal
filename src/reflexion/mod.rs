@@ -967,7 +967,7 @@ mod tests {
             .expect("request task failed");
 
         assert!(request.starts_with("POST /add HTTP/1.1"));
-        assert!(request.contains("\"user_id\":\"reflexion\""));
+        assert!(request.contains("\"user_id\":\"neo\""));
         assert!(request.contains("Agent test-agent"));
         assert!(request.contains("NEVER submit code with clippy warnings or lint failures"));
         assert!(request.contains("Reflexion Loop"));
@@ -979,6 +979,125 @@ mod tests {
                 .lock()
                 .expect("mem0 sync url override mutex poisoned");
             *override_url = None;
+        }
+    }
+
+    #[test]
+    fn test_spawn_mem0_sync_posts_without_existing_tokio_runtime() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("failed to bind Mem0 sync test listener");
+        listener
+            .set_nonblocking(true)
+            .expect("failed to set listener nonblocking");
+        let addr = listener.local_addr().expect("failed to read listener addr");
+        {
+            let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                .lock()
+                .expect("mem0 sync url override mutex poisoned");
+            *override_url = Some(format!("http://{addr}/add"));
+        }
+
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        use std::io::Write;
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .expect("failed to write response");
+                        return Some(request);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("failed to accept request: {e}"),
+                }
+            }
+        });
+
+        let rule = Rule {
+            id: "rule_mem0_plain_thread".to_string(),
+            agent_name: "plain-agent".to_string(),
+            category: "lint_failure".to_string(),
+            rule_text: "No lint warnings".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            trigger_count: 2,
+        };
+
+        spawn_mem0_sync(&rule);
+
+        let request = server
+            .join()
+            .expect("Mem0 sync test server panicked")
+            .expect("Mem0 sync should issue a request without an ambient Tokio runtime");
+        assert!(request.starts_with("POST /add HTTP/1.1"));
+        assert!(request.contains("\"user_id\":\"neo\""));
+        assert!(request.contains("Agent plain-agent"));
+
+        {
+            let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                .lock()
+                .expect("mem0 sync url override mutex poisoned");
+            *override_url = None;
+        }
+    }
+
+    #[test]
+    fn test_mem0_sync_body_uses_mem0_user_id_env() {
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("MEM0_USER_ID").ok();
+        unsafe {
+            std::env::remove_var("MEM0_USER_ID");
+        }
+        let default_body = mem0_sync_body("agent", "rule", "category", 1);
+        assert_eq!(default_body["user_id"], "neo");
+
+        unsafe {
+            std::env::set_var("MEM0_USER_ID", "custom-user");
+        }
+        let custom_body = mem0_sync_body("agent", "rule", "category", 1);
+        assert_eq!(custom_body["user_id"], "custom-user");
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MEM0_USER_ID", value),
+                None => std::env::remove_var("MEM0_USER_ID"),
+            }
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut buf = Vec::new();
+        let mut tmp = [0; 1024];
+        loop {
+            let read = stream.read(&mut tmp).expect("failed to read request");
+            assert_ne!(read, 0, "connection closed before request completed");
+            buf.extend_from_slice(&tmp[..read]);
+            if let Some(header_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let full_len = header_end + 4 + content_length;
+                if buf.len() >= full_len {
+                    return String::from_utf8_lossy(&buf[..full_len]).into_owned();
+                }
+            }
         }
     }
 
