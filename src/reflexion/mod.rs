@@ -128,7 +128,7 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
         return Some("lint_failure");
     }
 
-    None
+    Some("general")
 }
 
 /// Retrieve the rule text for a given category.
@@ -160,16 +160,7 @@ pub fn record_mistake(
     let parent_msg = parent_id.and_then(|pid| crate::inbox::find_message(home, pid));
     let parent_text = parent_msg.as_ref().map(|m| m.text.as_str());
 
-    // Resolve the actual agent name from parent message sender if possible
-    let mut real_agent_name = agent_name.to_string();
-    if let Some(ref p_msg) = parent_msg {
-        let from = p_msg.from.trim();
-        if let Some(stripped) = from.strip_prefix("from:") {
-            real_agent_name = stripped.to_string();
-        } else {
-            real_agent_name = from.to_string();
-        }
-    }
+    let real_agent_name = agent_name.to_string();
 
     let rejection_text = format!("{}\n{}", summary, args["artifacts"].as_str().unwrap_or(""));
     let category = match category_hint {
@@ -724,6 +715,68 @@ mod tests {
 
         let rejection2 = "Run cargo clippy before submitting.";
         assert_eq!(classify_mistake(rejection2, None), Some("lint_failure"));
+    }
+
+    #[test]
+    fn test_classify_mistake_unknown_falls_back_to_general() {
+        let rejection = "The report missed the operational nuance in this workflow.";
+        assert_eq!(classify_mistake(rejection, None), Some("general"));
+    }
+
+    #[test]
+    fn test_record_mistake_keeps_agent_name_when_parent_sender_is_coordinator() {
+        let home = tmp_home("record_mistake_parent_sender_test");
+        let agent = "worker-agent";
+        let parent_id = "parent-msg-coordinator";
+        let parent_msg = crate::inbox::InboxMessage {
+            id: Some(parent_id.to_string()),
+            from: "from:general".to_string(),
+            text: "UNVERIFIED\noperator note without matching category".to_string(),
+            kind: Some("task".to_string()),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        };
+        let inbox_dir = home.join("inbox");
+        std::fs::create_dir_all(&inbox_dir).expect("failed to create inbox dir");
+        let inbox_file = inbox_dir.join(format!("{agent}.jsonl"));
+        std::fs::write(
+            &inbox_file,
+            format!(
+                "{}\n",
+                serde_json::to_string(&parent_msg).expect("failed to serialize parent msg")
+            ),
+        )
+        .expect("failed to write parent msg inbox file");
+
+        let args = json!({
+            "parent_id": parent_id,
+            "correlation_id": "task-parent-agent",
+            "artifacts": "unclassified reviewer concern"
+        });
+        let rule_id = record_mistake(
+            &home,
+            "general",
+            agent,
+            "REJECTED\n### Evidence\ncited: src/lib.rs:1 -- concern",
+            &args,
+            None,
+        );
+        assert!(rule_id.is_none(), "single mistake should not solidify");
+
+        let mistake_file = std::fs::read_dir(home.join("mistakes"))
+            .expect("read mistakes dir")
+            .next()
+            .expect("one mistake file")
+            .expect("mistake dir entry")
+            .path();
+        let mistake: Mistake = serde_json::from_str(
+            &std::fs::read_to_string(mistake_file).expect("read mistake file"),
+        )
+        .expect("deserialize mistake");
+        assert_eq!(mistake.agent_name, agent);
+        assert_eq!(mistake.category, "general");
+
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

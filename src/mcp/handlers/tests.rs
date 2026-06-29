@@ -377,6 +377,22 @@ fn report_result_emits_with_correlation_id() {
 fn verified_report_result_records_success() {
     let _g = fleet_test_guard();
     let (_rec, home) = setup_recorder("fleet_report_verified_success");
+    let mistakes_dir = home.join("mistakes");
+    std::fs::create_dir_all(&mistakes_dir).expect("create mistakes dir");
+    let mistake = crate::reflexion::Mistake {
+        id: "mstk-clean-review".to_string(),
+        task_id: Some("T-success-record".to_string()),
+        agent_name: "sender".to_string(),
+        category: "clean_review".to_string(),
+        rejection_reason: "prior review issue".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        corrected_at: None,
+    };
+    std::fs::write(
+        mistakes_dir.join("mstk-clean-review.json"),
+        serde_json::to_string(&mistake).expect("serialize mistake"),
+    )
+    .expect("write mistake");
 
     let result = handle_tool(
         "send",
@@ -395,18 +411,32 @@ fn verified_report_result_records_success() {
         "VERIFIED report_result should succeed: {result}"
     );
 
-    let successes_path = home.join("successes").join("target.json");
+    let successes_path = home.join("successes").join("sender.json");
     assert!(
         successes_path.exists(),
-        "VERIFIED report should record a success for the reviewed worker"
+        "VERIFIED report should record a success for the reporting worker"
     );
     let successes: Vec<crate::reflexion::Success> =
         serde_json::from_str(&std::fs::read_to_string(successes_path).expect("read successes"))
             .expect("deserialize successes");
     assert_eq!(successes.len(), 1);
-    assert_eq!(successes[0].agent_name, "target");
+    assert_eq!(successes[0].agent_name, "sender");
     assert_eq!(successes[0].category, "clean_review");
     assert!(successes[0].summary.starts_with("VERIFIED"));
+    assert!(
+        !home.join("successes").join("target.json").exists(),
+        "success must not be attributed to the report target"
+    );
+
+    let corrected: crate::reflexion::Mistake = serde_json::from_str(
+        &std::fs::read_to_string(mistakes_dir.join("mstk-clean-review.json"))
+            .expect("read corrected mistake"),
+    )
+    .expect("deserialize corrected mistake");
+    assert!(
+        corrected.corrected_at.is_some(),
+        "VERIFIED report should mark the sender's prior mistake corrected"
+    );
 
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
