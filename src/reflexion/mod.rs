@@ -515,29 +515,42 @@ fn inject_rule_to_obsidian(
 }
 
 fn spawn_mem0_sync(rule: &Rule) {
-    if tokio::runtime::Handle::try_current().is_err() {
-        tracing::warn!("Mem0 sync skipped: no Tokio runtime available");
-        return;
-    }
-
     let rule_text = rule.rule_text.clone();
     let agent_name = rule.agent_name.clone();
     let category = rule.category.clone();
     let count = rule.trigger_count;
     let url = mem0_sync_url();
+
     // fire-and-forget: sync rule to Mem0, non-critical
-    tokio::spawn(async move {
-        let body = mem0_sync_body(&agent_name, &rule_text, &category, count);
-        if let Err(e) = reqwest::Client::new()
-            .post(url)
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-        {
-            tracing::warn!("Mem0 sync failed (non-fatal): {}", e);
-        }
-    });
+    if let Err(e) = std::thread::Builder::new()
+        .name("agend-mem0-rule-sync".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Mem0 rule sync: failed to build runtime");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let body = mem0_sync_body(&agent_name, &rule_text, &category, count);
+                if let Err(e) = reqwest::Client::new()
+                    .post(url)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await
+                {
+                    tracing::warn!(error = %e, "Mem0 rule sync failed (non-fatal)");
+                }
+            });
+        })
+    {
+        tracing::warn!(error = %e, "Mem0 rule sync: failed to spawn worker thread");
+    }
 }
 
 fn mem0_sync_body(
@@ -546,12 +559,13 @@ fn mem0_sync_body(
     category: &str,
     trigger_count: usize,
 ) -> serde_json::Value {
+    let user_id = std::env::var("MEM0_USER_ID").unwrap_or_else(|_| "neo".to_string());
     serde_json::json!({
         "content": format!(
             "Agent {} 的規則：{}（來源：Reflexion Loop，分類：{}，觸發次數：{}）",
             agent_name, rule_text, category, trigger_count
         ),
-        "user_id": "reflexion"
+        "user_id": user_id
     })
 }
 
@@ -891,6 +905,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[tokio::test]
     async fn test_solidify_triggers_mem0_sync() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -982,6 +997,7 @@ mod tests {
         }
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_spawn_mem0_sync_posts_without_existing_tokio_runtime() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
