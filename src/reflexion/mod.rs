@@ -237,6 +237,53 @@ pub fn get_rule_text(category: &str) -> &'static str {
     }
 }
 
+fn first_meaningful_line(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("###")
+            || trimmed.starts_with("REJECTED")
+            || trimmed.starts_with("VERIFIED")
+            || trimmed.starts_with("ran:")
+            || trimmed.starts_with("cited:")
+        {
+            continue;
+        }
+        let trunc_len = trimmed
+            .char_indices()
+            .nth(120)
+            .map(|(i, _)| i)
+            .unwrap_or(trimmed.len());
+        let start = line.find(trimmed)?;
+        return Some(&line[start..start + trunc_len]);
+    }
+    None
+}
+
+fn synthesize_rule_text(category: &str, mistakes: &[Mistake]) -> String {
+    let base_rule = get_rule_text(category);
+    let mut rejection_lines: Vec<&str> = Vec::new();
+    for mistake in mistakes {
+        if let Some(line) = first_meaningful_line(&mistake.rejection_reason) {
+            if !rejection_lines.contains(&line) {
+                rejection_lines.push(line);
+            }
+            if rejection_lines.len() >= 3 {
+                break;
+            }
+        }
+    }
+    if rejection_lines.is_empty() {
+        return base_rule.to_string();
+    }
+    let bullets = rejection_lines
+        .iter()
+        .map(|line| format!("- {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{base_rule}\n\nRecurring failures:\n{bullets}")
+}
+
 /// Main entry point to record a mistake, check threshold, and inject rule if needed.
 pub fn record_mistake(
     home: &Path,
@@ -487,12 +534,12 @@ pub fn solidify_rule(
     }
 
     let rule_id = format!("rule_{}_{}", agent_name, category);
-    let rule_text = get_rule_text(category);
+    let rule_text = synthesize_rule_text(category, &recent_mistakes);
     let rule = Rule {
         id: rule_id.clone(),
         agent_name: agent_name.to_string(),
         category: category.to_string(),
-        rule_text: rule_text.to_string(),
+        rule_text: rule_text.clone(),
         trigger_count,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -505,11 +552,11 @@ pub fn solidify_rule(
     }
 
     // Inject rule into agent's .agents/AGENTS.md
-    inject_rule_to_agents_md_for_binding(home, agent_name, category, rule_text);
+    inject_rule_to_agents_md_for_binding(home, agent_name, category, &rule_text);
 
     spawn_mem0_sync(&rule);
     let vault = obsidian_vault_path();
-    inject_rule_to_obsidian(&vault, agent_name, category, rule_text, trigger_count);
+    inject_rule_to_obsidian(&vault, agent_name, category, &rule_text, trigger_count);
     Some(rule_id)
 }
 
@@ -1715,5 +1762,50 @@ mod tests {
         assert_eq!(rule_id_str, format!("rule_{}_{}", agent, category));
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_first_meaningful_line_skips_metadata_lines() {
+        let text = "### Evidence\nREJECTED\nran: cargo test\ncited: mod.rs:10\nActual clippy warning on line 42";
+        assert_eq!(
+            first_meaningful_line(text),
+            Some("Actual clippy warning on line 42")
+        );
+    }
+
+    #[test]
+    fn test_synthesize_rule_text_empty_mistakes_returns_base_rule() {
+        let text = synthesize_rule_text("lint_failure", &[]);
+        assert_eq!(text, get_rule_text("lint_failure"));
+        assert!(!text.contains("Recurring failures:"));
+    }
+
+    #[test]
+    fn test_synthesize_rule_text_with_mistakes_includes_recurring_failures() {
+        let mistakes = vec![
+            Mistake {
+                id: "mstk_1".to_string(),
+                task_id: None,
+                agent_name: "agent".to_string(),
+                category: "lint_failure".to_string(),
+                rejection_reason: "REJECTED\nClippy reported unused variable".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                corrected_at: None,
+            },
+            Mistake {
+                id: "mstk_2".to_string(),
+                task_id: None,
+                agent_name: "agent".to_string(),
+                category: "lint_failure".to_string(),
+                rejection_reason: "Missing derive annotation on struct".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                corrected_at: None,
+            },
+        ];
+        let text = synthesize_rule_text("lint_failure", &mistakes);
+        assert!(text.contains("Recurring failures:"));
+        assert!(text.contains("- Clippy reported unused variable"));
+        assert!(text.contains("- Missing derive annotation on struct"));
+        assert!(text.starts_with(get_rule_text("lint_failure")));
     }
 }
