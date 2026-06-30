@@ -3791,7 +3791,8 @@ fn test_dispatch_task_injects_rules() {
     assert!(description.contains("[適用規則]"));
     assert!(description.contains("- Always run tests before push"));
 
-    // Test when rules exist but assignee is different (should not inject)
+    // Test when rules exist but assignee is different: they should be shared
+    // as cross-agent references, not injected as the assignee's own rules.
     let result2 = handle_tool(
         "task",
         &json!({
@@ -3806,7 +3807,148 @@ fn test_dispatch_task_injects_rules() {
     let description2 = result2["task"]["description"]
         .as_str()
         .expect("description string 2");
-    assert_eq!(description2, "Original description 2");
+    assert!(description2.contains("Original description 2"));
+    assert!(!description2.contains("[適用規則]"));
+    assert!(description2.contains("[其他 Worker 規則參考]"));
+    assert!(description2.contains("- [test-agent] Always run tests before push"));
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_dispatch_task_injects_cross_agent_rules() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_dispatch_task_inject_cross_agent_rules_test");
+    std::env::set_var("AGEND_HOME", &home);
+
+    let rules_dir = home.join("rules");
+    std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+    let own_rule = crate::reflexion::Rule {
+        id: "rule_agent_a".to_string(),
+        agent_name: "agent-a".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Always run tests before push".to_string(),
+        created_at: "2026-06-26T12:00:00Z".to_string(),
+        trigger_count: 1,
+    };
+    let cross_rule = crate::reflexion::Rule {
+        id: "rule_agent_b".to_string(),
+        agent_name: "agent-b".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Capture reviewer evidence before reporting".to_string(),
+        created_at: "2026-06-26T12:01:00Z".to_string(),
+        trigger_count: 2,
+    };
+    std::fs::write(
+        rules_dir.join("rule_agent_a.json"),
+        serde_json::to_string(&own_rule).expect("failed to serialize own rule"),
+    )
+    .expect("failed to write own rule");
+    std::fs::write(
+        rules_dir.join("rule_agent_b.json"),
+        serde_json::to_string(&cross_rule).expect("failed to serialize cross rule"),
+    )
+    .expect("failed to write cross rule");
+
+    let result = handle_tool(
+        "task",
+        &json!({
+            "action": "create",
+            "title": "Cross-agent Task",
+            "description": "Original description",
+            "assignee": "agent-a",
+        }),
+        "operator",
+    );
+
+    assert!(result.get("error").is_none());
+    let description = result["task"]["description"]
+        .as_str()
+        .expect("description string");
+    assert!(description.contains("Original description"));
+    assert!(description.contains("[適用規則]"));
+    assert!(description.contains("- Always run tests before push"));
+    assert!(description.contains("[其他 Worker 規則參考]"));
+    assert!(description.contains("- [agent-b] Capture reviewer evidence before reporting"));
+    assert!(!description.contains("- [agent-a] Always run tests before push"));
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_dispatch_task_dedupes_cross_agent_rule_text() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_dispatch_task_dedupe_cross_agent_rules_test");
+    std::env::set_var("AGEND_HOME", &home);
+
+    let rules_dir = home.join("rules");
+    std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+    let own_rule = crate::reflexion::Rule {
+        id: "rule_agent_a_duplicate".to_string(),
+        agent_name: "agent-a".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Always run tests before push".to_string(),
+        created_at: "2026-06-26T12:00:00Z".to_string(),
+        trigger_count: 1,
+    };
+    let duplicate_cross_rule = crate::reflexion::Rule {
+        id: "rule_agent_b_duplicate".to_string(),
+        agent_name: "agent-b".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Always run tests before push".to_string(),
+        created_at: "2026-06-26T12:01:00Z".to_string(),
+        trigger_count: 2,
+    };
+    let unique_cross_rule = crate::reflexion::Rule {
+        id: "rule_agent_b_unique".to_string(),
+        agent_name: "agent-b".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Collect evidence before reporting".to_string(),
+        created_at: "2026-06-26T12:02:00Z".to_string(),
+        trigger_count: 3,
+    };
+    std::fs::write(
+        rules_dir.join("rule_agent_a_duplicate.json"),
+        serde_json::to_string(&own_rule).expect("failed to serialize own rule"),
+    )
+    .expect("failed to write own rule");
+    std::fs::write(
+        rules_dir.join("rule_agent_b_duplicate.json"),
+        serde_json::to_string(&duplicate_cross_rule).expect("failed to serialize cross rule"),
+    )
+    .expect("failed to write cross rule");
+    std::fs::write(
+        rules_dir.join("rule_agent_b_unique.json"),
+        serde_json::to_string(&unique_cross_rule).expect("failed to serialize unique cross rule"),
+    )
+    .expect("failed to write unique cross rule");
+
+    let result = handle_tool(
+        "task",
+        &json!({
+            "action": "create",
+            "title": "Cross-agent Dedupe Task",
+            "description": "Original description",
+            "assignee": "agent-a",
+        }),
+        "operator",
+    );
+
+    assert!(result.get("error").is_none());
+    let description = result["task"]["description"]
+        .as_str()
+        .expect("description string");
+    assert!(description.contains("[適用規則]"));
+    assert!(description.contains("[其他 Worker 規則參考]"));
+    assert!(description.contains("- [agent-b] Collect evidence before reporting"));
+    assert_eq!(
+        description.matches("Always run tests before push").count(),
+        1
+    );
 
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();

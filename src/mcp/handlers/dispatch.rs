@@ -317,6 +317,20 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
                         .join("\n");
                     sections.push(format!("[適用規則]\n{rules_text}"));
                 }
+                let cross_rules = crate::reflexion::list_cross_agent_rules(ctx.home, agent_name);
+                if !cross_rules.is_empty() {
+                    let own_rule_texts: std::collections::HashSet<&str> =
+                        rules.iter().map(|r| r.rule_text.as_str()).collect();
+                    let cross_text = cross_rules
+                        .iter()
+                        .filter(|r| !own_rule_texts.contains(r.rule_text.as_str()))
+                        .map(|r| format!("- [{}] {}", r.agent_name, r.rule_text))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !cross_text.is_empty() {
+                        sections.push(format!("[其他 Worker 規則參考]\n{cross_text}"));
+                    }
+                }
                 if let Some(mem0_context) = dispatch_mem0_context(agent_name, original_message) {
                     sections.push(mem0_context);
                 }
