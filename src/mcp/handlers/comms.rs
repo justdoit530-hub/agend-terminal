@@ -459,8 +459,15 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 );
             }
             if verdict == super::comms_gates::Verdict::Verified {
-                let category = args["category"].as_str().unwrap_or("general");
-                crate::reflexion::record_success(home, target, sender.as_str(), summary, category);
+                let category = args["category"].as_str();
+                let success_category = category.unwrap_or("general");
+                crate::reflexion::record_success(
+                    home,
+                    target,
+                    sender.as_str(),
+                    summary,
+                    success_category,
+                );
                 crate::reflexion::mark_mistake_corrected(home, sender.as_str(), category);
             }
 
