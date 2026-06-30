@@ -16,25 +16,58 @@ pub struct Mistake {
     pub corrected_at: Option<String>,
 }
 
-pub fn mark_mistake_corrected(home: &Path, agent_name: &str, category: &str) {
+pub fn mark_mistake_corrected<'a>(
+    home: &Path,
+    agent_name: &str,
+    category: impl Into<Option<&'a str>>,
+) {
+    let category = category.into().filter(|category| !category.is_empty());
     let mistakes_dir = home.join("mistakes");
     let Ok(entries) = fs::read_dir(&mistakes_dir) else {
         return;
     };
     let now = chrono::Utc::now().to_rfc3339();
+    let mut latest_uncategorized_match: Option<(
+        chrono::DateTime<chrono::Utc>,
+        std::path::PathBuf,
+    )> = None;
     for entry in entries.filter_map(Result::ok) {
-        if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
-            if let Ok(content) = fs::read_to_string(entry.path()) {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Ok(content) = fs::read_to_string(&path) {
                 if let Ok(mut m) = serde_json::from_str::<Mistake>(&content) {
-                    if m.agent_name == agent_name
-                        && m.category == category
-                        && m.corrected_at.is_none()
-                    {
+                    if m.agent_name != agent_name || m.corrected_at.is_some() {
+                        continue;
+                    }
+                    if category.is_some_and(|category| m.category == category) {
                         m.corrected_at = Some(now.clone());
                         if let Ok(serialized) = serde_json::to_string_pretty(&m) {
-                            let _ = fs::write(entry.path(), serialized);
+                            let _ = fs::write(&path, serialized);
+                        }
+                    } else if category.is_none() {
+                        let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&m.timestamp)
+                            .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+                        else {
+                            continue;
+                        };
+                        if latest_uncategorized_match
+                            .as_ref()
+                            .is_none_or(|(latest, _)| timestamp > *latest)
+                        {
+                            latest_uncategorized_match = Some((timestamp, path));
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if let Some((_, path)) = latest_uncategorized_match {
+        if let Ok(content) = fs::read_to_string(&path) {
+            if let Ok(mut m) = serde_json::from_str::<Mistake>(&content) {
+                m.corrected_at = Some(now);
+                if let Ok(serialized) = serde_json::to_string_pretty(&m) {
+                    let _ = fs::write(path, serialized);
                 }
             }
         }
