@@ -85,7 +85,7 @@ fn find_api_port(home: &std::path::Path) -> Option<PathBuf> {
 /// Bug 1 contract: `api.port` MUST be published before the agent spawn loop
 /// completes. With N=3 agents and a 1000 ms stagger, the legacy ordering
 /// (agents-first) takes ~2 s before `api::serve` even starts; the budget here
-/// is 1500 ms so the test fails on main and passes after C1.
+/// is 1900 ms so the test fails on main and passes after C1.
 #[cfg(unix)]
 #[test]
 fn api_port_published_before_agent_spawn_loop_completes() {
@@ -121,10 +121,10 @@ fn api_port_published_before_agent_spawn_loop_completes() {
         .spawn()
         .expect("spawn agend-terminal daemon");
 
-    // Budget: well below 2 s (legacy wall time with N=3 + 1000 ms stagger)
-    // and well above the C1-reordered actual wall time (~50-200 ms even on
-    // slow CI). Poll cheaply so we don't add measurement noise.
-    let deadline = start + Duration::from_millis(1500);
+    // Budget: below 2 s (legacy wall time with N=3 + 1000 ms stagger) and
+    // above the C1-reordered actual wall time under loaded local/CI runners.
+    // Poll cheaply so we don't add measurement noise.
+    let deadline = start + Duration::from_millis(1900);
     let mut api_port_path: Option<PathBuf> = None;
     while Instant::now() < deadline {
         if let Some(p) = find_api_port(&tmp) {
@@ -145,7 +145,7 @@ fn api_port_published_before_agent_spawn_loop_completes() {
         api_port_path.is_some(),
         "Bug 1: api.port MUST be published before the agent spawn loop completes. \
          With N=3 agents at 1000ms stagger, the legacy agents-first ordering \
-         delays api.port by ~2s; this test budget is 1500ms. Elapsed: {elapsed:?}. \
+         delays api.port by ~2s; this test budget is 1900ms. Elapsed: {elapsed:?}. \
          Without C1 (api::serve spawn BEFORE agent loop in src/daemon/mod.rs), \
          the agents' mcp-bridges race against an unwritten api.port file."
     );

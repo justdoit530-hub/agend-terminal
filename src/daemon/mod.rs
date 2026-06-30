@@ -11,6 +11,7 @@ pub(crate) mod ci_watch;
 pub(crate) mod conflict_notify;
 mod crash_respawn;
 pub(crate) mod cron_tick;
+mod daemon_identity;
 pub(crate) mod decision_timeout;
 pub(crate) mod dedup_state;
 pub(crate) mod dispatch_idle;
@@ -425,73 +426,7 @@ pub fn sweep_stale_run_dirs(home: &Path) {
     }
 }
 
-/// Write daemon identity file for PID reuse detection.
-///
-/// Format: `{pid}:{boot_unix}:{start_token}`. The third field
-/// (CR-2026-06-14 zombie-kill identity-compare) is the OS process start-time
-/// token (see [`crate::process::process_start_token`]) so a stale `.daemon`
-/// whose PID got recycled onto an unrelated process is detectable: the
-/// recorded token won't match the live process's. Appended (not inserted) so
-/// the existing first/second-field readers keep working. `0` when the
-/// self-token can't be resolved — a recorded `0` will never match a real
-/// live token, so the conservative outcome is fail-closed (never signal),
-/// which is the safe direction.
-pub(crate) fn write_daemon_id(run_dir: &Path) {
-    let pid = std::process::id();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let token = crate::process::process_start_token(pid).unwrap_or(0);
-    // A1: atomic write — a plain `fs::write` can be read mid-write (torn) by a
-    // concurrent `read_daemon_pid`/liveness probe, which then parse-fails on a
-    // truncated `pid:now:token` record. `store::atomic_write` publishes via a
-    // unique tmp + rename so readers only ever see a complete record.
-    let _ = crate::store::atomic_write(
-        &run_dir.join(".daemon"),
-        format!("{pid}:{now}:{token}").as_bytes(),
-    );
-}
-
-/// Read the PID recorded in `{run_dir}/.daemon`. Returns `None` if the file is
-/// missing or malformed — callers should treat that as "unknown PID".
-pub(crate) fn read_daemon_pid(run_dir: &Path) -> Option<u32> {
-    std::fs::read_to_string(run_dir.join(".daemon"))
-        .ok()?
-        .trim()
-        .split_once(':')
-        .and_then(|(pid, _)| pid.parse().ok())
-}
-
-/// Read the boot epoch (unix seconds) recorded in `{run_dir}/.daemon`
-/// (`{pid}:{boot_unix}:{start_token}`). Used by the worktree force-reclaim
-/// boot-grace (reviewer-2 #5). `None` if the file is missing or malformed.
-///
-/// CR-2026-06-14: splits on `:` and takes field index 1 rather than
-/// `split_once(':').1` — the latter would capture `"{boot_unix}:{start_token}"`
-/// once the third field was appended and fail to parse as a u64.
-pub(crate) fn read_daemon_boot_unix(run_dir: &Path) -> Option<u64> {
-    std::fs::read_to_string(run_dir.join(".daemon"))
-        .ok()?
-        .trim()
-        .split(':')
-        .nth(1)
-        .and_then(|ts| ts.parse().ok())
-}
-
-/// Read the OS process start-time token recorded in `{run_dir}/.daemon`
-/// (`{pid}:{boot_unix}:{start_token}`, field index 2). `None` if the file is
-/// missing, malformed, or written by a pre-CR-2026-06-14 daemon (no third
-/// field) — callers MUST treat `None` as "identity unverifiable → fail
-/// closed" per the zombie-kill identity-compare design.
-pub(crate) fn read_daemon_start_token(run_dir: &Path) -> Option<u64> {
-    std::fs::read_to_string(run_dir.join(".daemon"))
-        .ok()?
-        .trim()
-        .split(':')
-        .nth(2)
-        .and_then(|t| t.parse().ok())
-}
+pub(crate) use daemon_identity::{read_daemon_boot_unix, read_daemon_pid, read_daemon_start_token, write_daemon_id};
 
 /// Agent definition tuple for daemon startup.
 pub type AgentDef = (
