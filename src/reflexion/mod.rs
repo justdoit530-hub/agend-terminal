@@ -110,6 +110,21 @@ pub fn list_rules(home: &Path, agent_name: &str) -> Vec<Rule> {
         .collect()
 }
 
+/// List all solidified rules that belong to agents other than `exclude_agent`.
+pub fn list_cross_agent_rules(home: &Path, exclude_agent: &str) -> Vec<Rule> {
+    let rules_dir = home.join("rules");
+    let Ok(entries) = fs::read_dir(&rules_dir) else {
+        return vec![];
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .filter_map(|content| serde_json::from_str::<Rule>(&content).ok())
+        .filter(|rule| rule.agent_name != exclude_agent)
+        .collect()
+}
+
 const MEM0_SYNC_URL: &str = "http://localhost:5174/add";
 
 /// Classify a mistake using regex matching on the rejection text and parent message.
@@ -1060,10 +1075,11 @@ mod tests {
         assert!(rule_path.exists());
         let rule_content = std::fs::read_to_string(&rule_path).expect("failed to read rule file");
         let rule: Rule = serde_json::from_str(&rule_content).expect("failed to deserialize rule");
-        assert_eq!(
-            rule.rule_text,
-            "NEVER report VERIFIED without running cargo test"
-        );
+        assert!(rule
+            .rule_text
+            .starts_with("NEVER report VERIFIED without running cargo test"));
+        assert!(rule.rule_text.contains("Recurring failures:"));
+        assert!(rule.rule_text.contains("- evidence of failure"));
         assert_eq!(rule.trigger_count, 3);
 
         let agents_md_path = worktree_dir.join(".agents").join("AGENTS.md");
@@ -1403,10 +1419,11 @@ mod tests {
         assert!(rule_path.exists());
         let rule_content = std::fs::read_to_string(&rule_path).expect("failed to read rule file");
         let rule: Rule = serde_json::from_str(&rule_content).expect("failed to deserialize rule");
-        assert_eq!(
-            rule.rule_text,
+        assert!(rule.rule_text.starts_with(
             "NEVER open a PR to suzuke/agend-terminal; always use justdoit530-hub/agend-terminal"
-        );
+        ));
+        assert!(rule.rule_text.contains("Recurring failures:"));
+        assert!(rule.rule_text.contains("- evidence of wrong repo"));
 
         std::fs::remove_dir_all(&home).ok();
     }

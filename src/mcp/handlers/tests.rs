@@ -3791,7 +3791,8 @@ fn test_dispatch_task_injects_rules() {
     assert!(description.contains("[適用規則]"));
     assert!(description.contains("- Always run tests before push"));
 
-    // Test when rules exist but assignee is different (should not inject)
+    // Test when rules exist but assignee is different: they should be shared
+    // as cross-agent references, not injected as the assignee's own rules.
     let result2 = handle_tool(
         "task",
         &json!({
@@ -3806,7 +3807,10 @@ fn test_dispatch_task_injects_rules() {
     let description2 = result2["task"]["description"]
         .as_str()
         .expect("description string 2");
-    assert_eq!(description2, "Original description 2");
+    assert!(description2.contains("Original description 2"));
+    assert!(!description2.contains("[適用規則]"));
+    assert!(description2.contains("[其他 Worker 規則參考]"));
+    assert!(description2.contains("- [test-agent] Always run tests before push"));
 
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
@@ -3941,7 +3945,10 @@ fn test_dispatch_task_dedupes_cross_agent_rule_text() {
     assert!(description.contains("[適用規則]"));
     assert!(description.contains("[其他 Worker 規則參考]"));
     assert!(description.contains("- [agent-b] Collect evidence before reporting"));
-    assert_eq!(description.matches("Always run tests before push").count(), 1);
+    assert_eq!(
+        description.matches("Always run tests before push").count(),
+        1
+    );
 
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
