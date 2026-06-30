@@ -742,13 +742,13 @@ mod tests {
 
     #[test]
     fn test_classify_mistake_wrong_branch_target() {
-        let rejection1 = "Do not target suzuke/agend-terminal.";
+        let rejection1 = "The PR base branch points at upstream instead of the fork.";
         assert_eq!(
             classify_mistake(rejection1, None),
             Some("wrong_branch_target")
         );
 
-        let rejection2 = "PR base is suzuke/agend-terminal upstream instead of fork";
+        let rejection2 = "The branch target is the upstream base branch, not the fork.";
         assert_eq!(
             classify_mistake(rejection2, None),
             Some("wrong_branch_target")
@@ -762,6 +762,48 @@ mod tests {
 
         let rejection2 = "Run cargo clippy before submitting.";
         assert_eq!(classify_mistake(rejection2, None), Some("lint_failure"));
+    }
+
+    #[test]
+    fn test_classify_mistake_wrong_pr_repo() {
+        let rejection = "gh pr create used --repo suzuke/agend-terminal for this pull request.";
+        assert_eq!(classify_mistake(rejection, None), Some("wrong_pr_repo"));
+    }
+
+    #[test]
+    fn test_classify_mistake_missing_evidence() {
+        let rejection = "VERIFIED report was sent without evidence and no ### Evidence block.";
+        assert_eq!(
+            classify_mistake(rejection, None),
+            Some("missing_evidence")
+        );
+    }
+
+    #[test]
+    fn test_classify_mistake_hardcoded_secret() {
+        let rejection = "This hardcoded API key should be read from an environment variable.";
+        assert_eq!(
+            classify_mistake(rejection, None),
+            Some("hardcoded_secret")
+        );
+    }
+
+    #[test]
+    fn test_classify_mistake_missing_fire_and_forget() {
+        let rejection = "tokio::spawn is missing the required fire-and-forget comment.";
+        assert_eq!(
+            classify_mistake(rejection, None),
+            Some("missing_fire_and_forget")
+        );
+    }
+
+    #[test]
+    fn test_classify_mistake_wrong_branch_base() {
+        let rejection = "This feature branch was branched from a stale base.";
+        assert_eq!(
+            classify_mistake(rejection, None),
+            Some("wrong_branch_base")
+        );
     }
 
     #[test]
