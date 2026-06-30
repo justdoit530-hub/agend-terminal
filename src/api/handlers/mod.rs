@@ -9,6 +9,7 @@ pub(crate) mod hook_event;
 pub(crate) mod instance;
 pub(crate) mod mcp_proxy;
 pub(crate) mod messaging;
+mod messaging_verdicts;
 pub(crate) mod query;
 pub(crate) mod team;
 pub(crate) mod verify_push;

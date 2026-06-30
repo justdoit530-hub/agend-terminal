@@ -9,6 +9,7 @@ mod api_server;
 // `pub(super)` = app-only, so command EXECUTION is not widened.
 pub(crate) mod commands;
 mod dispatch;
+mod frame_timing;
 mod mouse;
 mod overlay;
 mod pane_factory;
@@ -27,6 +28,7 @@ use crate::keybinds::KeyHandler;
 use crate::layout::{Layout, Pane};
 use crate::notification_queue;
 use crate::render;
+use frame_timing::{trace_tty_size, should_draw, should_sync_notifications, BOOT_FRAME_TIME_CAP, FRAME_INTERVAL, MAX_BOOT_CATCHUP, NOTIF_SYNC_INTERVAL};
 use overlay::{CloseTarget, Overlay, OverlayCtx};
 
 use anyhow::Result;
@@ -225,80 +227,6 @@ fn app_tick_handlers(
 /// terminal. Bracketing the phases (baseline → post-fleet-spawn → pre-loop)
 /// pins which one; the per-frame loop probe (`#2057-size`) shows the loop only
 /// ever observes the post-shrink value, so the culprit is pre-loop.
-fn trace_tty_size(enabled: bool, phase: &str) {
-    if !enabled {
-        return;
-    }
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
-    tracing::info!(
-        tag = "#2057-startup",
-        phase,
-        cols,
-        rows,
-        "controlling-TTY kernel winsize at startup milestone"
-    );
-}
-
-/// #t-84833-10 redraw-storm frame cap: the render loop draws at most once per
-/// `FRAME_INTERVAL`. Under a boot-time PTY-output flood (11 agents spewing
-/// startup output → one `wakeup_tx` per chunk), the loop used to draw once per
-/// wakeup (observed 300–741 fps) and saturate the render thread, starving input.
-/// 33 ms ≈ 30 fps is plenty for a TUI and halves the render CPU vs 60 fps.
-const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
-
-/// #freeze-4 (t-…2324) per-frame TIME budget for the BOOT catch-up drain
-/// ([`render::drain_all_panes_until`]). Load-bearing safety: each boot frame yields
-/// to `select!` (input) after this much draining, so a restart flood can never
-/// hard-freeze input — worst case the loading phase lasts a few more frames. ~80 ms
-/// keeps input serviced ~12×/s while clearing the flood far faster than the
-/// steady-state 64 KiB/frame. Provisional (conservative); tune from `#freeze-*`
-/// restart data if needed.
-const BOOT_FRAME_TIME_CAP: std::time::Duration = std::time::Duration::from_millis(80);
-
-/// #freeze-4 hard ceiling on the boot catch-up phase: after this the loop reverts
-/// to the steady-state cap regardless of remaining backlog (which then drains under
-/// the normal bounded path). Guarantees boot can't hang unbounded on a pathological
-/// backlog. Provisional (conservative).
-const MAX_BOOT_CATCHUP: std::time::Duration = std::time::Duration::from_millis(1500);
-
-/// Pure frame-cap decision (the test seam): may we draw now? `None` = never drawn
-/// (always draw the first frame); otherwise only once `FRAME_INTERVAL` has elapsed
-/// since the last draw. Independent of *what* changed — coalescing/dirtiness is
-/// the caller's job; this only rate-limits.
-fn should_draw(
-    last_draw: Option<std::time::Instant>,
-    now: std::time::Instant,
-    frame_interval: std::time::Duration,
-) -> bool {
-    match last_draw {
-        None => true,
-        Some(t) => now.duration_since(t) >= frame_interval,
-    }
-}
-
-/// #84833-15 R2 perf: `sync_notification_state` scans the notification-queue dir
-/// (`read_dir` + `read_to_string` per pane) on EVERY render wakeup just to refresh
-/// the tab/title `[N]` badge — a disk-I/O storm under the same wakeup flood the
-/// frame cap addresses. The badge tolerates ≥1s staleness, so throttle the scan to
-/// once per second (the sibling idle-flush is already ≥1s-gated). This is independent
-/// of #2346's draw cap: the scan runs at the loop-body TOP, before `should_draw`.
-const NOTIF_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// Pure throttle decision (the test seam), mirroring `should_draw`: may we re-scan
-/// the notification queues now? `None` = never scanned (scan the first frame so the
-/// badge is correct at startup); otherwise only once `NOTIF_SYNC_INTERVAL` has
-/// elapsed since the last scan.
-fn should_sync_notifications(
-    last_sync: Option<std::time::Instant>,
-    now: std::time::Instant,
-    interval: std::time::Duration,
-) -> bool {
-    match last_sync {
-        None => true,
-        Some(t) => now.duration_since(t) >= interval,
-    }
-}
-
 /// #2050 simplify PR-C (②): render the active overlay on top of the main frame.
 /// Extracted verbatim from the two byte-identical blocks in `run_app` — the normal
 /// draw path and the screenshot (TestBackend) path — so they can't drift. Takes
@@ -1997,104 +1925,6 @@ mod tests {
     use super::*;
     use crate::layout::PaneSource;
     use crate::vterm::VTerm;
-
-    /// #t-84833-10 redraw-storm frame cap — the `should_draw` rate-limit decision.
-    #[test]
-    fn should_draw_caps_at_frame_rate() {
-        use std::time::{Duration, Instant};
-        let fi = Duration::from_millis(33);
-        let t0 = Instant::now();
-        assert!(should_draw(None, t0, fi), "first frame always draws");
-        assert!(
-            !should_draw(Some(t0), t0, fi),
-            "no draw immediately after a draw"
-        );
-        assert!(
-            !should_draw(Some(t0), t0 + Duration::from_millis(10), fi),
-            "10ms < interval → throttled"
-        );
-        assert!(
-            should_draw(Some(t0), t0 + Duration::from_millis(33), fi),
-            "interval elapsed → draw"
-        );
-        assert!(
-            should_draw(Some(t0), t0 + Duration::from_millis(500), fi),
-            "well past interval → draw"
-        );
-    }
-
-    /// #t-84833-10: the redraw count under a wakeup flood is bounded by the FRAME
-    /// RATE, not by the number of wakeups (the storm fix). 1000 wakeups packed into
-    /// ~100ms must yield only ~3-4 draws (100ms / 33ms), not 1000.
-    #[test]
-    fn frame_cap_bounds_draws_under_wakeup_flood() {
-        use std::time::{Duration, Instant};
-        let fi = Duration::from_millis(33);
-        let t0 = Instant::now();
-        let mut last_draw: Option<Instant> = None;
-        let mut draws = 0u32;
-        for i in 0..1000u64 {
-            let now = t0 + Duration::from_micros(i * 100); // 1000 wakeups over ~100ms
-            if should_draw(last_draw, now, fi) {
-                draws += 1;
-                last_draw = Some(now);
-            }
-        }
-        assert!(
-            draws <= 5,
-            "draws must be bounded by frame-rate, got {draws} for 1000 wakeups in 100ms"
-        );
-        assert!(
-            draws >= 3,
-            "but should still draw a few times across 100ms, got {draws}"
-        );
-    }
-
-    /// #84833-15 R2 perf: the notification-queue disk-scan count under a wakeup flood
-    /// is bounded by `NOTIF_SYNC_INTERVAL` (≥1s), not by the number of wakeups. A burst
-    /// of M wakeups inside one <1s window must yield exactly ONE scan (pre-fix = M);
-    /// crossing the ≥1s boundary admits exactly one more. Deterministic via constructed
-    /// `Instant`s (no wall-clock timing), threading `last_sync` like the render loop.
-    #[test]
-    fn notif_sync_throttle_bounds_disk_scans_per_window() {
-        use std::time::{Duration, Instant};
-        let interval = Duration::from_secs(1);
-        let t0 = Instant::now();
-
-        // First-frame semantics: never-scanned ⇒ scan now (badge correct at startup).
-        assert!(
-            should_sync_notifications(None, t0, interval),
-            "first frame always scans so the startup badge is correct"
-        );
-
-        // 200 wakeups packed into ~900ms (one <1s window) → exactly ONE scan.
-        let mut last_sync: Option<Instant> = None;
-        let mut scans = 0u32;
-        for i in 0..200u64 {
-            let now = t0 + Duration::from_micros(i * 4500); // ~900ms total, all < 1s
-            if should_sync_notifications(last_sync, now, interval) {
-                scans += 1;
-                last_sync = Some(now);
-            }
-        }
-        assert_eq!(
-            scans, 1,
-            "a wakeup burst within one <1s window must scan exactly once, got {scans}"
-        );
-
-        // Crossing the ≥1s boundary admits exactly one more scan...
-        let after = t0 + Duration::from_millis(1000);
-        assert!(
-            should_sync_notifications(last_sync, after, interval),
-            "≥1s since last scan → scan again"
-        );
-        last_sync = Some(after);
-        // ...and the next sub-1s wakeup is throttled again.
-        assert!(
-            !should_sync_notifications(last_sync, after + Duration::from_millis(500), interval),
-            "0.5s after the last scan → throttled"
-        );
-    }
 
     /// #render-first phase-(b) F2 (r4): `bounded_join_attach_workers` must DETACH a
     /// worker wedged past the deadline (so quit can't hang) while still joining the
