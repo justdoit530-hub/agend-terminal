@@ -506,6 +506,65 @@ fn verified_report_without_category_records_success_and_corrects_general_mistake
 }
 
 #[test]
+fn verified_report_without_category_corrects_unclassified_mistake() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("fleet_report_verified_success_unclassified_correction");
+    let mistakes_dir = home.join("mistakes");
+    std::fs::create_dir_all(&mistakes_dir).expect("create mistakes dir");
+    let mistake = crate::reflexion::Mistake {
+        id: "mstk-unclassified-review".to_string(),
+        task_id: Some("T-success-unclassified-category".to_string()),
+        agent_name: "sender".to_string(),
+        category: "unclassified".to_string(),
+        rejection_reason: "prior review issue with no known category".to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        corrected_at: None,
+    };
+    std::fs::write(
+        mistakes_dir.join("mstk-unclassified-review.json"),
+        serde_json::to_string(&mistake).expect("serialize mistake"),
+    )
+    .expect("write mistake");
+
+    let result = handle_tool(
+        "send",
+        &json!({
+            "instance": "target",
+            "message": "VERIFIED\n### Evidence\nran: cargo test -> passed",
+            "request_kind": "report",
+            "summary": "VERIFIED\n### Evidence\nran: cargo test -> passed",
+            "correlation_id": "T-success-unclassified-category",
+        }),
+        "sender",
+    );
+    assert!(
+        is_ok_result(&result),
+        "VERIFIED report_result should succeed: {result}"
+    );
+
+    let successes_path = home.join("successes").join("sender.json");
+    let successes: Vec<crate::reflexion::Success> =
+        serde_json::from_str(&std::fs::read_to_string(successes_path).expect("read successes"))
+            .expect("deserialize successes");
+    assert_eq!(successes.len(), 1);
+    assert_eq!(successes[0].agent_name, "sender");
+    assert_eq!(successes[0].category, "general");
+
+    let corrected: crate::reflexion::Mistake = serde_json::from_str(
+        &std::fs::read_to_string(mistakes_dir.join("mstk-unclassified-review.json"))
+            .expect("read corrected mistake"),
+    )
+    .expect("deserialize corrected mistake");
+    assert!(
+        corrected.corrected_at.is_some(),
+        "VERIFIED report without category should correct the sender's latest unclassified mistake"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn bind_persists_across_kind_report_reply() {
     // Sprint 53 P0-Y: regression guard for the auto-unbind bug general m-42
     // surfaced. Pre-fix `handle_report_result` ran `binding::unbind(home,
