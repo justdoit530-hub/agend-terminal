@@ -130,6 +130,11 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
     static MISSING_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static BRANCH_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static LINT_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static PR_REPO_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static EVIDENCE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SECRET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static FIRE_AND_FORGET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BRANCH_BASE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
     let test_re = TEST_RE.get_or_init(|| {
         regex::Regex::new(r"(?i)(cargo test|test suite|unit test)").expect("valid test regex")
@@ -145,7 +150,7 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
     // 2. wrong_branch_target
     // PR base is suzuke/agend-terminal upstream instead of fork
     let branch_re = BRANCH_RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)(suzuke/agend-terminal|upstream|base branch|suzuke)")
+        regex::Regex::new(r"(?i)(upstream|branch target|target.*fork|target.*branch)")
             .expect("valid branch regex")
     });
     if branch_re.is_match(rejection_text) {
@@ -159,6 +164,59 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
     });
     if lint_re.is_match(rejection_text) {
         return Some("lint_failure");
+    }
+
+    // 4. wrong_pr_repo
+    let pr_repo_re = PR_REPO_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)((pr create|pull request|gh pr).*(suzuke/agend-terminal|wrong repo|incorrect repo|--repo suzuke)|(suzuke/agend-terminal|wrong repo|incorrect repo|--repo suzuke).*(pr create|pull request|gh pr))",
+        )
+        .expect("valid PR repo regex")
+    });
+    if pr_repo_re.is_match(rejection_text) {
+        return Some("wrong_pr_repo");
+    }
+
+    // 5. missing_evidence
+    let evidence_re = EVIDENCE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(without evidence|no evidence|missing.*evidence|evidence.*missing|missing.*### evidence|no.*### evidence|without.*### evidence|missing.*cited:|missing.*ran:)",
+        )
+        .expect("valid evidence regex")
+    });
+    if evidence_re.is_match(rejection_text) {
+        return Some("missing_evidence");
+    }
+
+    // 6. hardcoded_secret
+    let secret_re = SECRET_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(hardcode|hard-code|hardcoded|secret|api.?key|token|credential|env var|environment variable)",
+        )
+        .expect("valid secret regex")
+    });
+    if secret_re.is_match(rejection_text) {
+        return Some("hardcoded_secret");
+    }
+
+    // 7. missing_fire_and_forget
+    let fire_and_forget_re = FIRE_AND_FORGET_RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)(fire.and.forget|tokio::spawn|spawn.*comment|// fire)")
+            .expect("valid fire-and-forget regex")
+    });
+    if fire_and_forget_re.is_match(rejection_text) {
+        return Some("missing_fire_and_forget");
+    }
+
+    // 8. wrong_branch_base
+    let branch_base_re = BRANCH_BASE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(base branch|wrong base|stale base|branched from|checkout.*main|based on.*main)",
+        )
+        .expect("valid branch base regex")
+    });
+    if branch_base_re.is_match(rejection_text) {
+        return Some("wrong_branch_base");
     }
 
     Some("unclassified")
@@ -773,19 +831,13 @@ mod tests {
     #[test]
     fn test_classify_mistake_missing_evidence() {
         let rejection = "VERIFIED report was sent without evidence and no ### Evidence block.";
-        assert_eq!(
-            classify_mistake(rejection, None),
-            Some("missing_evidence")
-        );
+        assert_eq!(classify_mistake(rejection, None), Some("missing_evidence"));
     }
 
     #[test]
     fn test_classify_mistake_hardcoded_secret() {
         let rejection = "This hardcoded API key should be read from an environment variable.";
-        assert_eq!(
-            classify_mistake(rejection, None),
-            Some("hardcoded_secret")
-        );
+        assert_eq!(classify_mistake(rejection, None), Some("hardcoded_secret"));
     }
 
     #[test]
@@ -800,10 +852,7 @@ mod tests {
     #[test]
     fn test_classify_mistake_wrong_branch_base() {
         let rejection = "This feature branch was branched from a stale base.";
-        assert_eq!(
-            classify_mistake(rejection, None),
-            Some("wrong_branch_base")
-        );
+        assert_eq!(classify_mistake(rejection, None), Some("wrong_branch_base"));
     }
 
     #[test]
@@ -868,6 +917,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_record_mistake_and_solidify_threshold() {
         let home = tmp_home("record_mistake_test");
@@ -1244,6 +1294,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_record_mistake_with_category_hint() {
         let home = tmp_home("record_mistake_hint_test");
@@ -1349,6 +1400,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_solidify_success_pattern_at_threshold() {
         let home = tmp_home("solidify_success_pattern_test");
@@ -1393,6 +1445,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_solidify_rule_fallback_worktree_scan() {
         let home = tmp_home("solidify_fallback_test");
@@ -1463,6 +1516,7 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_mistakes_30_day_cutoff_and_90_day_cleanup() {
         let home = tmp_home("expiry_test");
@@ -1622,6 +1676,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_disconfirming_gate_allows_after_correction() {
         let home = tmp_home("gate_allows_test");
