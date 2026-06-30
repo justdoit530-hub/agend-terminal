@@ -1236,13 +1236,16 @@ mod tests {
     async fn test_solidify_triggers_mem0_sync() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous_mem0_user = std::env::var("MEM0_USER_ID").ok();
-        unsafe {
-            std::env::remove_var("MEM0_USER_ID");
-        }
+        let previous_mem0_user = {
+            let _guard = crate::daemon::test_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("MEM0_USER_ID").ok();
+            unsafe {
+                std::env::remove_var("MEM0_USER_ID");
+            }
+            previous
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1330,10 +1333,15 @@ mod tests {
             *override_url = None;
         }
 
-        unsafe {
-            match previous_mem0_user {
-                Some(value) => std::env::set_var("MEM0_USER_ID", value),
-                None => std::env::remove_var("MEM0_USER_ID"),
+        {
+            let _guard = crate::daemon::test_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            unsafe {
+                match previous_mem0_user {
+                    Some(value) => std::env::set_var("MEM0_USER_ID", value),
+                    None => std::env::remove_var("MEM0_USER_ID"),
+                }
             }
         }
     }
