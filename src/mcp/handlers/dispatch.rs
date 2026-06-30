@@ -348,6 +348,7 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
 fn dispatch_mem0_context(agent_name: &str, message: &str) -> Option<String> {
     let message_prefix: String = message.chars().take(100).collect();
     let query = format!("{agent_name} {message_prefix}");
+    // fire-and-forget: not detached; joined below before returning to bound Mem0 lookup lifetime.
     let worker = match std::thread::Builder::new()
         .name("agend-mem0-dispatch".to_string())
         .spawn(move || {

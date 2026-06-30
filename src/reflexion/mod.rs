@@ -299,6 +299,14 @@ fn synthesize_rule_text(category: &str, mistakes: &[Mistake]) -> String {
     format!("{base_rule}\n\nRecurring failures:\n{bullets}")
 }
 
+fn solidify_threshold() -> usize {
+    std::env::var("AGEND_SOLIDIFY_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(3)
+}
+
 /// Main entry point to record a mistake, check threshold, and inject rule if needed.
 pub fn record_mistake(
     home: &Path,
@@ -371,7 +379,7 @@ pub fn record_mistake(
     }
 
     // Solidify rule if threshold reached
-    let rule_id = if count >= 3 {
+    let rule_id = if count >= solidify_threshold() {
         solidify_rule(home, &real_agent_name, &category, count)
     } else {
         None
@@ -440,7 +448,7 @@ pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
-    if recent.len() < 3 {
+    if recent.len() < solidify_threshold() {
         return None;
     }
 
@@ -1093,10 +1101,148 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    fn with_solidify_threshold_env<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("AGEND_SOLIDIFY_THRESHOLD").ok();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("AGEND_SOLIDIFY_THRESHOLD", v),
+                None => std::env::remove_var("AGEND_SOLIDIFY_THRESHOLD"),
+            }
+        }
+        let r = f();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("AGEND_SOLIDIFY_THRESHOLD", v),
+                None => std::env::remove_var("AGEND_SOLIDIFY_THRESHOLD"),
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn test_solidify_threshold_env_var() {
+        with_solidify_threshold_env(None, || {
+            assert_eq!(solidify_threshold(), 3);
+        });
+        with_solidify_threshold_env(Some("0"), || {
+            assert_eq!(solidify_threshold(), 3);
+        });
+        with_solidify_threshold_env(Some("2"), || {
+            assert_eq!(solidify_threshold(), 2);
+        });
+    }
+
+    #[serial_test::serial(mem0_sync)]
+    #[test]
+    fn test_solidify_threshold_two_mistakes_triggers_early() {
+        with_solidify_threshold_env(Some("2"), || {
+            let home = tmp_home("solidify_threshold_two_test");
+            let agent = "threshold-agent";
+
+            let worktree_dir = home.join("mock_worktree");
+            std::fs::create_dir_all(&worktree_dir).expect("failed to create mock worktree");
+            let binding_dir = home.join("runtime").join(agent);
+            std::fs::create_dir_all(&binding_dir).expect("failed to create binding dir");
+            let binding_json = json!({
+                "worktree": worktree_dir.to_str().expect("invalid worktree path"),
+                "branch": "feat/mock-branch"
+            });
+            std::fs::write(
+                binding_dir.join("binding.json"),
+                serde_json::to_string(&binding_json).expect("failed to serialize binding json"),
+            )
+            .expect("failed to write binding.json");
+
+            let parent_id = "parent-msg-threshold";
+            let parent_msg = crate::inbox::InboxMessage {
+                id: Some(parent_id.to_string()),
+                from: format!("from:{}", agent),
+                text: "VERIFIED\nEvidence:\nran: cargo check -> success\ncited: mod.rs:110"
+                    .to_string(),
+                kind: Some("report".to_string()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                ..Default::default()
+            };
+            let inbox_dir = home.join("inbox");
+            std::fs::create_dir_all(&inbox_dir).expect("failed to create inbox dir");
+            let inbox_file = inbox_dir.join(format!("{}.jsonl", agent));
+            std::fs::write(
+                &inbox_file,
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&parent_msg).expect("failed to serialize parent msg")
+                ),
+            )
+            .expect("failed to write parent msg inbox file");
+
+            let args = json!({
+                "parent_id": parent_id,
+                "correlation_id": "task-threshold",
+                "artifacts": "evidence of failure"
+            });
+
+            let rule_id = record_mistake(
+                &home,
+                "general",
+                agent,
+                "REJECTED: no cargo test executed",
+                &args,
+                None,
+            );
+            assert!(rule_id.is_none(), "first mistake should not solidify");
+
+            mark_mistake_corrected(&home, agent, "missing_test_execution");
+
+            let rule_id = record_mistake(
+                &home,
+                "general",
+                agent,
+                "REJECTED: did not run cargo test",
+                &args,
+                None,
+            );
+            assert!(
+                rule_id.is_some(),
+                "second mistake should solidify with threshold=2"
+            );
+
+            std::fs::remove_dir_all(&home).ok();
+        });
+    }
+
+    fn with_mem0_user_id_cleared<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("MEM0_USER_ID").ok();
+        unsafe {
+            std::env::remove_var("MEM0_USER_ID");
+        }
+        let result = f();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MEM0_USER_ID", value),
+                None => std::env::remove_var("MEM0_USER_ID"),
+            }
+        }
+        result
+    }
+
     #[serial_test::serial(mem0_sync)]
     #[tokio::test]
     async fn test_solidify_triggers_mem0_sync() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _guard = crate::daemon::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous_mem0_user = std::env::var("MEM0_USER_ID").ok();
+        unsafe {
+            std::env::remove_var("MEM0_USER_ID");
+        }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1183,11 +1329,19 @@ mod tests {
                 .expect("mem0 sync url override mutex poisoned");
             *override_url = None;
         }
+
+        unsafe {
+            match previous_mem0_user {
+                Some(value) => std::env::set_var("MEM0_USER_ID", value),
+                None => std::env::remove_var("MEM0_USER_ID"),
+            }
+        }
     }
 
     #[serial_test::serial(mem0_sync)]
     #[test]
     fn test_spawn_mem0_sync_posts_without_existing_tokio_runtime() {
+        with_mem0_user_id_cleared(|| {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("failed to bind Mem0 sync test listener");
         listener
@@ -1249,6 +1403,7 @@ mod tests {
                 .expect("mem0 sync url override mutex poisoned");
             *override_url = None;
         }
+        });
     }
 
     #[test]

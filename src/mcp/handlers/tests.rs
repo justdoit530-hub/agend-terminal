@@ -3749,9 +3749,14 @@ fn test_list_rules_via_mcp() {
 
 #[test]
 fn test_dispatch_task_injects_rules() {
+    let _env = crate::daemon::test_env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _g = fleet_test_guard();
     let home = tmp_home("mcp_dispatch_task_inject_rules_test");
     std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("MEM0_HTTP_URL", "http://127.0.0.1:1");
+    std::env::set_var("MEM0_USER_ID", "dispatch-rules-test-user");
 
     let rules_dir = home.join("rules");
     std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
@@ -3951,6 +3956,8 @@ fn test_dispatch_task_dedupes_cross_agent_rule_text() {
     );
 
     std::env::remove_var("AGEND_HOME");
+    std::env::remove_var("MEM0_HTTP_URL");
+    std::env::remove_var("MEM0_USER_ID");
     std::fs::remove_dir_all(&home).ok();
 }
 
