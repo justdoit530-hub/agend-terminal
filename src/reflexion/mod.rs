@@ -556,6 +556,10 @@ pub fn cleanup_old_mistakes(home: &Path) {
     }
 }
 
+/// Minimum increase in `trigger_count` since the last write before re-synthesizing
+/// `rule_text` (below this delta, only the count is bumped).
+const RESOLIDIFY_DELTA: usize = 3;
+
 /// Persist a rule after repeated mistakes, inject it into AGENTS.md, and sync it to Mem0.
 pub fn solidify_rule(
     home: &Path,
@@ -589,6 +593,16 @@ pub fn solidify_rule(
         return None;
     }
 
+    recent_mistakes.sort_by(|a, b| {
+        let ts_a = chrono::DateTime::parse_from_rfc3339(&a.timestamp)
+            .map(|ts| ts.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+        let ts_b = chrono::DateTime::parse_from_rfc3339(&b.timestamp)
+            .map(|ts| ts.with_timezone(&chrono::Utc))
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+        ts_b.cmp(&ts_a)
+    });
+
     let rules_dir = home.join("rules");
     if let Err(e) = fs::create_dir_all(&rules_dir) {
         tracing::warn!(?e, "failed to create rules directory");
@@ -596,29 +610,53 @@ pub fn solidify_rule(
     }
 
     let rule_id = format!("rule_{}_{}", agent_name, category);
-    let rule_text = synthesize_rule_text(category, &recent_mistakes);
+    let rule_path = rules_dir.join(format!("{}.json", rule_id));
+    let existing_rule: Option<Rule> = fs::read_to_string(&rule_path)
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok());
+
+    let (rule_text, created_at, refresh_external) = match existing_rule {
+        Some(existing) => {
+            let delta = trigger_count.saturating_sub(existing.trigger_count);
+            if delta >= RESOLIDIFY_DELTA {
+                (
+                    synthesize_rule_text(category, &recent_mistakes),
+                    existing.created_at,
+                    true,
+                )
+            } else {
+                (existing.rule_text, existing.created_at, false)
+            }
+        }
+        None => (
+            synthesize_rule_text(category, &recent_mistakes),
+            chrono::Utc::now().to_rfc3339(),
+            true,
+        ),
+    };
+
     let rule = Rule {
         id: rule_id.clone(),
         agent_name: agent_name.to_string(),
         category: category.to_string(),
         rule_text: rule_text.clone(),
         trigger_count,
-        created_at: chrono::Utc::now().to_rfc3339(),
+        created_at,
     };
 
-    let rule_path = rules_dir.join(format!("{}.json", rule_id));
     if let Ok(serialized) = serde_json::to_string_pretty(&rule) {
         if let Err(e) = fs::write(&rule_path, serialized) {
             tracing::warn!(?e, ?rule_path, "failed to write rule file");
         }
     }
 
-    // Inject rule into agent's .agents/AGENTS.md
-    inject_rule_to_agents_md_for_binding(home, agent_name, category, &rule_text);
+    if refresh_external {
+        inject_rule_to_agents_md_for_binding(home, agent_name, category, &rule_text);
+        spawn_mem0_sync(&rule);
+        let vault = obsidian_vault_path();
+        inject_rule_to_obsidian(&vault, agent_name, category, &rule_text, trigger_count);
+    }
 
-    spawn_mem0_sync(&rule);
-    let vault = obsidian_vault_path();
-    inject_rule_to_obsidian(&vault, agent_name, category, &rule_text, trigger_count);
     Some(rule_id)
 }
 
@@ -1799,6 +1837,131 @@ mod tests {
         assert!(agents_md_content.contains("<!-- agend-rules:start -->"));
         assert!(agents_md_content.contains("NEVER report VERIFIED without running cargo test"));
         assert!(agents_md_content.contains("<!-- agend-rules:end -->"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_re_solidify_bumps_count_only_when_delta_below_threshold() {
+        let home = tmp_home("re_solidify_count_only_test");
+        let agent = "re-solidify-agent";
+        let category = "lint_failure";
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+
+        for (idx, reason) in [
+            "Clippy warning on handler",
+            "Lint failure in dispatch",
+            "More clippy warnings",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mistake = Mistake {
+                id: format!("mock_mstk_{idx}"),
+                task_id: None,
+                agent_name: agent.to_string(),
+                category: category.to_string(),
+                rejection_reason: (*reason).to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+            };
+            std::fs::write(
+                mistakes_dir.join(format!("mock_mstk_{idx}.json")),
+                serde_json::to_string(&mistake).expect("failed to serialize mock mistake"),
+            )
+            .expect("failed to write mock mistake");
+        }
+
+        solidify_rule(&home, agent, category, 3).expect("initial solidify should succeed");
+        let rule_path = home.join("rules").join(format!("rule_{agent}_{category}.json"));
+        let initial_rule: Rule =
+            serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read rule"))
+                .expect("deserialize rule");
+
+        solidify_rule(&home, agent, category, 5).expect("count-only update should succeed");
+        let updated_rule: Rule =
+            serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read updated rule"))
+                .expect("deserialize updated rule");
+
+        assert_eq!(updated_rule.trigger_count, 5);
+        assert_eq!(updated_rule.rule_text, initial_rule.rule_text);
+        assert_eq!(updated_rule.created_at, initial_rule.created_at);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_re_solidify_refreshes_rule_text_when_delta_reaches_threshold() {
+        let home = tmp_home("re_solidify_refresh_test");
+        let agent = "re-solidify-refresh-agent";
+        let category = "lint_failure";
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+
+        let base_time = chrono::Utc::now();
+        let initial_reasons = [
+            "Clippy warning on handler",
+            "Lint failure in dispatch",
+            "More clippy warnings",
+        ];
+        for (idx, reason) in initial_reasons.iter().enumerate() {
+            let mistake = Mistake {
+                id: format!("mock_mstk_{idx}"),
+                task_id: None,
+                agent_name: agent.to_string(),
+                category: category.to_string(),
+                rejection_reason: (*reason).to_string(),
+                timestamp: (base_time - chrono::Duration::seconds(10 - idx as i64)).to_rfc3339(),
+                corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+            };
+            std::fs::write(
+                mistakes_dir.join(format!("mock_mstk_{idx}.json")),
+                serde_json::to_string(&mistake).expect("failed to serialize mock mistake"),
+            )
+            .expect("failed to write mock mistake");
+        }
+
+        solidify_rule(&home, agent, category, 3).expect("initial solidify should succeed");
+        let rule_path = home.join("rules").join(format!("rule_{agent}_{category}.json"));
+        let initial_rule: Rule =
+            serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read rule"))
+                .expect("deserialize rule");
+
+        let extra_reasons = [
+            "New regression: await_holding_lock clippy error",
+            "Another lint failure in reflexion tests",
+            "cargo clippy still reports warnings",
+        ];
+        for (idx, reason) in extra_reasons.iter().enumerate() {
+            let mistake = Mistake {
+                id: format!("mock_mstk_extra_{idx}"),
+                task_id: None,
+                agent_name: agent.to_string(),
+                category: category.to_string(),
+                rejection_reason: (*reason).to_string(),
+                timestamp: (base_time + chrono::Duration::seconds(idx as i64 + 1)).to_rfc3339(),
+                corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+            };
+            std::fs::write(
+                mistakes_dir
+                    .join(format!("mock_mstk_extra_{idx}.json")),
+                serde_json::to_string(&mistake).expect("failed to serialize extra mock mistake"),
+            )
+            .expect("failed to write extra mock mistake");
+        }
+
+        solidify_rule(&home, agent, category, 6).expect("re-solidify should succeed");
+        let refreshed_rule: Rule =
+            serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read refreshed rule"))
+                .expect("deserialize refreshed rule");
+
+        assert_eq!(refreshed_rule.trigger_count, 6);
+        assert_eq!(refreshed_rule.created_at, initial_rule.created_at);
+        assert_ne!(refreshed_rule.rule_text, initial_rule.rule_text);
+        assert!(refreshed_rule
+            .rule_text
+            .contains("await_holding_lock clippy error"));
 
         std::fs::remove_dir_all(&home).ok();
     }
