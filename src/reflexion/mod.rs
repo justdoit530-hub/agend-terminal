@@ -1891,6 +1891,181 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[serial_test::serial(mem0_sync)]
+    #[test]
+    fn test_re_solidify_count_only_does_not_trigger_external_sync() {
+        with_mem0_user_id_cleared(|| {
+            let home = tmp_home("re_solidify_no_external_sync_test");
+            let agent = "re-solidify-no-sync-agent";
+            let category = "lint_failure";
+            let obsidian_vault = home.join("obsidian_vault");
+            std::fs::create_dir_all(&obsidian_vault).expect("failed to create obsidian vault");
+
+            let previous_obsidian_vault = std::env::var("AGEND_OBSIDIAN_VAULT").ok();
+            unsafe {
+                std::env::set_var(
+                    "AGEND_OBSIDIAN_VAULT",
+                    obsidian_vault.to_str().expect("invalid obsidian vault path"),
+                );
+            }
+
+            let worktree_dir = home.join("worktrees").join(agent).join("mock_worktree_1");
+            std::fs::create_dir_all(worktree_dir.join(".agents")).expect("failed to create agents dir");
+            let agents_md_path = worktree_dir.join(".agents").join("AGENTS.md");
+            std::fs::write(
+                &agents_md_path,
+                "<!-- agend-rules:start -->\n<!-- agend-rules:end -->",
+            )
+            .expect("failed to init AGENTS.md");
+
+            let mistakes_dir = home.join("mistakes");
+            std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+            for (idx, reason) in [
+                "Clippy warning on handler",
+                "Lint failure in dispatch",
+                "More clippy warnings",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let mistake = Mistake {
+                    id: format!("mock_mstk_{idx}"),
+                    task_id: None,
+                    agent_name: agent.to_string(),
+                    category: category.to_string(),
+                    rejection_reason: (*reason).to_string(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+                };
+                std::fs::write(
+                    mistakes_dir.join(format!("mock_mstk_{idx}.json")),
+                    serde_json::to_string(&mistake).expect("failed to serialize mock mistake"),
+                )
+                .expect("failed to write mock mistake");
+            }
+
+            let mem0_listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("failed to bind Mem0 sync test listener");
+            mem0_listener
+                .set_nonblocking(true)
+                .expect("failed to set listener nonblocking");
+            let mem0_addr = mem0_listener
+                .local_addr()
+                .expect("failed to read listener addr");
+            {
+                let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                    .lock()
+                    .expect("mem0 sync url override mutex poisoned");
+                *override_url = Some(format!("http://{mem0_addr}/add"));
+            }
+
+            let initial_mem0_server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match mem0_listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let request = read_http_request(&mut stream);
+                            use std::io::Write;
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .expect("failed to write response");
+                            return Some(request);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("failed to accept initial Mem0 request: {e}"),
+                    }
+                }
+            });
+
+            solidify_rule(&home, agent, category, 3).expect("initial solidify should succeed");
+            initial_mem0_server
+                .join()
+                .expect("initial Mem0 server panicked")
+                .expect("initial solidify should trigger Mem0 sync");
+
+            let rule_path = home.join("rules").join(format!("rule_{agent}_{category}.json"));
+            let initial_rule: Rule =
+                serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read rule"))
+                    .expect("deserialize rule");
+            let agents_md_after_initial =
+                std::fs::read_to_string(&agents_md_path).expect("read AGENTS.md after initial");
+            let obsidian_md_path = obsidian_vault.join("Rules").join(format!("{agent}_{category}.md"));
+            assert!(obsidian_md_path.exists(), "initial solidify should write Obsidian rule");
+            let obsidian_after_initial =
+                std::fs::read_to_string(&obsidian_md_path).expect("read Obsidian rule after initial");
+
+            let mem0_listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("failed to bind second Mem0 sync test listener");
+            mem0_listener
+                .set_nonblocking(true)
+                .expect("failed to set listener nonblocking");
+            let mem0_addr = mem0_listener
+                .local_addr()
+                .expect("failed to read second listener addr");
+            {
+                let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                    .lock()
+                    .expect("mem0 sync url override mutex poisoned");
+                *override_url = Some(format!("http://{mem0_addr}/add"));
+            }
+
+            let count_only_mem0_server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                loop {
+                    match mem0_listener.accept() {
+                        Ok(_) => panic!("count-only re-solidify must not trigger Mem0 sync"),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("failed while polling Mem0 listener: {e}"),
+                    }
+                }
+            });
+
+            solidify_rule(&home, agent, category, 4).expect("count-only update should succeed");
+            count_only_mem0_server
+                .join()
+                .expect("count-only Mem0 server panicked");
+
+            let updated_rule: Rule = serde_json::from_str(
+                &std::fs::read_to_string(&rule_path).expect("read updated rule"),
+            )
+            .expect("deserialize updated rule");
+            assert_eq!(updated_rule.trigger_count, 4);
+            assert_eq!(updated_rule.rule_text, initial_rule.rule_text);
+            assert_eq!(
+                std::fs::read_to_string(&agents_md_path).expect("read AGENTS.md after count-only"),
+                agents_md_after_initial
+            );
+            assert_eq!(
+                std::fs::read_to_string(&obsidian_md_path).expect("read Obsidian rule after count-only"),
+                obsidian_after_initial
+            );
+
+            {
+                let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                    .lock()
+                    .expect("mem0 sync url override mutex poisoned");
+                *override_url = None;
+            }
+            unsafe {
+                match previous_obsidian_vault {
+                    Some(value) => std::env::set_var("AGEND_OBSIDIAN_VAULT", value),
+                    None => std::env::remove_var("AGEND_OBSIDIAN_VAULT"),
+                }
+            }
+            std::fs::remove_dir_all(&home).ok();
+        });
+    }
+
     #[test]
     fn test_re_solidify_refreshes_rule_text_when_delta_reaches_threshold() {
         let home = tmp_home("re_solidify_refresh_test");
