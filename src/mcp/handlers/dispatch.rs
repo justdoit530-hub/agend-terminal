@@ -306,10 +306,38 @@ const KEYWORD_MIN_LEN: usize = 3;
 /// Common task-description filler — excluded so generic dispatches still
 /// receive all rules (empty keywords ⇒ [`rule_is_relevant`] passes everything).
 const KEYWORD_STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "from", "this", "that", "into", "before", "after",
-    "when", "your", "have", "will", "been", "were", "they", "please", "task", "work",
-    "worker", "original", "description", "implement", "create", "make", "change",
-    "complete", "update", "review", "branch", "repo",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "this",
+    "that",
+    "into",
+    "before",
+    "after",
+    "when",
+    "your",
+    "have",
+    "will",
+    "been",
+    "were",
+    "they",
+    "please",
+    "task",
+    "work",
+    "worker",
+    "original",
+    "description",
+    "implement",
+    "create",
+    "make",
+    "change",
+    "complete",
+    "update",
+    "review",
+    "branch",
+    "repo",
 ];
 
 /// Tokenize a task description into lowercase keywords for relevance matching.
@@ -354,13 +382,11 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
                         .join("\n");
                     sections.push(format!("[適用規則]\n{rules_text}"));
                 }
-                let cross_rules: Vec<_> = crate::reflexion::list_cross_agent_rules(
-                    ctx.home,
-                    agent_name,
-                )
-                .into_iter()
-                .filter(|r| rule_is_relevant(&r.rule_text, &keywords))
-                .collect();
+                let cross_rules: Vec<_> =
+                    crate::reflexion::list_cross_agent_rules(ctx.home, agent_name)
+                        .into_iter()
+                        .filter(|r| rule_is_relevant(&r.rule_text, &keywords))
+                        .collect();
                 if !cross_rules.is_empty() {
                     let own_rule_texts: std::collections::HashSet<&str> =
                         rules.iter().map(|r| r.rule_text.as_str()).collect();
@@ -374,8 +400,10 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
                         sections.push(format!("[其他 Worker 規則參考]\n{cross_text}"));
                     }
                 }
-                if let Some(mem0_context) = dispatch_mem0_context(agent_name, original_message) {
-                    sections.push(mem0_context);
+                if semantic_search_enabled() {
+                    if let Some(mem0_context) = dispatch_mem0_context(original_message) {
+                        sections.push(mem0_context);
+                    }
                 }
                 if sections.len() > 1 {
                     modified_args["description"] = json!(sections.join("\n\n"));
@@ -388,9 +416,18 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
     }
 }
 
-fn dispatch_mem0_context(agent_name: &str, message: &str) -> Option<String> {
-    let message_prefix: String = message.chars().take(100).collect();
-    let query = format!("{agent_name} {message_prefix}");
+fn semantic_search_enabled() -> bool {
+    match std::env::var("SEMANTIC_SEARCH_ENABLED") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+fn dispatch_mem0_context(message: &str) -> Option<String> {
+    let query = message.to_string();
     // fire-and-forget: not detached; joined below before returning to bound Mem0 lookup lifetime.
     let worker = match std::thread::Builder::new()
         .name("agend-mem0-dispatch".to_string())
@@ -425,9 +462,18 @@ fn dispatch_mem0_context(agent_name: &str, message: &str) -> Option<String> {
 async fn search_mem0_context(query: &str) -> Option<String> {
     let base_url =
         std::env::var("MEM0_HTTP_URL").unwrap_or_else(|_| "http://localhost:5174".to_string());
-    let url = format!("{}/search", base_url.trim_end_matches('/'));
     let user_id = std::env::var("MEM0_USER_ID").unwrap_or_else(|_| "neo".to_string());
     let client = mem0_http_client()?;
+    search_mem0_context_with_client(client, &base_url, &user_id, query).await
+}
+
+async fn search_mem0_context_with_client(
+    client: &reqwest::Client,
+    base_url: &str,
+    user_id: &str,
+    query: &str,
+) -> Option<String> {
+    let url = format!("{}/search", base_url.trim_end_matches('/'));
     let response = match client
         .post(url)
         .json(&json!({
@@ -467,6 +513,7 @@ async fn search_mem0_context(query: &str) -> Option<String> {
     };
     let memories = results
         .iter()
+        .filter(|result| result["score"].as_f64().is_some_and(|score| score >= 0.6))
         .filter_map(|result| result["memory"].as_str())
         .map(|memory| format!("- {memory}"))
         .collect::<Vec<_>>();
@@ -482,7 +529,7 @@ fn mem0_http_client() -> Option<&'static reqwest::Client> {
     CLIENT
         .get_or_init(|| {
             match reqwest::Client::builder()
-                .timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(5))
                 .build()
             {
                 Ok(client) => Some(client),
@@ -786,6 +833,9 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::thread;
 
     fn ctx_for<'a>(home: &'a Path, args: &'a Value, instance: &'a str) -> HandlerCtx<'a> {
         static EMPTY_SENDER: Option<Sender> = None;
@@ -843,6 +893,90 @@ mod tests {
             &kw
         ));
         assert!(!rule_is_relevant("Always use justdoit530-hub for PRs", &kw));
+    }
+
+    #[test]
+    fn semantic_search_enabled_defaults_true_and_accepts_false_values() {
+        std::env::remove_var("SEMANTIC_SEARCH_ENABLED");
+        assert!(semantic_search_enabled());
+
+        std::env::set_var("SEMANTIC_SEARCH_ENABLED", "false");
+        assert!(!semantic_search_enabled());
+
+        std::env::set_var("SEMANTIC_SEARCH_ENABLED", "1");
+        assert!(semantic_search_enabled());
+
+        std::env::remove_var("SEMANTIC_SEARCH_ENABLED");
+    }
+
+    #[test]
+    fn search_mem0_context_filters_by_score() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"results":[{"memory":"too weak","score":0.59},{"memory":"relevant rule","score":0.6}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let context = rt
+            .block_on(search_mem0_context_with_client(
+                &client,
+                &base_url,
+                "neo",
+                "dispatch task",
+            ))
+            .expect("semantic context");
+
+        server.join().expect("server thread");
+        assert!(context.contains("[過去經驗]"));
+        assert!(context.contains("relevant rule"));
+        assert!(!context.contains("too weak"));
+    }
+
+    #[test]
+    fn search_mem0_context_timeout_fails_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf);
+            thread::sleep(Duration::from_millis(250));
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("client");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let context = rt.block_on(search_mem0_context_with_client(
+            &client,
+            &base_url,
+            "neo",
+            "dispatch task",
+        ));
+
+        server.join().expect("server thread");
+        assert!(context.is_none());
     }
 
     #[test]
