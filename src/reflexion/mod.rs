@@ -150,6 +150,9 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
     static SECRET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static FIRE_AND_FORGET_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static BRANCH_BASE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static INCOMPLETE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static TEST_FAILURE_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static MISSING_PR_DESC_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
 
     let test_re = TEST_RE.get_or_init(|| {
         regex::Regex::new(r"(?i)(cargo test|test suite|unit test)").expect("valid test regex")
@@ -234,6 +237,39 @@ pub fn classify_mistake(rejection_text: &str, parent_text: Option<&str>) -> Opti
         return Some("wrong_branch_base");
     }
 
+    // 9. incomplete_implementation
+    let incomplete_re = INCOMPLETE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(incomplete implementation|functionally incomplete|stub implementation|left a todo|todo left|partial logic|partial implementation|not implemented|unimplemented|placeholder implementation|\btodo\b|\bfixme\b)",
+        )
+        .expect("valid incomplete implementation regex")
+    });
+    if incomplete_re.is_match(rejection_text) {
+        return Some("incomplete_implementation");
+    }
+
+    // 10. test_failure
+    let test_failure_re = TEST_FAILURE_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(test failure|tests fail|failing test|tests? (are )?failing|broke.*tests?|broken tests?|tests? broken|test regression|assertion failed|tests? did not pass|cargo test.*fail)",
+        )
+        .expect("valid test failure regex")
+    });
+    if test_failure_re.is_match(rejection_text) {
+        return Some("test_failure");
+    }
+
+    // 11. missing_pr_description
+    let missing_pr_desc_re = MISSING_PR_DESC_RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(empty pr (description|body)|missing pr (description|body)|trivial pr (description|body)|no pr description|pr (description|body) (is )?(empty|missing|trivial)|empty pull request (description|body)|missing pull request description)",
+        )
+        .expect("valid missing PR description regex")
+    });
+    if missing_pr_desc_re.is_match(rejection_text) {
+        return Some("missing_pr_description");
+    }
+
     Some("unclassified")
 }
 
@@ -248,6 +284,9 @@ pub fn get_rule_text(category: &str) -> &'static str {
         "wrong_pr_repo" => "NEVER open a PR to suzuke/agend-terminal; always use justdoit530-hub/agend-terminal",
         "hardcoded_secret" => "NEVER hardcode secrets or API keys in source code; read from environment variables",
         "wrong_branch_base" => "NEVER base a feature branch on a stale or wrong base branch",
+        "incomplete_implementation" => "NEVER submit functionally incomplete code (stubs, TODOs, or partial logic); finish the implementation before opening a PR",
+        "test_failure" => "NEVER commit code that breaks existing tests; run cargo test and fix failures before submitting",
+        "missing_pr_description" => "NEVER open a PR with an empty or trivial description; write a meaningful PR body explaining what changed and why",
         _ => "NEVER repeat this mistake category",
     }
 }
@@ -926,6 +965,45 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_mistake_incomplete_implementation() {
+        let rejection1 = "The change is functionally incomplete and still has a TODO left in.";
+        assert_eq!(
+            classify_mistake(rejection1, None),
+            Some("incomplete_implementation")
+        );
+
+        let rejection2 = "This is a stub implementation with partial logic only.";
+        assert_eq!(
+            classify_mistake(rejection2, None),
+            Some("incomplete_implementation")
+        );
+    }
+
+    #[test]
+    fn test_classify_mistake_test_failure() {
+        let rejection1 = "cargo test failed with a regression in the handler tests.";
+        assert_eq!(classify_mistake(rejection1, None), Some("test_failure"));
+
+        let rejection2 = "The commit broke the existing test suite.";
+        assert_eq!(classify_mistake(rejection2, None), Some("test_failure"));
+    }
+
+    #[test]
+    fn test_classify_mistake_missing_pr_description() {
+        let rejection1 = "The PR body is empty — please add a meaningful description.";
+        assert_eq!(
+            classify_mistake(rejection1, None),
+            Some("missing_pr_description")
+        );
+
+        let rejection2 = "You opened a pull request with a trivial PR description.";
+        assert_eq!(
+            classify_mistake(rejection2, None),
+            Some("missing_pr_description")
+        );
+    }
+
+    #[test]
     fn test_classify_mistake_unknown_falls_back_to_unclassified() {
         let rejection = "The report missed the operational nuance in this workflow.";
         assert_eq!(classify_mistake(rejection, None), Some("unclassified"));
@@ -1236,13 +1314,16 @@ mod tests {
     async fn test_solidify_triggers_mem0_sync() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let _guard = crate::daemon::test_env_lock()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous_mem0_user = std::env::var("MEM0_USER_ID").ok();
-        unsafe {
-            std::env::remove_var("MEM0_USER_ID");
-        }
+        let previous_mem0_user = {
+            let _guard = crate::daemon::test_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let previous = std::env::var("MEM0_USER_ID").ok();
+            unsafe {
+                std::env::remove_var("MEM0_USER_ID");
+            }
+            previous
+        };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1330,10 +1411,15 @@ mod tests {
             *override_url = None;
         }
 
-        unsafe {
-            match previous_mem0_user {
-                Some(value) => std::env::set_var("MEM0_USER_ID", value),
-                None => std::env::remove_var("MEM0_USER_ID"),
+        {
+            let _guard = crate::daemon::test_env_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            unsafe {
+                match previous_mem0_user {
+                    Some(value) => std::env::set_var("MEM0_USER_ID", value),
+                    None => std::env::remove_var("MEM0_USER_ID"),
+                }
             }
         }
     }
