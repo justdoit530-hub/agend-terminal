@@ -4080,7 +4080,7 @@ fn test_dispatch_mem0_injects_without_existing_tokio_runtime() {
             request.contains(r#""user_id":"dispatch-user""#),
             "request was {request}"
         );
-        let body = r#"{"results":[{"memory":"Use a local runtime for dispatch Mem0 lookup"}]}"#;
+        let body = r#"{"results":[{"memory":"Use a local runtime for dispatch Mem0 lookup","score":0.6}]}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
             body.len(),
