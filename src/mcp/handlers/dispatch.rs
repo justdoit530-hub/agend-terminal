@@ -813,6 +813,28 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_keyword_filter_fail_open_on_all_stopwords() {
+        let description = "implement the task with repo branch";
+        let keywords = extract_keywords(description);
+        assert!(
+            keywords.is_empty(),
+            "all-stopword descriptions should yield no keywords: {keywords:?}"
+        );
+
+        let rule_texts = [
+            "NEVER open wrong repo",
+            "Always run cargo test before push",
+            "Capture reviewer evidence before reporting",
+        ];
+        for rule_text in rule_texts {
+            assert!(
+                rule_is_relevant(rule_text, &keywords),
+                "fail-open: {rule_text:?} should be relevant when keywords are empty"
+            );
+        }
+    }
+
+    #[test]
     fn rule_is_relevant_matches_substring() {
         let kw = extract_keywords("Verify cargo test evidence");
         assert!(rule_is_relevant("Always run tests before push", &kw));
