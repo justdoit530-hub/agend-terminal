@@ -3962,6 +3962,66 @@ fn test_dispatch_task_dedupes_cross_agent_rule_text() {
 }
 
 #[test]
+fn test_dispatch_task_filters_irrelevant_cross_agent_rules() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("mcp_dispatch_task_filter_cross_agent_rules_test");
+    std::env::set_var("AGEND_HOME", &home);
+
+    let rules_dir = home.join("rules");
+    std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+    let test_rule = crate::reflexion::Rule {
+        id: "rule_test_relevant".to_string(),
+        agent_name: "agent-a".to_string(),
+        category: "missing_test_execution".to_string(),
+        rule_text: "Always run cargo test before push".to_string(),
+        created_at: "2026-06-26T12:00:00Z".to_string(),
+        trigger_count: 1,
+    };
+    let pr_rule = crate::reflexion::Rule {
+        id: "rule_pr_irrelevant".to_string(),
+        agent_name: "agent-b".to_string(),
+        category: "wrong_repo".to_string(),
+        rule_text: "NEVER open a PR to suzuke/agend-terminal".to_string(),
+        created_at: "2026-06-26T12:01:00Z".to_string(),
+        trigger_count: 2,
+    };
+    std::fs::write(
+        rules_dir.join("rule_test_relevant.json"),
+        serde_json::to_string(&test_rule).expect("failed to serialize test rule"),
+    )
+    .expect("failed to write test rule");
+    std::fs::write(
+        rules_dir.join("rule_pr_irrelevant.json"),
+        serde_json::to_string(&pr_rule).expect("failed to serialize pr rule"),
+    )
+    .expect("failed to write pr rule");
+
+    let result = handle_tool(
+        "task",
+        &json!({
+            "action": "create",
+            "title": "Cargo test task",
+            "description": "Run cargo test and verify clippy passes",
+            "assignee": "agent-a",
+        }),
+        "operator",
+    );
+
+    assert!(result.get("error").is_none());
+    let description = result["task"]["description"]
+        .as_str()
+        .expect("description string");
+    assert!(description.contains("[適用規則]"));
+    assert!(description.contains("Always run cargo test before push"));
+    assert!(!description.contains("[其他 Worker 規則參考]"));
+    assert!(!description.contains("suzuke/agend-terminal"));
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_dispatch_mem0_graceful_fail() {
     let _env = crate::daemon::test_env_lock()
         .lock()

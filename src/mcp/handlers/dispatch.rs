@@ -301,6 +301,39 @@ adapter!(dispatch_restart_daemon, h, restart::handle_restart_daemon);
 // handler. Unknown actions produce tool-specific error JSON.
 // ---------------------------------------------------------------------
 
+const KEYWORD_MIN_LEN: usize = 3;
+
+/// Common task-description filler — excluded so generic dispatches still
+/// receive all rules (empty keywords ⇒ [`rule_is_relevant`] passes everything).
+const KEYWORD_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "this", "that", "into", "before", "after",
+    "when", "your", "have", "will", "been", "were", "they", "please", "task", "work",
+    "worker", "original", "description", "implement", "create", "make", "change",
+    "complete", "update", "review", "branch", "repo",
+];
+
+/// Tokenize a task description into lowercase keywords for relevance matching.
+pub(crate) fn extract_keywords(task_description: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    task_description
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= KEYWORD_MIN_LEN)
+        .map(str::to_lowercase)
+        .filter(|w| !KEYWORD_STOPWORDS.contains(&w.as_str()))
+        .filter(|w| seen.insert(w.clone()))
+        .collect()
+}
+
+/// True when `rule_text` shares at least one keyword with the task, or when no
+/// keywords were extracted (generic/short descriptions — fail-open).
+pub(crate) fn rule_is_relevant(rule_text: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() {
+        return true;
+    }
+    let haystack = rule_text.to_lowercase();
+    keywords.iter().any(|kw| haystack.contains(kw))
+}
+
 pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
     if ctx.args["action"].as_str() == Some("create") {
         let mut modified_args = ctx.args.clone();
@@ -308,7 +341,11 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
             if !agent_name.is_empty() {
                 let original_message = modified_args["description"].as_str().unwrap_or("");
                 let mut sections = vec![original_message.to_string()];
-                let rules = crate::reflexion::list_rules(ctx.home, agent_name);
+                let keywords = extract_keywords(original_message);
+                let rules: Vec<_> = crate::reflexion::list_rules(ctx.home, agent_name)
+                    .into_iter()
+                    .filter(|r| rule_is_relevant(&r.rule_text, &keywords))
+                    .collect();
                 if !rules.is_empty() {
                     let rules_text = rules
                         .iter()
@@ -317,7 +354,13 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
                         .join("\n");
                     sections.push(format!("[適用規則]\n{rules_text}"));
                 }
-                let cross_rules = crate::reflexion::list_cross_agent_rules(ctx.home, agent_name);
+                let cross_rules: Vec<_> = crate::reflexion::list_cross_agent_rules(
+                    ctx.home,
+                    agent_name,
+                )
+                .into_iter()
+                .filter(|r| rule_is_relevant(&r.rule_text, &keywords))
+                .collect();
                 if !cross_rules.is_empty() {
                     let own_rule_texts: std::collections::HashSet<&str> =
                         rules.iter().map(|r| r.rule_text.as_str()).collect();
@@ -752,6 +795,32 @@ mod tests {
             instance_name: instance,
             sender: &EMPTY_SENDER,
         }
+    }
+
+    #[test]
+    fn extract_keywords_skips_stopwords_and_short_tokens() {
+        assert!(extract_keywords("Original description").is_empty());
+        let kw = extract_keywords("Run cargo test before push");
+        assert!(kw.contains(&"cargo".to_string()));
+        assert!(kw.contains(&"test".to_string()));
+        assert!(kw.contains(&"push".to_string()));
+        assert!(kw.contains(&"run".to_string()));
+    }
+
+    #[test]
+    fn rule_is_relevant_fail_open_on_empty_keywords() {
+        assert!(rule_is_relevant("NEVER open wrong repo", &[]));
+    }
+
+    #[test]
+    fn rule_is_relevant_matches_substring() {
+        let kw = extract_keywords("Verify cargo test evidence");
+        assert!(rule_is_relevant("Always run tests before push", &kw));
+        assert!(rule_is_relevant(
+            "Capture reviewer evidence before reporting",
+            &kw
+        ));
+        assert!(!rule_is_relevant("Always use justdoit530-hub for PRs", &kw));
     }
 
     #[test]
