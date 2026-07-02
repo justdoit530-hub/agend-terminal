@@ -1008,6 +1008,149 @@ fn parse_duration_secs(s: &str) -> Option<i64> {
     }
 }
 
+// ---------------------------------------------------------------------
+// Context-aware worker routing — prefer idle workers with lower context%.
+// ---------------------------------------------------------------------
+
+/// Context% assumed when telemetry is absent (medium load).
+pub(crate) const DEFAULT_UNKNOWN_CONTEXT_PCT: f32 = 50.0;
+
+/// Sort key for context-aware routing (`None` → [`DEFAULT_UNKNOWN_CONTEXT_PCT`]).
+pub(crate) fn context_sort_key(pct: Option<f32>) -> f32 {
+    pct.unwrap_or(DEFAULT_UNKNOWN_CONTEXT_PCT)
+}
+
+fn is_operated_idle(
+    raw: crate::state::AgentState,
+    observed: Option<&crate::daemon::shadow::reducer::ObservedStatus>,
+) -> bool {
+    crate::daemon::shadow::operated_state(raw, observed) == crate::state::AgentState::Idle
+}
+
+/// Snapshot idle candidates with their resolved `context_pct` (registry lock only).
+fn snapshot_idle_workers_with_context(
+    registry: &crate::agent::AgentRegistry,
+    candidates: &[String],
+    home: &Path,
+) -> Vec<(String, Option<f32>)> {
+    use std::collections::HashSet;
+
+    let candidate_set: HashSet<&str> = candidates.iter().map(String::as_str).collect();
+    let reg = crate::agent::lock_registry(registry);
+    reg.values()
+        .filter(|handle| candidate_set.contains(handle.name.as_str()))
+        .filter_map(|handle| {
+            let (raw, observed, context) = {
+                let c = handle.core.lock();
+                (
+                    c.state.current,
+                    c.observed_status.clone(),
+                    c.state.resolved_context(Some(home)),
+                )
+            };
+            if !is_operated_idle(raw, observed.as_ref()) {
+                return None;
+            }
+            let pct = context.map(|(p, _)| p);
+            Some((handle.name.to_string(), pct))
+        })
+        .collect()
+}
+
+/// Among `candidates`, return the operated-idle worker with the lowest context%.
+pub(crate) fn select_lowest_context_idle_worker(
+    registry: &crate::agent::AgentRegistry,
+    candidates: &[String],
+    home: &Path,
+) -> Option<String> {
+    let mut idle = snapshot_idle_workers_with_context(registry, candidates, home);
+    if idle.is_empty() {
+        return None;
+    }
+    idle.sort_by(|a, b| {
+        context_sort_key(a.1)
+            .partial_cmp(&context_sort_key(b.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Some(idle[0].0.clone())
+}
+
+/// Candidate worker names for a kind=task dispatch that would otherwise broadcast.
+pub(crate) fn resolve_task_dispatch_candidates(
+    home: &Path,
+    args: &Value,
+    sender: &str,
+) -> Vec<String> {
+    if let Some(arr) = args["instances"].as_array() {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .filter(|n| n != sender)
+            .collect();
+    }
+    if let Some(team) = args["team"].as_str() {
+        return crate::teams::get_members(home, team)
+            .into_iter()
+            .filter(|n| n != sender)
+            .collect();
+    }
+    if let Some(tags) = args["tags"].as_array() {
+        use std::collections::HashSet;
+
+        let tag_set: HashSet<String> = tags
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_lowercase))
+            .collect();
+        if tag_set.is_empty() {
+            return Vec::new();
+        }
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .unwrap_or_default();
+        return fleet
+            .instances
+            .keys()
+            .filter(|name| {
+                if tag_set.contains(&name.to_lowercase()) {
+                    return true;
+                }
+                fleet.instances.get(*name).is_some_and(|ic| {
+                    ic.role_kind.is_some_and(|rk| {
+                        serde_json::to_value(rk)
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_lowercase))
+                            .is_some_and(|rk_str| tag_set.contains(&rk_str))
+                    })
+                })
+            })
+            .filter(|n| *n != sender)
+            .cloned()
+            .collect();
+    }
+    Vec::new()
+}
+
+/// When dispatching kind=task to multiple candidates, pick the idle worker with
+/// the lowest `context_pct`. Returns `None` when routing does not apply.
+pub(crate) fn try_resolve_context_aware_task_target(
+    home: &Path,
+    registry: &crate::agent::AgentRegistry,
+    args: &Value,
+    sender: &str,
+) -> Option<String> {
+    if args["instance"].as_str().is_some_and(|s| !s.is_empty()) {
+        return None;
+    }
+    if args["request_kind"].as_str() != Some("task") {
+        return None;
+    }
+    let candidates = resolve_task_dispatch_candidates(home, args, sender);
+    if candidates.len() < 2 {
+        return None;
+    }
+    select_lowest_context_idle_worker(registry, &candidates, home)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1025,6 +1168,53 @@ mod tests {
             instance_name: instance,
             sender: &EMPTY_SENDER,
         }
+    }
+
+    /// Context-aware routing: two idle workers at 30% vs 70% → pick 30%.
+    #[cfg(unix)]
+    #[test]
+    fn context_aware_routing_prefers_lower_context_worker() {
+        use crate::agent::{self, AgentRegistry};
+        use crate::backend::Backend;
+        use crate::state::AgentState;
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        fn worker_with_context(name: &str, pct: f32) -> agent::AgentHandle {
+            let id = crate::types::InstanceId::default();
+            let handle = agent::mk_test_handle(name, id);
+            {
+                let mut core = handle.core.lock();
+                core.state = crate::state::StateTracker::new(Some(&Backend::ClaudeCode));
+                core.state.current = AgentState::Idle;
+                core.state.feed(&format!(
+                    "────────────\n  Model: test | Ctx Used: {pct:.1}% | branch\n  bypass permissions on\n❯\n"
+                ));
+            }
+            handle
+        }
+
+        let home = std::env::temp_dir();
+        let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut reg = agent::lock_registry(&registry);
+            let high = worker_with_context("worker-high", 70.0);
+            let low = worker_with_context("worker-low", 30.0);
+            reg.insert(high.id, high);
+            reg.insert(low.id, low);
+        }
+
+        let candidates = vec!["worker-high".into(), "worker-low".into()];
+        let selected = select_lowest_context_idle_worker(&registry, &candidates, &home)
+            .expect("should select an idle worker");
+        assert_eq!(selected, "worker-low");
+    }
+
+    #[test]
+    fn context_sort_key_defaults_unknown_to_fifty() {
+        assert!((context_sort_key(None) - DEFAULT_UNKNOWN_CONTEXT_PCT).abs() < f32::EPSILON);
+        assert!((context_sort_key(Some(12.5)) - 12.5).abs() < f32::EPSILON);
     }
 
     #[test]

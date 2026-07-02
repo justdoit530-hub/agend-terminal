@@ -896,7 +896,7 @@ mod tests {
             ("send", "instance", "comms.rs resolve_instance → single-recipient routing"),
             ("send", "instances", "comms.rs handle_broadcast recipient list"),
             ("send", "team", "comms.rs handle_broadcast → teams::get_members"),
-            ("send", "tags", "comms.rs is_some() triggers broadcast MODE; value-based tag-targeting NOT implemented"),
+            ("send", "tags", "comms.rs broadcast MODE; kind=task + tags filters candidates for context-aware single-worker routing"),
             ("send", "message", "comms.rs task body / lift_message for kind=report|query"),
             ("send", "request_kind", "comms.rs handler routing + auto_close kind gate"),
             ("send", "success_criteria", "comms.rs appended to delivered message body"),
