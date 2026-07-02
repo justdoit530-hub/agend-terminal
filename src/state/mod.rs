@@ -1228,6 +1228,11 @@ impl StateTracker {
     /// corrected estimator + its root-cause record live on in
     /// `token_cost::estimate_context_pct` (tested, uncalled); re-enable ONLY
     /// after validating its readings against statusline ground truth.
+    #[cfg(test)]
+    pub fn set_context_pct_for_test(&mut self, pct: f32) {
+        self.context_pct = Some((pct, std::time::Instant::now()));
+    }
+
     pub fn resolved_context(
         &self,
         home: Option<&std::path::Path>,

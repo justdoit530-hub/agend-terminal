@@ -212,6 +212,7 @@ pub enum BlockedReason {
     /// `AgentState::ModelUnsupported`. Manual-clear-only and hang-suppressing —
     /// see `auto_clears_on` / `suppresses_hang_check`.
     ModelUnsupported,
+    ContextHigh,
 }
 
 /// #1638: which recovery signal a [`BlockedReason`] is being tested against.
@@ -240,6 +241,7 @@ impl BlockedReason {
             "hang" => Some(Self::Hang),
             "crash" => Some(Self::Crash),
             "model_unsupported" => Some(Self::ModelUnsupported),
+            "context_high" => Some(Self::ContextHigh),
             _ => None,
         }
     }
@@ -253,6 +255,7 @@ impl BlockedReason {
             Self::PermissionPrompt => "permission_prompt",
             Self::Crash => "crash",
             Self::ModelUnsupported => "model_unsupported",
+            Self::ContextHigh => "context_high",
         }
     }
 
@@ -287,7 +290,11 @@ impl BlockedReason {
             // the operator must change the configured model, then the agent
             // restarts and `HealthTracker::reset()` clears it on respawn. So it
             // joins the manual-clear-only class with PermissionPrompt/Hang/Crash.
-            Self::PermissionPrompt | Self::Hang | Self::Crash | Self::ModelUnsupported => false,
+            Self::PermissionPrompt
+            | Self::Hang
+            | Self::Crash
+            | Self::ModelUnsupported
+            | Self::ContextHigh => false,
         }
     }
 
@@ -310,7 +317,7 @@ impl BlockedReason {
             | Self::QuotaExceeded
             | Self::AwaitingOperator
             | Self::ModelUnsupported => true,
-            Self::PermissionPrompt | Self::Hang | Self::Crash => false,
+            Self::PermissionPrompt | Self::Hang | Self::Crash | Self::ContextHigh => false,
         }
     }
 }

@@ -426,7 +426,9 @@ pub fn sweep_stale_run_dirs(home: &Path) {
     }
 }
 
-pub(crate) use daemon_identity::{read_daemon_boot_unix, read_daemon_pid, read_daemon_start_token, write_daemon_id};
+pub(crate) use daemon_identity::{
+    read_daemon_boot_unix, read_daemon_pid, read_daemon_start_token, write_daemon_id,
+};
 
 /// Agent definition tuple for daemon startup.
 pub type AgentDef = (
@@ -639,6 +641,7 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::PrStateScanHandler::new()),
         Box::new(per_tick::InboxMaintenanceHandler::new(60)),
         Box::new(per_tick::PollReminderHandler::new(30)),
+        Box::new(per_tick::ContextWatermarkHandler::new(30)),
         // #1491(A): inbox-stuck watchdog — every 30 ticks (~5min). Detects an
         // agent receiving but not draining its inbox; notifies lead (no auto-restart).
         Box::new(inbox_stuck),
