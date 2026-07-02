@@ -1466,67 +1466,67 @@ mod tests {
     #[test]
     fn test_spawn_mem0_sync_posts_without_existing_tokio_runtime() {
         with_mem0_user_id_cleared(|| {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")
-            .expect("failed to bind Mem0 sync test listener");
-        listener
-            .set_nonblocking(true)
-            .expect("failed to set listener nonblocking");
-        let addr = listener.local_addr().expect("failed to read listener addr");
-        {
-            let mut override_url = MEM0_SYNC_URL_OVERRIDE
-                .lock()
-                .expect("mem0 sync url override mutex poisoned");
-            *override_url = Some(format!("http://{addr}/add"));
-        }
-
-        let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            loop {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let request = read_http_request(&mut stream);
-                        use std::io::Write;
-                        stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                            .expect("failed to write response");
-                        return Some(request);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if std::time::Instant::now() >= deadline {
-                            return None;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(e) => panic!("failed to accept request: {e}"),
-                }
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("failed to bind Mem0 sync test listener");
+            listener
+                .set_nonblocking(true)
+                .expect("failed to set listener nonblocking");
+            let addr = listener.local_addr().expect("failed to read listener addr");
+            {
+                let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                    .lock()
+                    .expect("mem0 sync url override mutex poisoned");
+                *override_url = Some(format!("http://{addr}/add"));
             }
-        });
 
-        let rule = Rule {
-            id: "rule_mem0_plain_thread".to_string(),
-            agent_name: "plain-agent".to_string(),
-            category: "lint_failure".to_string(),
-            rule_text: "No lint warnings".to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            trigger_count: 2,
-        };
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let request = read_http_request(&mut stream);
+                            use std::io::Write;
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .expect("failed to write response");
+                            return Some(request);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                return None;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => panic!("failed to accept request: {e}"),
+                    }
+                }
+            });
 
-        spawn_mem0_sync(&rule);
+            let rule = Rule {
+                id: "rule_mem0_plain_thread".to_string(),
+                agent_name: "plain-agent".to_string(),
+                category: "lint_failure".to_string(),
+                rule_text: "No lint warnings".to_string(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                trigger_count: 2,
+            };
 
-        let request = server
-            .join()
-            .expect("Mem0 sync test server panicked")
-            .expect("Mem0 sync should issue a request without an ambient Tokio runtime");
-        assert!(request.starts_with("POST /add HTTP/1.1"));
-        assert!(request.contains("\"user_id\":\"neo\""));
-        assert!(request.contains("Agent plain-agent"));
+            spawn_mem0_sync(&rule);
 
-        {
-            let mut override_url = MEM0_SYNC_URL_OVERRIDE
-                .lock()
-                .expect("mem0 sync url override mutex poisoned");
-            *override_url = None;
-        }
+            let request = server
+                .join()
+                .expect("Mem0 sync test server panicked")
+                .expect("Mem0 sync should issue a request without an ambient Tokio runtime");
+            assert!(request.starts_with("POST /add HTTP/1.1"));
+            assert!(request.contains("\"user_id\":\"neo\""));
+            assert!(request.contains("Agent plain-agent"));
+
+            {
+                let mut override_url = MEM0_SYNC_URL_OVERRIDE
+                    .lock()
+                    .expect("mem0 sync url override mutex poisoned");
+                *override_url = None;
+            }
         });
     }
 
@@ -1874,7 +1874,9 @@ mod tests {
         }
 
         solidify_rule(&home, agent, category, 3).expect("initial solidify should succeed");
-        let rule_path = home.join("rules").join(format!("rule_{agent}_{category}.json"));
+        let rule_path = home
+            .join("rules")
+            .join(format!("rule_{agent}_{category}.json"));
         let initial_rule: Rule =
             serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read rule"))
                 .expect("deserialize rule");
@@ -1905,12 +1907,15 @@ mod tests {
             unsafe {
                 std::env::set_var(
                     "AGEND_OBSIDIAN_VAULT",
-                    obsidian_vault.to_str().expect("invalid obsidian vault path"),
+                    obsidian_vault
+                        .to_str()
+                        .expect("invalid obsidian vault path"),
                 );
             }
 
             let worktree_dir = home.join("worktrees").join(agent).join("mock_worktree_1");
-            std::fs::create_dir_all(worktree_dir.join(".agents")).expect("failed to create agents dir");
+            std::fs::create_dir_all(worktree_dir.join(".agents"))
+                .expect("failed to create agents dir");
             let agents_md_path = worktree_dir.join(".agents").join("AGENTS.md");
             std::fs::write(
                 &agents_md_path,
@@ -1988,16 +1993,23 @@ mod tests {
                 .expect("initial Mem0 server panicked")
                 .expect("initial solidify should trigger Mem0 sync");
 
-            let rule_path = home.join("rules").join(format!("rule_{agent}_{category}.json"));
+            let rule_path = home
+                .join("rules")
+                .join(format!("rule_{agent}_{category}.json"));
             let initial_rule: Rule =
                 serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read rule"))
                     .expect("deserialize rule");
             let agents_md_after_initial =
                 std::fs::read_to_string(&agents_md_path).expect("read AGENTS.md after initial");
-            let obsidian_md_path = obsidian_vault.join("Rules").join(format!("{agent}_{category}.md"));
-            assert!(obsidian_md_path.exists(), "initial solidify should write Obsidian rule");
-            let obsidian_after_initial =
-                std::fs::read_to_string(&obsidian_md_path).expect("read Obsidian rule after initial");
+            let obsidian_md_path = obsidian_vault
+                .join("Rules")
+                .join(format!("{agent}_{category}.md"));
+            assert!(
+                obsidian_md_path.exists(),
+                "initial solidify should write Obsidian rule"
+            );
+            let obsidian_after_initial = std::fs::read_to_string(&obsidian_md_path)
+                .expect("read Obsidian rule after initial");
 
             let mem0_listener = std::net::TcpListener::bind("127.0.0.1:0")
                 .expect("failed to bind second Mem0 sync test listener");
@@ -2046,7 +2058,8 @@ mod tests {
                 agents_md_after_initial
             );
             assert_eq!(
-                std::fs::read_to_string(&obsidian_md_path).expect("read Obsidian rule after count-only"),
+                std::fs::read_to_string(&obsidian_md_path)
+                    .expect("read Obsidian rule after count-only"),
                 obsidian_after_initial
             );
 
@@ -2098,7 +2111,9 @@ mod tests {
         }
 
         solidify_rule(&home, agent, category, 3).expect("initial solidify should succeed");
-        let rule_path = home.join("rules").join(format!("rule_{agent}_{category}.json"));
+        let rule_path = home
+            .join("rules")
+            .join(format!("rule_{agent}_{category}.json"));
         let initial_rule: Rule =
             serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read rule"))
                 .expect("deserialize rule");
@@ -2119,17 +2134,17 @@ mod tests {
                 corrected_at: Some(chrono::Utc::now().to_rfc3339()),
             };
             std::fs::write(
-                mistakes_dir
-                    .join(format!("mock_mstk_extra_{idx}.json")),
+                mistakes_dir.join(format!("mock_mstk_extra_{idx}.json")),
                 serde_json::to_string(&mistake).expect("failed to serialize extra mock mistake"),
             )
             .expect("failed to write extra mock mistake");
         }
 
         solidify_rule(&home, agent, category, 6).expect("re-solidify should succeed");
-        let refreshed_rule: Rule =
-            serde_json::from_str(&std::fs::read_to_string(&rule_path).expect("read refreshed rule"))
-                .expect("deserialize refreshed rule");
+        let refreshed_rule: Rule = serde_json::from_str(
+            &std::fs::read_to_string(&rule_path).expect("read refreshed rule"),
+        )
+        .expect("deserialize refreshed rule");
 
         assert_eq!(refreshed_rule.trigger_count, 6);
         assert_eq!(refreshed_rule.created_at, initial_rule.created_at);
