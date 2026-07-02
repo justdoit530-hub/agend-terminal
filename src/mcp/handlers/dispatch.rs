@@ -365,11 +365,11 @@ pub(crate) fn rule_is_relevant(rule_text: &str, keywords: &[String]) -> bool {
 pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
     if ctx.args["action"].as_str() == Some("create") {
         let mut modified_args = ctx.args.clone();
+        let original_message = modified_args["description"].as_str().unwrap_or("").to_string();
         if let Some(agent_name) = modified_args["assignee"].as_str() {
             if !agent_name.is_empty() {
-                let original_message = modified_args["description"].as_str().unwrap_or("");
                 let mut sections = vec![original_message.to_string()];
-                let keywords = extract_keywords(original_message);
+                let keywords = extract_keywords(&original_message);
                 let rules: Vec<_> = crate::reflexion::list_rules(ctx.home, agent_name)
                     .into_iter()
                     .filter(|r| rule_is_relevant(&r.rule_text, &keywords))
@@ -401,7 +401,7 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
                     }
                 }
                 if semantic_search_enabled() {
-                    if let Some(mem0_context) = dispatch_mem0_context(original_message) {
+                    if let Some(mem0_context) = dispatch_mem0_context(&original_message) {
                         sections.push(mem0_context);
                     }
                 }
@@ -410,10 +410,190 @@ pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
                 }
             }
         }
-        task::handle_task(ctx.home, &modified_args, ctx.instance_name)
+        let result = task::handle_task(ctx.home, &modified_args, ctx.instance_name);
+        attach_decompose_fields(result, &original_message)
     } else {
         task::handle_task(ctx.home, ctx.args, ctx.instance_name)
     }
+}
+
+fn attach_decompose_fields(result: Value, original_message: &str) -> Value {
+    if result.get("error").is_some() {
+        return result;
+    }
+    let Some(subtasks) = maybe_decompose_task(original_message) else {
+        return result;
+    };
+    if subtasks.len() < 2 {
+        return result;
+    }
+    let mut obj = match result {
+        Value::Object(map) => map,
+        other => return other,
+    };
+    obj.insert("decomposed".to_string(), json!(true));
+    obj.insert("subtasks".to_string(), json!(subtasks));
+    Value::Object(obj)
+}
+
+const DECOMPOSE_MIN_DESCRIPTION_LEN: usize = 500;
+const DECOMPOSE_CONJUNCTION_MARKERS: &[&str] = &["and", "以及", "還要", "並且"];
+
+fn decompose_enabled() -> bool {
+    match std::env::var("DECOMPOSE_ENABLED") {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn should_attempt_decompose(description: &str) -> bool {
+    if description.chars().count() <= DECOMPOSE_MIN_DESCRIPTION_LEN {
+        return false;
+    }
+    let haystack = description.to_lowercase();
+    DECOMPOSE_CONJUNCTION_MARKERS
+        .iter()
+        .any(|marker| haystack.contains(marker))
+}
+
+fn maybe_decompose_task(description: &str) -> Option<Vec<String>> {
+    if !decompose_enabled() || !should_attempt_decompose(description) {
+        return None;
+    }
+    dispatch_decompose_task(description)
+}
+
+fn dispatch_decompose_task(description: &str) -> Option<Vec<String>> {
+    let description = description.to_string();
+    // fire-and-forget: not detached; joined below before returning to bound Ollama lookup lifetime.
+    let worker = match std::thread::Builder::new()
+        .name("agend-ollama-decompose".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to build Ollama decompose runtime");
+                    return None;
+                }
+            };
+            rt.block_on(decompose_task_with_ollama(&description))
+        }) {
+        Ok(worker) => worker,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to spawn Ollama decompose thread");
+            return None;
+        }
+    };
+    match worker.join() {
+        Ok(subtasks) => subtasks,
+        Err(_) => {
+            tracing::warn!("Ollama decompose thread panicked");
+            None
+        }
+    }
+}
+
+async fn decompose_task_with_ollama(description: &str) -> Option<Vec<String>> {
+    let base_url =
+        std::env::var("OLLAMA_HTTP_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let model = std::env::var("OLLAMA_DECOMPOSE_MODEL")
+        .unwrap_or_else(|_| "qwen2.5:7b".to_string());
+    let client = ollama_http_client()?;
+    decompose_task_with_client(client, &base_url, &model, description).await
+}
+
+async fn decompose_task_with_client(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    description: &str,
+) -> Option<Vec<String>> {
+    let prompt = format!(
+        "Analyze this task description and decide whether it contains 2 or more independent subtasks \
+         that could be dispatched separately.\n\n\
+         Task description:\n{description}\n\n\
+         If there are 2 or more independent subtasks, reply with ONLY a JSON array of strings — \
+         each string is one subtask description.\n\
+         If there are fewer than 2 independent subtasks, reply with ONLY an empty JSON array: []\n\n\
+         Reply with JSON only, no markdown."
+    );
+    let response = match client
+        .post(format!("{}/api/chat", base_url.trim_end_matches('/')))
+        .json(&json!({
+            "model": model,
+            "stream": false,
+            "messages": [{"role": "user", "content": prompt}],
+        }))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(error = %err, "Ollama decompose request failed");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        tracing::warn!(
+            status = %response.status(),
+            "Ollama decompose returned non-success status"
+        );
+        return None;
+    }
+    let body: Value = match response.json().await {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::warn!(error = %err, "Ollama decompose response was not valid JSON");
+            return None;
+        }
+    };
+    parse_decompose_subtasks(body["message"]["content"].as_str().unwrap_or(""))
+}
+
+fn parse_decompose_subtasks(raw: &str) -> Option<Vec<String>> {
+    let mut text = raw.trim();
+    if text.starts_with("```") {
+        text = text
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim();
+    }
+    let array = serde_json::from_str::<Vec<String>>(text).ok()?;
+    let subtasks: Vec<String> = array
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if subtasks.len() >= 2 {
+        Some(subtasks)
+    } else {
+        None
+    }
+}
+
+fn ollama_http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            match reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to build Ollama decompose HTTP client");
+                    None
+                }
+            }
+        })
+        .as_ref()
 }
 
 fn semantic_search_enabled() -> bool {
@@ -907,6 +1087,128 @@ mod tests {
         assert!(semantic_search_enabled());
 
         std::env::remove_var("SEMANTIC_SEARCH_ENABLED");
+    }
+
+    #[test]
+    fn decompose_enabled_defaults_false_and_accepts_true_values() {
+        std::env::remove_var("DECOMPOSE_ENABLED");
+        assert!(!decompose_enabled());
+
+        std::env::set_var("DECOMPOSE_ENABLED", "true");
+        assert!(decompose_enabled());
+
+        std::env::set_var("DECOMPOSE_ENABLED", "0");
+        assert!(!decompose_enabled());
+
+        std::env::remove_var("DECOMPOSE_ENABLED");
+    }
+
+    #[test]
+    fn should_attempt_decompose_requires_length_and_conjunction() {
+        let short = format!("{} and more", "a".repeat(100));
+        assert!(!should_attempt_decompose(&short));
+
+        let long_no_conj = "x".repeat(DECOMPOSE_MIN_DESCRIPTION_LEN + 1);
+        assert!(!should_attempt_decompose(&long_no_conj));
+
+        let long_with_conj = format!(
+            "{} and {}",
+            "x".repeat(DECOMPOSE_MIN_DESCRIPTION_LEN),
+            "implement module B"
+        );
+        assert!(should_attempt_decompose(&long_with_conj));
+
+        let long_with_cjk = format!("{} 以及 還要測試", "模".repeat(500));
+        assert!(should_attempt_decompose(&long_with_cjk));
+    }
+
+    #[test]
+    fn parse_decompose_subtasks_accepts_json_array() {
+        let parsed = parse_decompose_subtasks(r#"["subtask one", "subtask two"]"#)
+            .expect("two subtasks");
+        assert_eq!(parsed, vec!["subtask one", "subtask two"]);
+        assert!(parse_decompose_subtasks(r#"["only one"]"#).is_none());
+        assert!(parse_decompose_subtasks("not json").is_none());
+    }
+
+    #[test]
+    fn decompose_disabled_skips_ollama_call_and_leaves_result_unchanged() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let contacted = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        listener.set_nonblocking(true).expect("set nonblocking");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let contacted_flag = Arc::clone(&contacted);
+        let _server = thread::spawn(move || {
+            if listener.accept().is_ok() {
+                contacted_flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        std::env::remove_var("DECOMPOSE_ENABLED");
+        std::env::set_var("OLLAMA_HTTP_URL", &base_url);
+
+        let description = format!(
+            "{} and {}",
+            "implement module A ".repeat(40),
+            "以及 implement module B with tests"
+        );
+        assert!(should_attempt_decompose(&description));
+        assert!(maybe_decompose_task(&description).is_none());
+        assert!(
+            !contacted.load(Ordering::SeqCst),
+            "DECOMPOSE_ENABLED=false must not contact Ollama"
+        );
+
+        let result = attach_decompose_fields(
+            json!({"id": "t-test", "event": "created", "status": "created"}),
+            &description,
+        );
+        assert!(result.get("decomposed").is_none());
+        assert!(result.get("subtasks").is_none());
+
+        std::env::remove_var("OLLAMA_HTTP_URL");
+    }
+
+    #[test]
+    fn decompose_task_with_client_parses_subtasks_from_mock_ollama() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("server addr"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buf = [0; 8192];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"message":{"content":"[\"build API endpoint\", \"add integration tests\"]"}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).expect("write response");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let subtasks = rt
+            .block_on(decompose_task_with_client(
+                &client,
+                &base_url,
+                "qwen2.5:7b",
+                "long task and more",
+            ))
+            .expect("subtasks");
+
+        server.join().expect("server thread");
+        assert_eq!(subtasks.len(), 2);
+        assert_eq!(subtasks[0], "build API endpoint");
     }
 
     #[test]
