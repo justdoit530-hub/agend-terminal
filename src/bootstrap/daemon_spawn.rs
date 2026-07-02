@@ -128,6 +128,9 @@ pub struct SuccessorHandle {
     /// handle is dropped when the predecessor exits; `std::process::Child::drop`
     /// neither waits nor kills, so the promoted successor keeps running.
     pub child: std::process::Child,
+    /// Thread handle for copying successor's stderr to log file. Stored for
+    /// graceful join on Phase-1 abort.
+    pub stderr_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// #1814: spawn a successor daemon for self-respawn handoff. Like
@@ -150,7 +153,7 @@ pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<Succe
     cmd.env(crate::daemon::restart::SUCCESSOR_HANDOFF_ENV, handoff_value);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     #[cfg(unix)]
     {
@@ -164,17 +167,32 @@ pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<Succe
         cmd.creation_flags(0x00000008 | 0x00000200);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn successor daemon: {} start", exe.display()))?;
     let pid = child.id();
+    let run_dir = crate::daemon::run_dir_for_pid(home, pid);
+    std::fs::create_dir_all(&run_dir).ok();
+    let stderr_path = run_dir.join("successor.stderr");
+
+    let child_stderr = child.stderr.take();
+    let stderr_thread = child_stderr.map(|mut src| {
+        let stderr_path_clone = stderr_path.clone();
+        std::thread::spawn(move || {
+            if let Ok(mut dest) = std::fs::File::create(stderr_path_clone) {
+                let _ = std::io::copy(&mut src, &mut dest);
+            }
+        })
+    });
+
     // The child handle is RETAINED (not dropped) so the Phase-1 gate can
     // `try_wait()` it: fast crash detection + zombie reaping on abort. On the
     // commit path the predecessor's `exit(0)` drops it without killing — the
     // promoted successor lives on (std Child drop is a no-op on the process).
     Ok(SuccessorHandle {
         pid,
-        run_dir: crate::daemon::run_dir_for_pid(home, pid),
+        run_dir,
         child,
+        stderr_thread,
     })
 }
