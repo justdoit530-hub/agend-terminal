@@ -16,10 +16,6 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
     if let Some(err) = enforce_send_invariants(home, &args, sender) {
         return err;
     }
-    // Broadcast mode: targets/team/tags present
-    if args.get("instances").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
-        return handle_broadcast(home, &args, sender);
-    }
 
     fn lift_message(args: &mut Value, dst: &str) {
         if args.get(dst).is_none() {
@@ -28,6 +24,28 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
             }
         }
     }
+
+    // kind=task + multi-candidate broadcast fields → lowest-context idle worker.
+    if let (Some(s), Some(reg)) = (sender.as_ref(), crate::agent::get_pending_registry()) {
+        if let Some(target) =
+            super::dispatch::try_resolve_context_aware_task_target(home, &reg, &args, s.as_str())
+        {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("instance".into(), json!(target));
+                obj.remove("instances");
+                obj.remove("team");
+                obj.remove("tags");
+            }
+            lift_message(&mut args, "task");
+            return handle_delegate_task(home, &args, sender);
+        }
+    }
+
+    // Broadcast mode: targets/team/tags present
+    if args.get("instances").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
+        return handle_broadcast(home, &args, sender);
+    }
+
     match args["request_kind"].as_str().unwrap_or("") {
         "task" => {
             lift_message(&mut args, "task");
