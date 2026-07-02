@@ -144,6 +144,8 @@ fn handle_self_respawn(home: &Path) -> Value {
         // instead of bricking. Park BEFORE setting RESTART_PENDING (which arms
         // the shutdown bridge) so the handle is always available to the recheck.
         let succ_pid = succ.pid;
+        // Clean up successor stderr on Phase-1 success
+        let _ = std::fs::remove_file(succ.run_dir.join("successor.stderr"));
         crate::daemon::park_self_respawn_successor(succ.child);
         crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
         std::fs::write(home.join("restart-requested"), "").ok();
@@ -172,6 +174,25 @@ fn handle_self_respawn(home: &Path) -> Value {
         );
         crate::process::kill_process_tree(succ.pid);
         let _ = succ.child.wait(); // reap so we don't leave a zombie
+
+        // Join the stderr thread so the file is fully written and closed
+        if let Some(h) = succ.stderr_thread.take() {
+            let _ = h.join();
+        }
+
+        // Read and log successor stderr on Phase-1 failure
+        let stderr_path = succ.run_dir.join("successor.stderr");
+        if let Ok(content) = std::fs::read_to_string(&stderr_path) {
+            if !content.trim().is_empty() {
+                tracing::warn!(
+                    target: "handoff",
+                    successor_pid = succ.pid,
+                    stderr = %content.trim(),
+                    "successor startup stderr on Phase-1 failure"
+                );
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&succ.run_dir);
         json!({
             "ok": false,
@@ -470,5 +491,39 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&tmp);
             },
         );
+    }
+
+    #[test]
+    fn test_successor_stderr_captured_on_failure() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agend-restart-stderr-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&tmp).expect("create tempdir");
+
+        let handoff_value = "stale-pid-test";
+        let mut succ = crate::bootstrap::daemon_spawn::spawn_successor_handoff(&tmp, handoff_value)
+            .expect("spawn successor");
+
+        let gate_passed = phase1_gate(&mut succ);
+        assert!(!gate_passed, "successor must fail Phase-1 gate");
+
+        if let Some(h) = succ.stderr_thread.take() {
+            let _ = h.join();
+        }
+
+        let stderr_path = succ.run_dir.join("successor.stderr");
+        assert!(stderr_path.exists(), "successor.stderr must exist");
+        let content = std::fs::read_to_string(&stderr_path).expect("read stderr file");
+        assert!(
+            !content.trim().is_empty(),
+            "captured stderr content must not be empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
