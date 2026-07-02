@@ -28,7 +28,10 @@ use crate::keybinds::KeyHandler;
 use crate::layout::{Layout, Pane};
 use crate::notification_queue;
 use crate::render;
-use frame_timing::{trace_tty_size, should_draw, should_sync_notifications, BOOT_FRAME_TIME_CAP, FRAME_INTERVAL, MAX_BOOT_CATCHUP, NOTIF_SYNC_INTERVAL};
+use frame_timing::{
+    should_draw, should_sync_notifications, trace_tty_size, BOOT_FRAME_TIME_CAP, FRAME_INTERVAL,
+    MAX_BOOT_CATCHUP, NOTIF_SYNC_INTERVAL,
+};
 use overlay::{CloseTarget, Overlay, OverlayCtx};
 
 use anyhow::Result;

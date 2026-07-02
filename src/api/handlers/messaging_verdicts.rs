@@ -77,7 +77,11 @@ pub(crate) fn process_verdicts(home: &Path, from: &str, msg: &crate::inbox::Inbo
     }
 }
 
-pub(crate) fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &crate::inbox::InboxMessage) {
+pub(crate) fn bridge_verdict_to_review_task(
+    home: &Path,
+    reporter: &str,
+    msg: &crate::inbox::InboxMessage,
+) {
     use crate::mcp::handlers::comms_gates::{detect_verdict, Verdict};
     // Only ACTUAL verdict reports: a leading VERIFIED/REJECTED/UNVERIFIED token
     // (§3.12) AND a `reviewed_head` SHA (every reviewer verdict carries it, #1024).
@@ -105,4 +109,3 @@ pub(crate) fn bridge_verdict_to_review_task(home: &Path, reporter: &str, msg: &c
         );
     }
 }
-

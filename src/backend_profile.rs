@@ -484,6 +484,10 @@ fn grok_profile() -> BackendProfile {
     BackendProfile {
         patterns: vec![
             (
+                AgentState::UsageLimit,
+                r"(?i)reached your message limit|rate limit|usage limit|429",
+            ),
+            (
                 AgentState::AuthError,
                 r"(?i)not.authenticated|sign.in.to.grok|grok.login",
             ),
@@ -755,6 +759,55 @@ mod agy_apierror_2409 {
             patterns.detect(AGY_RETRY_PROSE_PANE),
             Some(AgentState::Idle),
             "#2409/PR2410: an agent's own 'try again in a minute' prose must NOT be misread as ApiError"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grok_usage_limit_tests {
+    use super::*;
+
+    #[test]
+    fn grok_message_limit_reached_detects_usage_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::GrokCli);
+        let pane = "You've reached your message limit. Please try again later.\n❯";
+        assert_eq!(
+            patterns.detect(pane),
+            Some(AgentState::UsageLimit),
+            "Grok message limit should classify as UsageLimit"
+        );
+    }
+
+    #[test]
+    fn grok_rate_limit_exceeded_detects_usage_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::GrokCli);
+        let pane = "Rate limit exceeded. Please wait.\n❯";
+        assert_eq!(
+            patterns.detect(pane),
+            Some(AgentState::UsageLimit),
+            "Grok rate limit should classify as UsageLimit"
+        );
+    }
+
+    #[test]
+    fn grok_usage_limit_detects_usage_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::GrokCli);
+        let pane = "Usage limit hit. Resets in 2 hours.\n❯";
+        assert_eq!(
+            patterns.detect(pane),
+            Some(AgentState::UsageLimit),
+            "Grok usage limit should classify as UsageLimit"
+        );
+    }
+
+    #[test]
+    fn grok_normal_idle_not_misread_as_usage_limit() {
+        let patterns = crate::state::StatePatterns::for_backend(&Backend::GrokCli);
+        let pane = "Grok Build\n❯";
+        assert_eq!(
+            patterns.detect(pane),
+            Some(AgentState::Idle),
+            "Ordinary Grok idle pane must not be misread as UsageLimit"
         );
     }
 }

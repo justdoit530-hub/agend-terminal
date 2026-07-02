@@ -426,7 +426,9 @@ pub fn sweep_stale_run_dirs(home: &Path) {
     }
 }
 
-pub(crate) use daemon_identity::{read_daemon_boot_unix, read_daemon_pid, read_daemon_start_token, write_daemon_id};
+pub(crate) use daemon_identity::{
+    read_daemon_boot_unix, read_daemon_pid, read_daemon_start_token, write_daemon_id,
+};
 
 /// Agent definition tuple for daemon startup.
 pub type AgentDef = (
