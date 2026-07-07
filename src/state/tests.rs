@@ -5765,3 +5765,196 @@ fn context_source_stays_pattern_while_context_provider_is_statusline() {
         "the new typed capability coexists with the unchanged context_source"
     );
 }
+
+// ── #1523 Phase 0 / #2366 Tier 3: turn-completion sentinel ───────────────────
+
+#[test]
+fn turn_sentinel_nonce_is_deterministic_and_eight_hex() {
+    let a = turn_sentinel_nonce("fixup-dev");
+    let b = turn_sentinel_nonce("fixup-dev");
+    assert_eq!(a, b, "nonce must be stable for the same agent (recomputable)");
+    assert_eq!(a.len(), 8, "nonce is fixed 8-char hex: {a}");
+    assert!(
+        a.chars().all(|c| c.is_ascii_hexdigit()),
+        "nonce must be hex: {a}"
+    );
+    assert_ne!(
+        turn_sentinel_nonce("fixup-dev"),
+        turn_sentinel_nonce("fixup-reviewer-2"),
+        "distinct agents should (overwhelmingly) get distinct nonces"
+    );
+}
+
+#[test]
+fn turn_sentinel_token_shape_is_single_source_and_safe() {
+    let token = turn_sentinel_token("fixup-dev");
+    assert!(
+        token.starts_with("@@AGD:") && token.ends_with("@@"),
+        "token uses @@AGD:…@@ delimiters (16 chars total): {token}"
+    );
+    assert_eq!(token.len(), 16, "SHORT token must be ≤20 chars: {token}");
+    assert!(
+        !token.contains('<') && !token.contains('>'),
+        "token must avoid mangle-prone <…> delimiters: {token}"
+    );
+    assert!(
+        token.contains(&turn_sentinel_nonce("fixup-dev")),
+        "token carries this agent's nonce: {token}"
+    );
+}
+
+#[test]
+fn observe_turn_sentinel_distinguishes_emit_echo_leak() {
+    let token = turn_sentinel_token("agent-x");
+
+    let emit = observe_turn_sentinel(&format!("did the work\n{token}\n"), &token);
+    assert!(emit.token_seen && emit.on_last_line);
+    assert!(!emit.suspected_echo, "clean last-line emit is not an echo");
+    assert!(!emit.leak_signal);
+
+    let echo = observe_turn_sentinel(
+        &format!("## Turn-completion signal (AgEnD)\nprint this exact marker\n    {token}\n"),
+        &token,
+    );
+    assert!(
+        echo.token_seen && echo.suspected_echo,
+        "directive prose → echo"
+    );
+
+    let leak = observe_turn_sentinel(&format!("file.txt:\n{token}\nmore text below\n"), &token);
+    assert!(leak.token_seen && !leak.on_last_line);
+    assert!(leak.suspected_echo, "non-last-line token is suspect");
+    assert!(leak.leak_signal, "embedded non-directive token flags leak");
+
+    let other = observe_turn_sentinel("@@AGD:deadbeef@@\n", &token);
+    assert!(!other.token_seen, "only OUR exact token counts");
+
+    let mid = token.len() / 2;
+    let wrapped = format!("output\n{}\n{}\n", &token[..mid], &token[mid..]);
+    assert!(
+        observe_turn_sentinel(&wrapped, &token).token_seen,
+        "de-wrapped scan must reassemble a hard-wrapped token"
+    );
+}
+
+#[test]
+fn turn_sentinel_capture_never_touches_state() {
+    let token = turn_sentinel_token("zb-agent");
+    let mut t = StateTracker::new(Some(&Backend::OpenCode));
+    t.set_instance_name("zb-agent");
+    t.current = AgentState::Active;
+    let screen = format!("done\n{token}");
+    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
+    t.capture_turn_sentinel_shadow(&screen, &tail);
+    assert_eq!(
+        t.current,
+        AgentState::Active,
+        "capture must never change the classified state"
+    );
+}
+
+static SENTINEL_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn turn_sentinel_shadow_logs_record_when_on_without_changing_state() {
+    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = std::env::temp_dir().join(format!("agend-sentinel-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mk temp home");
+    let prev_home = std::env::var("AGEND_HOME").ok();
+    let prev_flag = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", "1");
+
+    let token = turn_sentinel_token("on-agent");
+    let mut t = StateTracker::new(Some(&Backend::OpenCode));
+    t.set_instance_name("on-agent");
+    t.current = AgentState::Active;
+    t.feed(&format!("all done now\n{token}"));
+    t.current = AgentState::Active;
+    let screen = format!("again\n{token}");
+    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
+    t.capture_turn_sentinel_shadow(&screen, &tail);
+    let with_state = t.current;
+
+    let log = home.join("turn_sentinel_shadow.jsonl");
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+
+    match prev_home {
+        Some(v) => std::env::set_var("AGEND_HOME", v),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+    match prev_flag {
+        Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
+        None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
+    }
+    std::fs::remove_dir_all(&home).ok();
+
+    let line = contents
+        .lines()
+        .last()
+        .expect("a shadow record must be appended when the flag is on");
+    let rec: serde_json::Value = serde_json::from_str(line).expect("valid json record");
+    assert_eq!(rec["agent"], "on-agent");
+    assert_eq!(rec["token_seen"], true);
+    assert_eq!(rec["on_last_line"], true, "emission is on the last line");
+    assert_eq!(rec["suspected_echo"], false, "clean emit is not an echo");
+    assert_eq!(
+        with_state,
+        AgentState::Active,
+        "capture must not change classification even when shadow is on"
+    );
+}
+
+#[test]
+fn turn_sentinel_fires_for_prod_constructed_tracker_2297() {
+    let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+    let home = std::env::temp_dir().join(format!("agend-sentinel-prod-{}", std::process::id()));
+    std::fs::create_dir_all(&home).expect("mk temp home");
+    let prev_home = std::env::var("AGEND_HOME").ok();
+    let prev_flag = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
+    std::env::set_var("AGEND_HOME", &home);
+    std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", "1");
+
+    let token = turn_sentinel_token("prod-agent");
+    let mut t = StateTracker::for_agent(Some(&Backend::OpenCode), "prod-agent");
+    t.feed(&format!("finished\n{token}"));
+
+    let log = home.join("turn_sentinel_shadow.jsonl");
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+
+    match prev_home {
+        Some(v) => std::env::set_var("AGEND_HOME", v),
+        None => std::env::remove_var("AGEND_HOME"),
+    }
+    match prev_flag {
+        Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
+        None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
+    }
+    std::fs::remove_dir_all(&home).ok();
+
+    let line = contents.lines().last().expect(
+        "prod-constructed tracker must fire the shadow log — an empty instance_name would kill it",
+    );
+    let rec: serde_json::Value = serde_json::from_str(line).expect("valid json record");
+    assert_eq!(rec["agent"], "prod-agent");
+    assert_eq!(rec["token_seen"], true);
+}
+
+#[test]
+fn grok_primary_pending_sentinel_idle_is_consumed_once() {
+    let token = turn_sentinel_token("grok-dev");
+    let mut t = StateTracker::for_agent(Some(&Backend::GrokCli), "grok-dev");
+    let screen = format!("all done\n{token}");
+    let tail = recent_screen_tail(&screen, HARD_WRAP_TAIL_LINES);
+    t.handle_turn_sentinel(&screen, &tail);
+    assert!(
+        t.take_pending_sentinel_idle().is_some(),
+        "clean grok emit must arm pending sentinel idle"
+    );
+    assert!(
+        t.take_pending_sentinel_idle().is_none(),
+        "pending sentinel idle is consume-once"
+    );
+}

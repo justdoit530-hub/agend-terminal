@@ -134,6 +134,11 @@ pub(crate) fn build_instructions_body(
     // — the daemon-role sentence differs per mode; the delegation half adapts to
     // whether this backend has a subagent tool.
     progress_directive: Option<(i64, bool)>,
+    // #1523 Phase 0 (shadow) / #2366 Tier 3 (grok-primary): `Some(token)` injects
+    // the in-band turn-completion sentinel directive. The token is built by
+    // `crate::state::turn_sentinel_token` so directive and detector share ONE
+    // source of truth. `None` = absent → ZERO behaviour change.
+    turn_sentinel: Option<&str>,
 ) -> String {
     let mut content = String::new();
     content.push_str("# AgEnD — Multi-Agent Coordination\n\n");
@@ -425,6 +430,22 @@ pub(crate) fn build_instructions_body(
         }
     }
 
+    // #1523 Phase 0 / #2366 Tier 3: in-band turn-completion sentinel. Grok always
+    // (Tier-3 primary path); other backends only under `AGEND_TURN_SENTINEL_SHADOW=1`.
+    if let Some(token) = turn_sentinel {
+        content.push_str("\n## Turn-completion signal (AgEnD)\n\n");
+        content.push_str(&format!(
+            "When you have FULLY finished responding to the current request and are about to wait \
+             for new input, print this exact marker on its own line as the very last line of your \
+             reply:\n\n    {token}\n\n"
+        ));
+        content
+            .push_str("- Emit it once per completed turn, only in your normal terminal reply.\n");
+        content.push_str("- Do NOT write it into any file, code, commit message, or tool input — it is a terminal-output signal only, never persisted content.\n");
+        content.push_str("- If you are still working, mid-task, or about to take another action, do NOT emit it yet.\n");
+        content.push_str("- This marker only helps the daemon notice you are done; nothing you do depends on it, so never let it change how you work.\n");
+    }
+
     content
 }
 
@@ -518,7 +539,16 @@ fn generate_agent_instructions(working_dir: &Path, command: &str, ctx: Option<&A
         m @ (1 | 2) => Some((m, backend.supports_subagents())),
         _ => None,
     };
-    let body = build_instructions_body(ctx, Some(&proto_str), progress_directive);
+    let turn_token = ctx
+        .map(|c| c.name)
+        .filter(|_| crate::state::turn_sentinel_injection_enabled(&backend))
+        .map(crate::state::turn_sentinel_token);
+    let body = build_instructions_body(
+        ctx,
+        Some(&proto_str),
+        progress_directive,
+        turn_token.as_deref(),
+    );
 
     // Include fleet.yaml `instructions:` inside the managed block so
     // shared files (AGENTS.md) don't duplicate it on each refresh (#1405).
@@ -864,7 +894,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None, None);
+        let body = build_instructions_body(Some(&ctx), None, None, None);
         // After sanitisation the name contains only [A-Za-z0-9_-]. All of
         // `\n`, `#`, space, and ` got stripped, so neither the injected
         // header nor a broken backtick span can appear.
@@ -891,7 +921,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None, None);
+        let body = build_instructions_body(Some(&ctx), None, None, None);
         // Role value stays on one line — a newline would let attackers open
         // a new markdown block.
         let role_line = extract_role_line(&body).expect("role line present");
@@ -926,7 +956,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None, None);
+        let body = build_instructions_body(Some(&ctx), None, None, None);
         // Structural marker — a new `\n## ` section — must not appear from
         // the Fleet Peers block.
         assert!(
@@ -981,7 +1011,7 @@ mod tests {
             team: Some(&team),
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None, None);
+        let body = build_instructions_body(Some(&ctx), None, None, None);
 
         // Team section heading carries the team's name, not "Fleet Peers".
         assert!(
@@ -1043,7 +1073,7 @@ mod tests {
             team: Some(&team),
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None, None);
+        let body = build_instructions_body(Some(&ctx), None, None, None);
         assert!(
             body.contains("Orchestrator: `dev-lead`"),
             "non-orchestrator member must be pointed at the orchestrator: {body}"
@@ -1064,7 +1094,7 @@ mod tests {
             team: None,
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), None, None);
+        let body = build_instructions_body(Some(&ctx), None, None, None);
         assert!(
             body.contains("## Fleet Peers"),
             "no team means fall back to original Fleet Peers heading: {body}"
@@ -1090,7 +1120,7 @@ mod tests {
     #[test]
     fn progress_directive_off_by_default_absent() {
         // #2090: `None` (progress_mode 0, default) → NO behavioural directive.
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
         assert!(
             !body.contains("Long-Task Progress Reporting"),
             "progress directive must be ABSENT when off: {body}"
@@ -1104,7 +1134,7 @@ mod tests {
         // present regardless of mode (like `[AGEND-AUTO]`/`[AGEND-RESUME]`), so an
         // agent always understands the marker if the backstop ever injects it —
         // even when the proactive self-report directive is OFF.
-        let off = build_instructions_body(None, None, None);
+        let off = build_instructions_body(None, None, None, None);
         assert!(
             off.contains("## Daemon progress nudge (`[AGEND-PROGRESS]`)"),
             "marker vocabulary must be present even when progress reporting is off: {off}"
@@ -1123,7 +1153,7 @@ mod tests {
         // of mode (like `[AGEND-AUTO]`/`[AGEND-RESUME]`/`[AGEND-PROGRESS]`), so an
         // agent always understands the save-state directive when the context-handoff
         // watchdog injects it.
-        let off = build_instructions_body(None, None, None);
+        let off = build_instructions_body(None, None, None, None);
         assert!(
             off.contains("## Daemon handoff trigger (`[AGEND-HANDOFF]`)"),
             "handoff marker vocabulary must always be present: {off}"
@@ -1137,14 +1167,14 @@ mod tests {
     #[test]
     fn progress_directive_present_and_backend_aware_when_on() {
         // Report mode (2), subagent-capable backend → self-report + delegate.
-        let on_caps = build_instructions_body(None, None, Some((2, true)));
+        let on_caps = build_instructions_body(None, None, Some((2, true)), None);
         assert!(on_caps.contains("Long-Task Progress Reporting"));
         assert!(
             on_caps.contains("subagent / Task tool. For work"),
             "subagent-capable backend gets the delegate directive: {on_caps}"
         );
         // Report mode, NO subagent tool → the inline-updates fallback instead.
-        let on_nocaps = build_instructions_body(None, None, Some((2, false)));
+        let on_nocaps = build_instructions_body(None, None, Some((2, false)), None);
         assert!(on_nocaps.contains("Long-Task Progress Reporting"));
         assert!(
             on_nocaps.contains("does NOT provide a subagent"),
@@ -1162,7 +1192,7 @@ mod tests {
         // Mirror mode (1): the daemon auto-relays the agent's output → the
         // directive must say so AND carry the exfil warning, NOT the report-mode
         // "nudge-only / never relays" wording.
-        let mirror = build_instructions_body(None, None, Some((1, true)));
+        let mirror = build_instructions_body(None, None, Some((1, true)), None);
         assert!(mirror.contains("Long-Task Progress Reporting"));
         assert!(
             mirror.contains("auto-relays your clean assistant text"),
@@ -1180,7 +1210,7 @@ mod tests {
 
     #[test]
     fn instructions_include_protocol_path() {
-        let body = build_instructions_body(None, Some("/tmp/protocol/FLEET-DEV-PROTOCOL.md"), None);
+        let body = build_instructions_body(None, Some("/tmp/protocol/FLEET-DEV-PROTOCOL.md"), None, None);
         assert!(
             body.contains("/tmp/protocol/FLEET-DEV-PROTOCOL.md"),
             "instructions must include protocol path: {body}"
@@ -1192,10 +1222,100 @@ mod tests {
     }
 
     #[test]
+    fn turn_sentinel_directive_present_only_when_token_given_1523() {
+        let off = build_instructions_body(None, None, None, None);
+        assert!(
+            !off.contains("Turn-completion signal"),
+            "sentinel section must be absent when token is None: {off}"
+        );
+        assert!(
+            !off.contains("@@AGD:"),
+            "token must not leak into instructions when token is None: {off}"
+        );
+        let token = crate::state::turn_sentinel_token("dir-agent");
+        let on = build_instructions_body(None, None, None, Some(&token));
+        assert!(on.contains("## Turn-completion signal (AgEnD)"));
+        assert!(
+            on.contains(&token),
+            "directive must embed the exact per-agent token: {on}"
+        );
+        assert!(
+            !token.contains('<') && !token.contains('>'),
+            "token must avoid mangle-prone <…> delimiters: {token}"
+        );
+        assert!(
+            on.contains("never persisted content"),
+            "directive must warn against writing the token to files (leak surface): {on}"
+        );
+    }
+
+    static SENTINEL_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn turn_sentinel_injected_for_grok_always_and_claude_under_shadow_1523() {
+        let _g = SENTINEL_ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("AGEND_TURN_SENTINEL_SHADOW").ok();
+        let grok_ctx = AgentContext {
+            name: "grok-agent",
+            role: None,
+            fleet_peers: &[],
+            team: None,
+            extra_instructions: None,
+        };
+        let claude_ctx = AgentContext {
+            name: "claude-888b09",
+            role: None,
+            fleet_peers: &[],
+            team: None,
+            extra_instructions: None,
+        };
+
+        std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW");
+        let grok_dir = tmp_dir("sentinel_grok_primary");
+        generate_with_context(&grok_dir, "grok", Some(&grok_ctx));
+        let grok_on = std::fs::read_to_string(grok_dir.join("AGENTS.md")).unwrap();
+        assert!(
+            grok_on.contains("## Turn-completion signal (AgEnD)"),
+            "grok must always receive the sentinel directive (Tier 3): {grok_on}"
+        );
+        assert!(
+            grok_on.contains(&crate::state::turn_sentinel_token("grok-agent")),
+            "grok must receive its per-agent token without shadow flag"
+        );
+        std::fs::remove_dir_all(&grok_dir).ok();
+
+        let claude_off_dir = tmp_dir("sentinel_claude_off");
+        generate_with_context(&claude_off_dir, "claude", Some(&claude_ctx));
+        let claude_off =
+            std::fs::read_to_string(claude_off_dir.join(".claude").join("agend.md")).unwrap();
+        assert!(
+            !claude_off.contains("Turn-completion signal"),
+            "Claude must NOT receive the directive when shadow is off: {claude_off}"
+        );
+        std::fs::remove_dir_all(&claude_off_dir).ok();
+
+        std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", "1");
+        let claude_on_dir = tmp_dir("sentinel_claude_on");
+        generate_with_context(&claude_on_dir, "claude", Some(&claude_ctx));
+        let claude_on =
+            std::fs::read_to_string(claude_on_dir.join(".claude").join("agend.md")).unwrap();
+        assert!(
+            claude_on.contains("## Turn-completion signal (AgEnD)"),
+            "Claude must receive the sentinel directive under shadow: {claude_on}"
+        );
+        std::fs::remove_dir_all(&claude_on_dir).ok();
+
+        match prev {
+            Some(v) => std::env::set_var("AGEND_TURN_SENTINEL_SHADOW", v),
+            None => std::env::remove_var("AGEND_TURN_SENTINEL_SHADOW"),
+        }
+    }
+
+    #[test]
     fn test_instruction_includes_agend_msg_rule() {
         // build_instructions_body is shared by all 4 backends.
         // Verify the [AGEND-MSG] handling section is present.
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
         assert!(
             body.contains("[AGEND-MSG]"),
             "instructions must include [AGEND-MSG] header handling rule"
@@ -1219,7 +1339,7 @@ mod tests {
     fn test_instruction_includes_agend_auto_rule_1769() {
         // #1769: agents must be taught that an injected `[AGEND-AUTO]` line is a
         // daemon auto-nudge, NOT an operator command (the trust-model enforcement).
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
         assert!(
             body.contains("[AGEND-AUTO"),
             "instructions must include the [AGEND-AUTO] daemon-auto-inject rule"
@@ -1237,7 +1357,7 @@ mod tests {
         // rule). must-follow ①: it is recover-your-own-state, NOT operator
         // authority — and the test-pinned `[AGEND-AUTO]` blanket must stay intact
         // (the two markers coexist, neither weakened by a per-kind carve-out).
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
         assert!(
             body.contains("[AGEND-RESUME]"),
             "instructions must teach the [AGEND-RESUME] self-bootstrap trigger"
@@ -1364,7 +1484,7 @@ mod tests {
     fn test_instruction_trigger_matches_header_prefix() {
         // Regression: locks the contract between S3-T1 (format_header) and
         // S3-T2 (instruction wording). If either side drifts, this breaks.
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
 
         // S3-T1 header always starts with ANSI prefix + [AGEND-MSG]
         let sample_msg = crate::inbox::InboxMessage {
@@ -1403,7 +1523,7 @@ mod tests {
 
     #[test]
     fn kind_aware_reply_obligation_in_prompt() {
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
         assert!(
             body.contains("Reply obligation depends on"),
             "prompt must contain kind-aware reply guidance"
@@ -1420,7 +1540,7 @@ mod tests {
 
     #[test]
     fn react_tool_mentioned_in_prompt() {
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
         assert!(
             body.contains("do not reply"),
             "prompt must mention ack-without-reply guidance"
@@ -1429,7 +1549,7 @@ mod tests {
 
     #[test]
     fn busy_response_format_in_prompt() {
-        let body = build_instructions_body(None, None, None);
+        let body = build_instructions_body(None, None, None, None);
         assert!(
             body.contains("BUSY"),
             "prompt must contain BUSY response guidance"
@@ -1463,7 +1583,7 @@ mod tests {
             fleet_peers: &[],
             extra_instructions: None,
         };
-        let body = build_instructions_body(Some(&ctx), Some("/tmp/protocol.md"), None);
+        let body = build_instructions_body(Some(&ctx), Some("/tmp/protocol.md"), None, None);
         assert!(
             !body.contains("<fleet-update>"),
             "instructions must not contain <fleet-update> marker after Sprint 35 removal"

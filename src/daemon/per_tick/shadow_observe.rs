@@ -70,18 +70,45 @@ impl PerTickHandler for ShadowObserveHandler {
             // reduce (which takes the shadow buffer/runtime locks — DISJOINT from
             // core.lock, and no thread ever acquires core.lock while holding those, so
             // no ordering hazard), then write the result under a fresh brief lock.
-            let (raw_state, screen, live) = {
-                let c = core.lock();
+            let (raw_state, screen, live, sentinel_at, backend_name) = {
+                let mut c = core.lock();
                 let raw_state = c.state.get_state();
+                let sentinel_at = c.state.take_pending_sentinel_idle();
+                let backend_name = c.state.backend_name().to_string();
                 let live = Liveness {
                     api_in_flight: c.api_activity.in_flight,
                     productive_silent_ms: c.state.productive_silence().as_millis() as u64,
                     child_alive: *child_alive,
                     mcp_activity_at_ms: c.health.last_mcp_activity_at_epoch_ms,
                 };
-                (raw_state, gate::screen_signal(raw_state), live)
+                (
+                    raw_state,
+                    gate::screen_signal(raw_state),
+                    live,
+                    sentinel_at,
+                    backend_name,
+                )
             };
+            if let Some(at_ms) = sentinel_at {
+                shadow::push_sentinel_idle(name, at_ms);
+            }
             let status = shadow::observe(name, screen, &live, now_ms);
+            if let Some(at_ms) = sentinel_at {
+                if let Some(backend) = crate::backend::Backend::from_command(&backend_name) {
+                    crate::daemon::sentinel_verifier::record_disagreement(
+                        ctx.home,
+                        &crate::daemon::sentinel_verifier::DisagreementObs {
+                            agent: name,
+                            backend: backend.name(),
+                            sentinel_at_ms: at_ms,
+                            raw_state,
+                            screen,
+                            observed_state: status.state,
+                            observed_authority: status.authority,
+                        },
+                    );
+                }
+            }
             log_correction(name, raw_state, screen, &status, &live);
             // #2413 (A): publish the GATED badge override into the lock-free mirror the
             // render snapshot reads (Some ⇒ a high-confidence correction the badge shows;

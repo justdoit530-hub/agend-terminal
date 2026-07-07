@@ -9,7 +9,8 @@
 //! unit-tested in ONE place.
 //!
 //! [`gated_override`] fires ONLY for a HIGH-CONFIDENCE real-time observer correction, i.e.
-//! ALL of: (a) `authority ∈ {Hook, Stream}` — a live lifecycle / event-stream plane, not
+//! ALL of: (a) `authority ∈ {Hook, Stream, Sentinel}` — a live lifecycle / event-stream /
+//! turn-completion plane, not
 //! the `Screen` baseline and not a low-confidence `Inferred` reconcile; (b) `confidence ∈
 //! {Confirmed, Strong}` — freshness is already implied (the reducer only labels a fresh
 //! observer plane this high); (c) the raw screen is not a HARD gate screen — `Approval`
@@ -71,7 +72,7 @@ pub(crate) fn screen_as_observed(screen: ScreenSignal) -> Option<ObservedState> 
 
 /// Map a corrected [`ObservedState`] to the [`AgentState`] a consumer shows (reusing the
 /// existing `state_color` / `display_name` tables). `Idle` ⇒ `None`: a correction never
-/// flips TO idle (the only idle-direction correction is the excluded `Inferred` reconcile).
+/// flips TO idle (except the grok Sentinel plane — see [`gated_override`]).
 fn observed_to_agent_state(state: ObservedState) -> Option<AgentState> {
     Some(match state {
         ObservedState::ToolUse
@@ -108,10 +109,23 @@ pub(crate) fn gated_override(raw: AgentState, status: &ObservedStatus) -> Option
     if matches!(screen, ScreenSignal::RateLimited) && !matches!(raw, AgentState::ServerRateLimit) {
         return None;
     }
+    // #2366 Tier 3: grok sentinel-primary may declare Idle even when the screen
+    // heuristic still reads Working (scrape lag). The ONLY authority allowed to
+    // flip TO idle — Hook/Stream/Inferred reconcile stay excluded below.
+    if status.authority == Authority::Sentinel
+        && matches!(
+            status.confidence,
+            Confidence::Confirmed | Confidence::Strong
+        )
+        && status.state == ObservedState::Idle
+        && matches!(screen, ScreenSignal::Working)
+    {
+        return Some(AgentState::Idle);
+    }
     // (a) + (b) high-confidence real-time observer plane only.
     let high_confidence = matches!(
         status.authority,
-        Authority::Hook | Authority::Stream | Authority::Mcp
+        Authority::Hook | Authority::Stream | Authority::Mcp | Authority::Sentinel
     ) && matches!(
         status.confidence,
         Confidence::Confirmed | Confidence::Strong
@@ -148,6 +162,16 @@ mod tests {
         }
     }
 
+    /// #2366 Tier 3: grok sentinel-primary may flip TO Idle when scrape still reads Working.
+    #[test]
+    fn sentinel_flips_working_screen_to_idle() {
+        let s = status(ObservedState::Idle, Authority::Sentinel, Confidence::Strong);
+        assert_eq!(
+            gated_override(AgentState::Active, &s),
+            Some(AgentState::Idle)
+        );
+    }
+
     /// The headline win: raw screen reads Idle mid-request, but a fresh Hook (or Stream)
     /// episode proves Active ⇒ override to a working state.
     #[test]
@@ -163,6 +187,12 @@ mod tests {
             Authority::Stream,
             Confidence::Strong,
         );
+        assert_eq!(
+            gated_override(AgentState::Idle, &s),
+            Some(AgentState::Active)
+        );
+        // Sentinel plane (grok) parity for false-idle beat.
+        let s = status(ObservedState::Active, Authority::Sentinel, Confidence::Strong);
         assert_eq!(
             gated_override(AgentState::Idle, &s),
             Some(AgentState::Active)

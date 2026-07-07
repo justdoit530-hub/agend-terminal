@@ -207,8 +207,10 @@ impl AgentRuntime {
         // the prior Hook-only `last_hook_ms.max(at_ms)`; for a claude (Hook-only) agent this
         // is byte-identical (same max, authority always `Hook`). Screen/lsof/Inferred are not
         // observer planes and never advance the freshness clock.
-        if matches!(ev.authority, Authority::Hook | Authority::Stream)
-            && ev.at_ms >= self.last_observer_ms
+        if matches!(
+            ev.authority,
+            Authority::Hook | Authority::Stream | Authority::Sentinel
+        ) && ev.at_ms >= self.last_observer_ms
         {
             self.last_observer_ms = ev.at_ms;
             self.last_observer_authority = Some(ev.authority);
@@ -503,14 +505,19 @@ impl AgentRuntime {
                 Confidence::Probable,
             );
         }
-        // Genuinely idle. Authority is the screen unless a hook PromptReady/TurnEnded
-        // is what closed us — either way Idle is well-supported.
+        // Genuinely idle. When the observer plane is fresh (Hook/Stream/Sentinel),
+        // label with whichever plane produced the newest evidence.
         let conf = if observer_fresh {
             Confidence::Strong
         } else {
             Confidence::Weak
         };
-        (ObservedState::Idle, Authority::Screen, conf)
+        let auth = if observer_fresh {
+            self.last_observer_authority.unwrap_or(Authority::Screen)
+        } else {
+            Authority::Screen
+        };
+        (ObservedState::Idle, auth, conf)
     }
 
     /// The liveness backstop: an open episode/span should be force-closed to Idle when

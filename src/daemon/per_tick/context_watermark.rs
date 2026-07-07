@@ -73,7 +73,7 @@ mod tests {
             c.state.set_context_pct_for_test(85.0);
         }
 
-        registry.lock().insert(handle.id.clone(), handle);
+        registry.lock().insert(handle.id, handle);
 
         let handler = ContextWatermarkHandler::new(1);
         let ctx = TickContext {
