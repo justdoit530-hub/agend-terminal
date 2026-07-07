@@ -393,6 +393,70 @@ fn restart_spawn_params(
     spawn_params
 }
 
+/// Grace ceiling for [`await_unsent_draft_or_grace`]: even while the operator
+/// keeps typing, force the restart after this long so a context-full / stuck
+/// agent can't be deferred indefinitely. The primary release is the operator
+/// submitting (draft clears well before this); the ceiling only bounds the
+/// pathological continuous-typing case. Tunable.
+const RESTART_DRAFT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Re-check cadence while deferring — silent (no per-poll event / nudge).
+const RESTART_DRAFT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+#[derive(Debug, PartialEq, Eq)]
+enum DraftGate {
+    Proceed,
+    Defer,
+}
+
+/// Pure restart-gate decision (unit-tested exhaustively): proceed with the kill
+/// iff `force`, there is no live operator draft, or the grace ceiling has
+/// elapsed; otherwise keep deferring. Kept pure (no clock / no IO) so the whole
+/// decision matrix is deterministic without real sleeps.
+fn restart_draft_gate(
+    force: bool,
+    has_live_draft: bool,
+    elapsed: std::time::Duration,
+    grace: std::time::Duration,
+) -> DraftGate {
+    if force || !has_live_draft || elapsed >= grace {
+        DraftGate::Proceed
+    } else {
+        DraftGate::Defer
+    }
+}
+
+/// Block the restart while the operator has unsent keystrokes in `name`'s input
+/// line, releasing the instant the draft is submitted/cleared or after
+/// [`RESTART_DRAFT_GRACE`]. Emits exactly two log lines (defer-start, proceed) —
+/// no per-poll noise. Thread-safety rationale is at the call site.
+fn await_unsent_draft_or_grace(home: &Path, name: &str, force: bool) {
+    if restart_draft_gate(
+        force,
+        crate::inbox::notify::operator_has_live_draft(home, name),
+        std::time::Duration::ZERO,
+        RESTART_DRAFT_GRACE,
+    ) == DraftGate::Proceed
+    {
+        return; // fast path: force, or no live draft — no wait, no log.
+    }
+    tracing::info!(%name, "restart deferred: operator has an unsent draft in the input line");
+    let start = std::time::Instant::now();
+    while restart_draft_gate(
+        force,
+        crate::inbox::notify::operator_has_live_draft(home, name),
+        start.elapsed(),
+        RESTART_DRAFT_GRACE,
+    ) == DraftGate::Defer
+    {
+        std::thread::sleep(RESTART_DRAFT_POLL);
+    }
+    tracing::info!(
+        %name,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "restart proceeding: draft submitted/cleared or grace ceiling reached"
+    );
+}
+
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
@@ -438,6 +502,16 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         Some(r) => r,
         None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
     };
+
+    // t-95913-5: the operator's unsent keystrokes live ONLY in the input line of
+    // the process we're about to kill — a fresh OR resume restart destroys them
+    // (`--continue` restores the conversation, not the input line). If the pane
+    // has a live draft, defer the kill until the operator submits (draft clears)
+    // or a grace ceiling elapses (so continuous typing can't defer forever).
+    // Mode-agnostic; `force:true` bypasses. Safe to block here: each api tool call
+    // runs on its own `api_handler` thread (`api::serve` per-session spawn), and
+    // the operator's submit arrives via the TUI write path, not this thread.
+    await_unsent_draft_or_grace(home, name, args["force"].as_bool().unwrap_or(false));
 
     // Session-reset inbox settle: for a FRESH restart (context-lost), settle
     // all DELIVERING rows to PROCESSED before killing the old instance.
@@ -666,5 +740,98 @@ mod tests {
         // which also maps to SpawnMode::Fresh) carries no flag → reads false.
         let initial = json!({"name": "dev", "backend": "claude", "layout": "tab"});
         assert!(!initial["self_kick_on_ready"].as_bool().unwrap_or(false));
+    }
+
+    // ── t-95913-5: defer fresh/resume restart while the operator has an unsent
+    // draft in the target pane's input line. The pure `restart_draft_gate` covers
+    // the whole decision matrix deterministically (no clock, no sleep). ──
+
+    #[test]
+    fn restart_draft_gate_proceeds_when_no_live_draft() {
+        // No unsent draft → kill immediately (gate is a no-op), any elapsed.
+        assert_eq!(
+            restart_draft_gate(false, false, std::time::Duration::ZERO, RESTART_DRAFT_GRACE),
+            DraftGate::Proceed
+        );
+    }
+
+    #[test]
+    fn restart_draft_gate_defers_live_draft_within_grace() {
+        // Live draft, still inside the grace window → defer the kill.
+        assert_eq!(
+            restart_draft_gate(
+                false,
+                true,
+                std::time::Duration::from_secs(10),
+                RESTART_DRAFT_GRACE
+            ),
+            DraftGate::Defer
+        );
+    }
+
+    #[test]
+    fn restart_draft_gate_proceeds_when_grace_ceiling_reached() {
+        // Live draft but grace elapsed → force the kill so continuous typing can't
+        // defer forever. Boundary: elapsed == grace proceeds.
+        assert_eq!(
+            restart_draft_gate(false, true, RESTART_DRAFT_GRACE, RESTART_DRAFT_GRACE),
+            DraftGate::Proceed
+        );
+        assert_eq!(
+            restart_draft_gate(
+                false,
+                true,
+                std::time::Duration::from_secs(61),
+                RESTART_DRAFT_GRACE
+            ),
+            DraftGate::Proceed
+        );
+    }
+
+    #[test]
+    fn restart_draft_gate_force_bypasses_live_draft() {
+        // force:true → kill immediately even with a live draft inside the window.
+        assert_eq!(
+            restart_draft_gate(true, true, std::time::Duration::ZERO, RESTART_DRAFT_GRACE),
+            DraftGate::Proceed
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn operator_has_live_draft_reflects_unsent_keystrokes() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-live-draft-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        // No metadata → no draft.
+        assert!(!crate::inbox::notify::operator_has_live_draft(&home, "a"));
+        // A keystroke with no following submit → a live unsent draft.
+        crate::notification_queue::record_input_activity(&home, "a");
+        assert!(crate::inbox::notify::operator_has_live_draft(&home, "a"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
+        // No draft → the fast path returns immediately (no block). A regression that
+        // dropped the no-draft check would hang this test to the nextest timeout.
+        let home = std::env::temp_dir().join(format!(
+            "agend-await-nodraft-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        await_unsent_draft_or_grace(&home, "a", false);
+        std::fs::remove_dir_all(&home).ok();
     }
 }
