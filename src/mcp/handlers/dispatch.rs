@@ -786,6 +786,12 @@ pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
         // #2299 explicit ack (C): confirm the agent HANDLED what it drained →
         // delivering → processed, so the reclaim-TTL won't re-deliver it.
         comms::handle_inbox_ack(ctx.home, ctx.args, ctx.instance_name)
+    } else if action == Some("discharge") {
+        // #2622: the deliberate exit for a channel-reply obligation that will
+        // not be (or no longer needs to be) answered — durably suppresses
+        // re-arm, stops the ladder, LOUDLY notifies the operator. Sibling of
+        // `ack`/`clear` (all obligation-settling ops on inbox messages).
+        channel::handle_discharge(ctx.home, ctx.args, ctx.instance_name)
     } else if action == Some("clear") {
         // #inbox-gc part a: quiet compact-clear (explicit action — never the
         // no-arg drain). Obligations stay unread; returns bounded summaries.

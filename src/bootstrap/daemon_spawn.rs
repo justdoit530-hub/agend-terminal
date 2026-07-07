@@ -178,6 +178,7 @@ pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<Succe
     let child_stderr = child.stderr.take();
     let stderr_thread = child_stderr.map(|mut src| {
         let stderr_path_clone = stderr_path.clone();
+        // fire-and-forget: copies stderr to successor.stderr until the child exit closes the pipe
         std::thread::spawn(move || {
             if let Ok(mut dest) = std::fs::File::create(stderr_path_clone) {
                 let _ = std::io::copy(&mut src, &mut dest);

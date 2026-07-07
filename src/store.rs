@@ -196,6 +196,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Durability helper: fsync the parent directory so the new directory entry
+/// reaches disk. unix-only; no-op on other platforms.
+pub fn fsync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
+    }
+}
+
 /// Serialize `data` as pretty JSON and [`atomic_write`] it to `path`.
 pub fn save_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     let body = serde_json::to_string_pretty(data)?;

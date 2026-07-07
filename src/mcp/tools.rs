@@ -29,6 +29,7 @@ pub(crate) fn def_reply() -> Value {
             "message": {"type": "string", "description": "The reply text to send to the user."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
             "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."},
+            "message_id": {"type": "string", "description": "#2622 PR-3: target an original inbox message by id. When set, routes by THAT message's own channel (instead of the process-global reply_to_channel prefer-chain) and, on send success, settles that row so it stops redelivering. Omit for the default prefer-chain behavior."},
             "buttons": {
                 "type": "array",
                 "description": "Optional inline keyboard buttons (2D array: rows of buttons). Supported on channels with buttons capability.",
@@ -87,10 +88,11 @@ pub(crate) fn def_send() -> Value {
 }
 
 pub(crate) fn def_inbox() -> Value {
-    json!({"name": "inbox", "description": "Check pending messages, OR look up a single message by ID, OR fetch a thread's messages, OR quietly clear a backlog, OR confirm messages processed. No params = drain pending (returns messages, now marked `delivering`). With message_id = describe message status (read/unread/expired/notfound). With thread_id = fetch all messages in thread ordered by timestamp. With action=\"clear\" = quiet compact-clear: marks non-obligation messages read and returns a BOUNDED summary {cleared_count, kept_unread_count, summaries[], requires_response[]} — unanswered queries + unsettled tasks stay UNREAD and surface in requires_response (never silently swallowed). Use clear (not drain) to dismiss a large stale backlog without flooding your context. With action=\"ack\" (#2299) = confirm you have HANDLED what you drained: transitions delivering→processed so the reclaim-TTL never re-delivers it. Pass message_id to ack one message, or omit it to ack your whole in-flight batch. Acking is best-effort: a re-drain implicitly acks the prior batch and a 10-min reclaim-TTL re-delivers anything left unconfirmed — but acking promptly avoids a redundant re-delivery if your turn is interrupted.",
+    json!({"name": "inbox", "description": "Check pending messages, OR look up a single message by ID, OR fetch a thread's messages, OR quietly clear a backlog, OR confirm messages processed. No params = drain pending (returns messages, now marked `delivering`). With message_id = describe message status (read/unread/expired/notfound). With thread_id = fetch all messages in thread ordered by timestamp. With action=\"clear\" = quiet compact-clear: marks non-obligation messages read and returns a BOUNDED summary {cleared_count, kept_unread_count, summaries[], requires_response[]} — unanswered queries + unsettled tasks stay UNREAD and surface in requires_response (never silently swallowed). Use clear (not drain) to dismiss a large stale backlog without flooding your context. With action=\"ack\" (#2299) = confirm you have HANDLED what you drained: transitions delivering→processed so the reclaim-TTL never re-delivers it. Pass message_id to ack one message, or omit it to ack your whole in-flight batch. Acking is best-effort: a re-drain implicitly acks the prior batch and a 10-min reclaim-TTL re-delivers anything left unconfirmed — but acking promptly avoids a redundant re-delivery if your turn is interrupted. With action=\"discharge\" (#2622) = close a CHANNEL-reply obligation you will NOT (or no longer need to) answer on its channel — e.g. a stale user/operator message you handled another way or that's no longer relevant. Requires `message_id` AND a non-empty `reason`. This durably stops the `channel-reply-missing` re-nudge for that message (across redelivery + daemon restart) AND notifies the operator that you closed it reply-less with your reason (audited — it is NOT a silent way to drop an obligation). Use `reply` if you actually want to answer; use `discharge` only when no channel reply is owed.",
     "inputSchema": {"type": "object", "properties": {
-        "action": {"type": "string", "enum": ["clear", "ack"], "description": "\"clear\" = quiet compact-clear (obligations kept unread). \"ack\" = confirm delivering→processed (#2299; message_id targets one, omit to ack the whole drained batch). Omit for normal drain."},
-        "message_id": {"type": "string", "description": "Look up message status by ID (describe), or with action=\"ack\" the message to confirm processed"},
+        "action": {"type": "string", "enum": ["clear", "ack", "discharge"], "description": "\"clear\" = quiet compact-clear (obligations kept unread). \"ack\" = confirm delivering→processed (#2299; message_id targets one, omit to ack the whole drained batch). \"discharge\" (#2622) = close a channel-reply obligation reply-less (requires message_id + reason; operator is notified). Omit for normal drain."},
+        "message_id": {"type": "string", "description": "Look up message status by ID (describe), or with action=\"ack\" the message to confirm processed, or with action=\"discharge\" the channel message whose reply-obligation to close."},
+        "reason": {"type": "string", "description": "Required for action=\"discharge\": WHY no channel reply is owed (recorded + surfaced to the operator). Self-discharge is audited, never silent."},
         "thread_id": {"type": "string", "description": "Fetch all messages in a thread"},
         "instance": {"type": "string", "description": "For message_id: target instance (defaults to caller). For thread_id: filter to a specific instance's inbox (optional, scans all if omitted)"}
     }}})
@@ -1234,5 +1236,33 @@ mod tests {
                  stale entry."
             );
         }
+    }
+
+    #[test]
+    fn reply_has_message_id_param_2622() {
+        // #2622 PR-3 reviewer5 r0: handle_reply reads args["message_id"] and
+        // implements the targeted-channel-routing path, but the schema never
+        // declared it — an MCP client validating against the advertised
+        // inputSchema has no way to pass `message_id`, so the capability is
+        // unreachable exactly like #2539's repo force/force_reason gap above.
+        let defs = tool_definitions();
+        let tools = defs["tools"].as_array().expect("tools array");
+        let reply = tools
+            .iter()
+            .find(|t| t["name"] == "reply")
+            .expect("reply tool not found");
+        let props = &reply["inputSchema"]["properties"];
+        assert!(
+            props["message_id"].is_object(),
+            "reply tool must declare 'message_id' so MCP clients can target an original message"
+        );
+        let required_strs: Vec<&str> = reply["inputSchema"]["required"]
+            .as_array()
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !required_strs.contains(&"message_id"),
+            "message_id must stay optional (backward-compat: omitting it is byte-identical)"
+        );
     }
 }
