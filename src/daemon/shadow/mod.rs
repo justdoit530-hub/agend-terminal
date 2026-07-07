@@ -189,6 +189,16 @@ pub fn push(agent: &str, ev: Evidence) {
     q.push_back(ev);
 }
 
+/// #2366 Tier 3: push a turn-completion sentinel idle signal for `agent`.
+/// Called by `shadow_observe` after consuming `StateTracker::take_pending_sentinel_idle`.
+pub fn push_sentinel_idle(agent: &str, at_ms: u64) {
+    use evidence::{Evidence, EvidenceKind};
+    push(
+        agent,
+        Evidence::sentinel(EvidenceKind::PromptReady, at_ms),
+    );
+}
+
 /// Drain (remove + return, oldest-first) all evidence for `agent` — the reducer's
 /// consume path (Phase B). Consumed by [`observe`] (the per-tick driver folds the
 /// drained evidence into the agent's persistent reducer runtime).

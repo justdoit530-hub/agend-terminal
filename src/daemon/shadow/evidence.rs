@@ -76,6 +76,8 @@ pub enum Authority {
     Screen,
     /// Process-tree liveness (pgrep / proc children).
     ProcessHeuristic,
+    /// #2366 Tier 3: in-band turn-completion sentinel (grok-primary).
+    Sentinel,
     /// Derived by the reducer from other evidence (e.g. Thinking).
     Inferred,
     Mcp,
@@ -120,6 +122,19 @@ impl Evidence {
         Self {
             kind,
             authority: Authority::Stream,
+            confidence: Confidence::Strong,
+            at_ms,
+            ttl_ms: 0,
+        }
+    }
+
+    /// A `Sentinel`-authority, `Strong` observation from the grok turn-completion
+    /// marker plane (#2366 Tier 3). One notch below `Hook`/`Confirmed` — the token
+    /// is agent-emitted in-band text, not a synchronous lifecycle callback.
+    pub fn sentinel(kind: EvidenceKind, at_ms: u64) -> Self {
+        Self {
+            kind,
+            authority: Authority::Sentinel,
             confidence: Confidence::Strong,
             at_ms,
             ttl_ms: 0,

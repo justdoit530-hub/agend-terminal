@@ -443,6 +443,13 @@ pub struct StateTracker {
     /// SRL incident on the same line after recovery re-logs once; the `#1809`
     /// cross-cycle→Idle behavioral fix stays OUTSIDE this dedup.
     last_srl_phantom_warn_sig: Option<(u64, bool)>,
+    /// #1523 Phase 0 (shadow): fire-once latch for turn-completion sentinel
+    /// telemetry — hash of the last side-logged observation so a static token
+    /// frame is not re-logged every feed.
+    last_turn_sentinel_sig: Option<u64>,
+    /// #2366 Tier 3 (grok-primary): epoch-ms of a clean sentinel turn-end emit
+    /// detected this feed, consumed by `shadow_observe` to push Sentinel evidence.
+    pending_sentinel_idle_ms: Option<u64>,
 }
 
 /// #1527: one recorded `current` transition, captured at the mutation site so
@@ -602,6 +609,86 @@ fn hash_screen(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+/// #1523 Phase 0: is the turn-completion sentinel shadow enabled? Default-OFF.
+pub(crate) fn turn_sentinel_shadow_enabled() -> bool {
+    std::env::var("AGEND_TURN_SENTINEL_SHADOW")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// #2366 Tier 3: grok sentinel-primary promotion. Default-ON for grok (the only
+/// Tier-3 path for a hook-less backend); explicit `AGEND_TURN_SENTINEL_PRIMARY=0`
+/// disables promotion while keeping measure-only shadow available.
+pub(crate) fn turn_sentinel_primary_enabled(backend: &crate::backend::Backend) -> bool {
+    matches!(backend, crate::backend::Backend::GrokCli)
+        && std::env::var("AGEND_TURN_SENTINEL_PRIMARY").as_deref() != Ok("0")
+}
+
+/// Should the turn-completion directive be injected at spawn? Grok always (Tier 3
+/// path); other backends only under the Phase-0 shadow soak flag.
+pub(crate) fn turn_sentinel_injection_enabled(backend: &crate::backend::Backend) -> bool {
+    matches!(backend, crate::backend::Backend::GrokCli)
+        || turn_sentinel_shadow_enabled()
+}
+
+/// Per-agent sentinel nonce — deterministic from the agent name so the instruction
+/// writer and detector compute the SAME token with no persisted state.
+pub(crate) fn turn_sentinel_nonce(name: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() & 0xffff_ffff)
+}
+
+/// Short fixed prefix for the fast-path `contains` check (≤20-char total token).
+const TURN_SENTINEL_PREFIX: &str = "@@AGD:";
+const TURN_SENTINEL_SUFFIX: &str = "@@";
+
+/// The exact in-band turn-completion token (16 chars: `@@AGD:{8hex}@@`).
+pub(crate) fn turn_sentinel_token(name: &str) -> String {
+    format!(
+        "{TURN_SENTINEL_PREFIX}{}{TURN_SENTINEL_SUFFIX}",
+        turn_sentinel_nonce(name)
+    )
+}
+
+/// Pure classification of a screen tail against an agent's turn-completion token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnSentinelObs {
+    token_seen: bool,
+    on_last_line: bool,
+    suspected_echo: bool,
+    leak_signal: bool,
+}
+
+fn observe_turn_sentinel(tail: &str, token: &str) -> TurnSentinelObs {
+    let dewrapped: String = tail.chars().filter(|c| *c != '\n').collect();
+    let token_seen = tail.contains(token) || dewrapped.contains(token);
+    if !token_seen {
+        return TurnSentinelObs {
+            token_seen: false,
+            on_last_line: false,
+            suspected_echo: false,
+            leak_signal: false,
+        };
+    }
+    let on_last_line = tail
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.contains(token));
+    let directive_echo = tail.contains("Turn-completion signal")
+        || tail.contains("never persisted content")
+        || tail.contains("print this exact marker");
+    let suspected_echo = directive_echo || !on_last_line;
+    let leak_signal = !on_last_line && !directive_echo;
+    TurnSentinelObs {
+        token_seen,
+        on_last_line,
+        suspected_echo,
+        leak_signal,
+    }
 }
 
 /// #1955: the (bottom-most) screen line containing `matched` — the UsageLimit
@@ -1091,6 +1178,8 @@ impl StateTracker {
             non_srl_since_last_srl: false,
             last_srl_keep_latched_sig: None,
             last_srl_phantom_warn_sig: None,
+            last_turn_sentinel_sig: None,
+            pending_sentinel_idle_ms: None,
         }
     }
 
@@ -1111,6 +1200,11 @@ impl StateTracker {
     /// (re)name an already-built tracker.
     pub fn set_instance_name(&mut self, name: &str) {
         self.instance_name = name.to_string();
+    }
+
+    /// Backend name string (`Backend::name()`) for telemetry / plane gating.
+    pub(crate) fn backend_name(&self) -> &str {
+        &self.backend_name
     }
 
     /// Returns true if behavioral config is populated (managed backends).
@@ -1494,9 +1588,113 @@ impl StateTracker {
             }
         }
 
-        // F9 (#685 sub-task 4): productive-output detection (zero behavior).
+        // Post-classify instrumentation (zero behavior): turn-completion sentinel
+        // shadow telemetry + grok-primary pending evidence for shadow_observe.
         let recent_tail = recent_screen_tail(screen_text, HARD_WRAP_TAIL_LINES);
+        self.handle_turn_sentinel(screen_text, &recent_tail);
+
+        // F9 (#685 sub-task 4): productive-output detection (zero behavior).
         self.detect_productive_output(&recent_tail);
+    }
+
+    /// #1523 Phase 0 + #2366 Tier 3: turn-completion sentinel handling.
+    ///
+    /// Always runs the measure-only shadow capture when the shadow flag is on.
+    /// When grok sentinel-primary is enabled, a clean last-line token emit
+    /// stashes `pending_sentinel_idle_ms` for `shadow_observe` to push Sentinel
+    /// evidence (avoids a state→daemon dependency cycle).
+    fn handle_turn_sentinel(&mut self, screen_text: &str, tail: &str) {
+        self.capture_turn_sentinel_shadow(screen_text, tail);
+        self.arm_sentinel_primary_idle(screen_text, tail);
+    }
+
+    /// Consume a grok-primary sentinel idle signal detected this feed cycle.
+    pub(crate) fn take_pending_sentinel_idle(&mut self) -> Option<u64> {
+        self.pending_sentinel_idle_ms.take()
+    }
+
+    /// #2366 Tier 3: stash epoch-ms when this agent's turn-completion token
+    /// appears as a clean last-line emit. Consumed by `shadow_observe`.
+    fn arm_sentinel_primary_idle(&mut self, screen_text: &str, tail: &str) {
+        self.pending_sentinel_idle_ms = None;
+        if self.instance_name.is_empty() {
+            return;
+        }
+        let Some(backend) = crate::backend::Backend::from_command(&self.backend_name) else {
+            return;
+        };
+        if !turn_sentinel_primary_enabled(&backend) {
+            return;
+        }
+        if !screen_text.contains(TURN_SENTINEL_PREFIX) {
+            return;
+        }
+        let token = turn_sentinel_token(&self.instance_name);
+        let obs = observe_turn_sentinel(tail, &token);
+        if !obs.token_seen
+            || !obs.on_last_line
+            || obs.suspected_echo
+            || obs.leak_signal
+        {
+            return;
+        }
+        self.pending_sentinel_idle_ms =
+            Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
+    }
+
+    /// #1523 Phase 0: turn-completion sentinel shadow telemetry.
+    ///
+    /// When `AGEND_TURN_SENTINEL_SHADOW=1`, agents with the directive are
+    /// instructed to print `@@AGD:{nonce}@@` as the final line when a turn
+    /// finishes (see [`turn_sentinel_token`]). This side-logs whether THIS
+    /// agent's token is on screen alongside the heuristic classification, so
+    /// emit-rate / false-emit (instruction-echo / source-view) / leak can be
+    /// measured before any production reliance. The daemon takes NO action on the
+    /// signal in Phase 0 — this only ever ADDS corroboration, never subtracts.
+    fn capture_turn_sentinel_shadow(&mut self, screen_text: &str, tail: &str) {
+        if !turn_sentinel_shadow_enabled() || self.instance_name.is_empty() {
+            return;
+        }
+        if !screen_text.contains(TURN_SENTINEL_PREFIX) {
+            self.last_turn_sentinel_sig = None;
+            return;
+        }
+        let token = turn_sentinel_token(&self.instance_name);
+        let obs = observe_turn_sentinel(tail, &token);
+        if !obs.token_seen {
+            self.last_turn_sentinel_sig = None;
+            return;
+        }
+        let consistent = matches!(self.current, AgentState::Idle);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        tail.hash(&mut h);
+        obs.on_last_line.hash(&mut h);
+        obs.suspected_echo.hash(&mut h);
+        let sig = h.finish();
+        if self.last_turn_sentinel_sig == Some(sig) {
+            return;
+        }
+        self.last_turn_sentinel_sig = Some(sig);
+        let record = serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "backend": self.backend_name,
+            "agent": self.instance_name,
+            "token_seen": obs.token_seen,
+            "on_last_line": obs.on_last_line,
+            "existing_state": self.current.display_name(),
+            "consistent": consistent,
+            "suspected_echo": obs.suspected_echo,
+            "leak_signal": obs.leak_signal,
+        });
+        let path = crate::home_dir().join("turn_sentinel_shadow.jsonl");
+        if let Err(e) = append_jsonl(&path, &record) {
+            tracing::debug!(
+                target: "state_detection",
+                agent = %self.instance_name,
+                error = %e,
+                "#1523 Phase 0 shadow: failed to append turn-sentinel diagnostic"
+            );
+        }
     }
 
     /// Gate 1 — hash-dedup. Returns `true` when this frame is a duplicate
