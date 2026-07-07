@@ -212,7 +212,8 @@ fn phase1_remote_gone_worktree_keeps_unpushed_branch_ref_worktree_git() {
         "other".to_string(),
         (Some(repo.join("other")), Some(repo.clone())),
     );
-    let removed = sweep_from_registry(&configs, &[]);
+    let home = scratch("home-dummy");
+    let removed = sweep_from_registry(&home, &configs, &[]);
     std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
 
     // The stale worktree DIR IS still reclaimed (harmless disk cleanup)...
