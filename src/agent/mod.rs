@@ -26,6 +26,9 @@ use dismiss::{
 
 pub mod deleting;
 
+#[cfg(unix)]
+mod write_actor;
+
 pub use env_isolation::{env_isolation_enabled, is_sensitive_env_key, resolve_child_env};
 pub(crate) use env_isolation::{env_key_in, warn_env_isolation_disabled_once};
 
@@ -1128,6 +1131,8 @@ pub fn spawn_agent(
             .take_writer()
             .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?,
     ));
+    #[cfg(unix)]
+    write_actor::register(&pty_writer, pair.master.as_ref());
     let mut pty_reader = pair
         .master
         .try_clone_reader()
@@ -1504,6 +1509,8 @@ pub fn spawn_ephemeral_worker(config: &SpawnConfig) -> anyhow::Result<EphemeralP
                 .take_writer()
                 .map_err(|e| anyhow::anyhow!("take_writer: {e}"))?,
         ));
+        #[cfg(unix)]
+        write_actor::register(&pty_writer, pair.master.as_ref());
         let mut pty_reader = pair
             .master
             .try_clone_reader()
@@ -2164,13 +2171,30 @@ fn wait_for_process_exit(
     None
 }
 
+/// Eviction chokepoint -- see `write_actor::remove_and_unregister`'s doc.
+#[cfg(unix)]
+pub(crate) fn remove_and_unregister(
+    registry: &AgentRegistry,
+    id: &crate::types::InstanceId,
+) -> Option<AgentHandle> {
+    write_actor::remove_and_unregister(registry, id)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn remove_and_unregister(
+    registry: &AgentRegistry,
+    id: &crate::types::InstanceId,
+) -> Option<AgentHandle> {
+    lock_registry(registry).remove(id)
+}
+
 fn cleanup_agent(
     name: &str,
     id: &crate::types::InstanceId,
     registry: &AgentRegistry,
     home: &Option<std::path::PathBuf>,
 ) {
-    lock_registry(registry).remove(id);
+    remove_and_unregister(registry, id);
     if let Some(ref home) = home {
         crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
     }
@@ -2444,7 +2468,28 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
+#[cfg(unix)]
+fn try_actor_write(writer: &PtyWriter, data: &[u8]) -> Option<std::io::Result<()>> {
+    write_actor::write(writer, data.to_vec(), PTY_WRITE_TIMEOUT)
+}
+
+#[cfg(not(unix))]
+fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<()>> {
+    None
+}
+
+/// Test-only cross-module registration check (used by `daemon::lifecycle`'s
+/// Unix-only test — `write_actor` doesn't exist on other platforms).
+#[cfg(all(test, unix))]
+pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
+    write_actor::fd_for(writer).is_some()
+}
+
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
+    if let Some(result) = try_actor_write(writer, data) {
+        return result;
+    }
+
     let key = Arc::as_ptr(writer) as usize;
 
     // If a previous write is still stuck, fail fast.
