@@ -433,6 +433,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 0,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
         let observed = super::super::observe("adog", ScreenSignal::Working, &live, 1782403460000);
         assert_eq!(observed.authority, Authority::Stream);

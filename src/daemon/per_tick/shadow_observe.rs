@@ -77,6 +77,7 @@ impl PerTickHandler for ShadowObserveHandler {
                     api_in_flight: c.api_activity.in_flight,
                     productive_silent_ms: c.state.productive_silence().as_millis() as u64,
                     child_alive: *child_alive,
+                    mcp_activity_at_ms: c.health.last_mcp_activity_at_epoch_ms,
                 };
                 (raw_state, gate::screen_signal(raw_state), live)
             };

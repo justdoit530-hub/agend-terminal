@@ -78,6 +78,7 @@ pub enum Authority {
     ProcessHeuristic,
     /// Derived by the reducer from other evidence (e.g. Thinking).
     Inferred,
+    Mcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

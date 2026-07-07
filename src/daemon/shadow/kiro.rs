@@ -557,6 +557,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 0,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
         let observed = super::super::observe("kdog", ScreenSignal::Working, &live, 5_000);
         assert_eq!(
