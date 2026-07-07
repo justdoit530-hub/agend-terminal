@@ -75,7 +75,7 @@ fn worktree_auto_cleanup(home: &Path, configs: &ConfigRegistry) {
                     .collect()
             })
             .unwrap_or_default();
-    let cleaned = crate::worktree_cleanup::sweep_from_registry(&config_data, &fleet_dirs);
+    let cleaned = crate::worktree_cleanup::sweep_from_registry(home, &config_data, &fleet_dirs);
     for (branch, path) in &cleaned {
         crate::event_log::log(
             home,
