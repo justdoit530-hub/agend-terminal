@@ -146,6 +146,8 @@ pub struct Liveness {
     pub productive_silent_ms: u64,
     /// The agent's child process still exists.
     pub child_alive: bool,
+    /// Epoch milliseconds of the last MCP activity.
+    pub mcp_activity_at_ms: Option<u64>,
 }
 
 /// Per-agent accumulator. Folded with hook Evidence over time (`ingest`), then queried
@@ -337,11 +339,25 @@ impl AgentRuntime {
             now_ms
         };
 
+        let evidence = if authority == Authority::Mcp {
+            let mut ev = self.trail.iter().cloned().collect::<Vec<_>>();
+            if let Some(mcp_ms) = live.mcp_activity_at_ms {
+                ev.push(EvidenceRef {
+                    kind: "mcp_activity".to_string(),
+                    authority: Authority::Mcp,
+                    at_ms: mcp_ms,
+                });
+            }
+            ev
+        } else {
+            self.trail.iter().cloned().collect()
+        };
+
         ObservedStatus {
             state,
             confidence,
             authority,
-            evidence: self.trail.iter().cloned().collect(),
+            evidence,
             since_ms,
         }
     }
@@ -360,6 +376,13 @@ impl AgentRuntime {
                 Authority::ProcessHeuristic,
                 Confidence::Strong,
             );
+        }
+
+        // MCP activity within the freshness window trumps everything else except dead process.
+        if let Some(mcp_ms) = live.mcp_activity_at_ms {
+            if now_ms.saturating_sub(mcp_ms) <= HOOK_FRESHNESS_MS {
+                return (ObservedState::Active, Authority::Mcp, Confidence::Strong);
+            }
         }
 
         // Observer-plane freshness: a Hook/Stream episode within the window is the real-time
@@ -577,6 +600,7 @@ mod tests {
             api_in_flight: false,
             productive_silent_ms,
             child_alive: true,
+            mcp_activity_at_ms: None,
         }
     }
 
@@ -585,6 +609,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 0,
             child_alive: true,
+            mcp_activity_at_ms: None,
         }
     }
 
@@ -712,6 +737,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 60_000,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
         let s = rt.observe(
             ScreenSignal::Idle,
@@ -738,6 +764,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 30_000,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
         // Hook age 100s ≪ EPISODE_STALE_MS (300s) ⇒ fresh ⇒ no last-resort reconcile.
         let s = rt.observe(ScreenSignal::Idle, &live, 1_000 + 100_000);
@@ -762,6 +789,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 301_000,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
         let s = rt.observe(ScreenSignal::Idle, &live, 1_000 + EPISODE_STALE_MS + 1);
         assert_ne!(
@@ -793,6 +821,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: now_ms - 2_000,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
         let s = rt.observe(ScreenSignal::Idle, &live, now_ms);
         assert_eq!(
@@ -973,6 +1002,7 @@ mod tests {
             api_in_flight: false,
             productive_silent_ms: 0,
             child_alive: false,
+            mcp_activity_at_ms: None,
         };
         let s = rt.observe(ScreenSignal::Working, &live, 1_100);
         assert_eq!(s.state, ObservedState::Idle);
@@ -1034,5 +1064,23 @@ mod tests {
         assert!(j.get("since_ms").is_some());
         let back: ObservedStatus = serde_json::from_value(j).expect("deserialize");
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn test_mcp_activity_liveness_override() {
+        let mut rt = AgentRuntime::default();
+        let mut live = live_quiet(30_000);
+        let now_ms = HOOK_FRESHNESS_MS + 10_000;
+        live.mcp_activity_at_ms = Some(now_ms - 5_000);
+
+        let s = rt.observe(ScreenSignal::Idle, &live, now_ms);
+        assert_eq!(s.state, ObservedState::Active);
+        assert_eq!(s.authority, Authority::Mcp);
+        assert_eq!(s.confidence, Confidence::Strong);
+        assert!(s.evidence.iter().any(|e| e.authority == Authority::Mcp));
+
+        live.mcp_activity_at_ms = Some(now_ms - HOOK_FRESHNESS_MS - 1_000);
+        let s = rt.observe(ScreenSignal::Idle, &live, now_ms);
+        assert_eq!(s.state, ObservedState::Idle);
     }
 }

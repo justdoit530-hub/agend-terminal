@@ -143,6 +143,24 @@ pub(crate) fn check_stalled(
     // elapsed negative → stall detection silently stop firing.
     let elapsed_secs = crate::daemon::utils::elapsed_since(now, last_alive).num_seconds();
     let stall_threshold = (eta_secs as f64 * STALL_MULTIPLIER) as i64;
+
+    // Check if the agent has had MCP activity within the threshold window
+    if let Some(agent_name) = task.routed_to.as_ref().or(task.assignee.as_ref()) {
+        if let Some(reg) = crate::agent::get_pending_registry() {
+            let registry = crate::agent::lock_registry(&reg);
+            if let Some(handle) = registry.values().find(|h| h.name.as_str() == agent_name) {
+                let last_mcp = handle.core.lock().health.last_mcp_activity_at_epoch_ms;
+                if let Some(last_mcp_epoch_ms) = last_mcp {
+                    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let elapsed_secs = now_ms.saturating_sub(last_mcp_epoch_ms) / 1000;
+                    if elapsed_secs <= stall_threshold as u64 {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     if elapsed_secs > stall_threshold {
         Some(format!(
             "elapsed={elapsed_secs}s exceeds eta_secs*{STALL_MULTIPLIER}={stall_threshold}s \
@@ -865,6 +883,65 @@ mod tests {
             crate::inbox::drain(&home, "general").is_empty(),
             "seeded stall must remain suppressed on the next scan"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn check_stalled_ignores_tasks_with_recent_mcp_activity() {
+        let home = tmp_home("stalled-mcp");
+        let now = chrono::Utc::now();
+        let dispatched = (now - chrono::Duration::seconds(500)).to_rfc3339();
+        let mut task = make_task("t-mcp", "in_progress", Some(100), Some(&dispatched));
+        task.routed_to = Some("mcp-agent".to_string());
+
+        let registry: crate::agent::AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let inst_id = crate::types::InstanceId::new();
+        let handle = crate::agent::mk_test_handle("mcp-agent", inst_id);
+        registry.lock().insert(inst_id, handle);
+
+        crate::agent::set_pending_registry(registry.clone());
+
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let last_mcp = now_ms - 10_000;
+        let reg_guard = crate::agent::lock_registry(&registry);
+        let agent_handle = reg_guard
+            .values()
+            .find(|h| h.name.as_str() == "mcp-agent")
+            .unwrap();
+        agent_handle
+            .core
+            .lock()
+            .health
+            .last_mcp_activity_at_epoch_ms = Some(last_mcp);
+        drop(reg_guard);
+
+        let result = check_stalled(&home, &task, now);
+        assert!(
+            result.is_none(),
+            "must NOT detect stall when agent has recent MCP activity"
+        );
+
+        let stale_mcp = now_ms - 500_000;
+        let reg_guard = crate::agent::lock_registry(&registry);
+        let agent_handle = reg_guard
+            .values()
+            .find(|h| h.name.as_str() == "mcp-agent")
+            .unwrap();
+        agent_handle
+            .core
+            .lock()
+            .health
+            .last_mcp_activity_at_epoch_ms = Some(stale_mcp);
+        drop(reg_guard);
+
+        let result = check_stalled(&home, &task, now);
+        assert!(
+            result.is_some(),
+            "must detect stall when MCP activity is stale"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 }

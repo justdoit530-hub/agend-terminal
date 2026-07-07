@@ -109,11 +109,13 @@ pub(crate) fn gated_override(raw: AgentState, status: &ObservedStatus) -> Option
         return None;
     }
     // (a) + (b) high-confidence real-time observer plane only.
-    let high_confidence = matches!(status.authority, Authority::Hook | Authority::Stream)
-        && matches!(
-            status.confidence,
-            Confidence::Confirmed | Confidence::Strong
-        );
+    let high_confidence = matches!(
+        status.authority,
+        Authority::Hook | Authority::Stream | Authority::Mcp
+    ) && matches!(
+        status.confidence,
+        Confidence::Confirmed | Confidence::Strong
+    );
     if !high_confidence {
         return None;
     }
@@ -307,6 +309,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 0,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
         let s = rt.observe(ScreenSignal::Approval, &live, 1_200);
         assert_eq!(s.state, ObservedState::WaitingForUser);
@@ -337,6 +340,7 @@ mod tests {
             api_in_flight: true,
             productive_silent_ms: 0,
             child_alive: true,
+            mcp_activity_at_ms: None,
         };
 
         // (1) RESUMED: turn hit a 529 (StopFailure → episode closed), then a NEW turn started —

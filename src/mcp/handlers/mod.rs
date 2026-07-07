@@ -120,9 +120,18 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         // poll still proves the agent is alive.
         let cold_start =
             crate::daemon::heartbeat_pair::snapshot_for(instance_name).heartbeat_at_ms == 0;
+        let now_ms = crate::daemon::heartbeat_pair::now_ms();
         crate::daemon::heartbeat_pair::update_with(instance_name, |p| {
-            p.heartbeat_at_ms = crate::daemon::heartbeat_pair::now_ms();
+            p.heartbeat_at_ms = now_ms;
         });
+
+        // Record MCP activity in AgentCore's HealthTracker
+        if let Some(reg) = crate::agent::get_pending_registry() {
+            let registry = crate::agent::lock_registry(&reg);
+            if let Some(handle) = registry.values().find(|h| h.name.as_str() == instance_name) {
+                handle.core.lock().health.last_mcp_activity_at_epoch_ms = Some(now_ms);
+            }
+        }
         // Disk `last_heartbeat` RMW: skip for a read-only tool (the perf win) EXCEPT
         // on the cold→warm first call after a (re)start. The supervisor reads disk
         // `last_heartbeat` ONLY as the crash-recovery fallback while the in-mem pair

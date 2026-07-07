@@ -385,6 +385,8 @@ pub struct HealthTracker {
     /// (`RecoverySignal::RateLimitLifted` is the would-be typed equivalent but
     /// stays unwired — a bool is sufficient here, #2232 D2.)
     pub rate_limit_self_cleared: bool,
+    /// Last MCP activity timestamp as epoch milliseconds.
+    pub last_mcp_activity_at_epoch_ms: Option<u64>,
     /// `#685` sub-task 7a: per-agent recovery dispatcher state machine.
     /// Mutated only by `src/daemon/per_tick/recovery_dispatcher.rs`;
     /// `health.rs` ships it as a field to keep all per-agent state in
@@ -519,6 +521,7 @@ impl HealthTracker {
             current_reason: None,
             current_note: None,
             rate_limit_self_cleared: false,
+            last_mcp_activity_at_epoch_ms: None,
             recovery_stage_state: RecoveryStageState::None,
             last_stage1_fired_at: None,
             recovery_restart_count: 0,
@@ -794,6 +797,23 @@ impl HealthTracker {
             if reason.suppresses_hang_check() {
                 return false;
             }
+        }
+
+        // MCP activity within the window keeps the agent active/healthy
+        let mcp_active = if let Some(last_mcp) = self.last_mcp_activity_at_epoch_ms {
+            let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+            let elapsed = Duration::from_millis(now_ms.saturating_sub(last_mcp));
+            !productive_silence_exceeds(agent_state, elapsed)
+        } else {
+            false
+        };
+
+        if mcp_active {
+            if matches!(self.state, HealthState::Hung | HealthState::IdleLong) {
+                self.state = HealthState::Healthy;
+                self.hung_since = None;
+            }
+            return false;
         }
 
         let silence_exceeds_threshold = productive_silence_exceeds(agent_state, silent);
@@ -2442,5 +2462,49 @@ mod tests {
 
         // State must NOT be Healthy or Recovering; it transitions to Absent
         assert_eq!(h.state, HealthState::Absent);
+    }
+
+    #[test]
+    fn test_check_hang_suppressed_by_recent_mcp_activity() {
+        let mut h = HealthTracker::new();
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+        h.last_mcp_activity_at_epoch_ms = Some(now_ms - 5_000);
+        h.state = HealthState::Hung;
+
+        let is_hung = h.check_hang(
+            AgentState::Active,
+            Duration::from_secs(700),
+            Duration::from_secs(0),
+            1_000_000,
+            0,
+        );
+
+        assert!(
+            !is_hung,
+            "check_hang must return false when recent MCP activity exists"
+        );
+        assert_eq!(
+            h.state,
+            HealthState::Healthy,
+            "state must transition to Healthy on MCP activity"
+        );
+        assert!(h.hung_since.is_none(), "hung_since must be cleared");
+
+        h.last_mcp_activity_at_epoch_ms = Some(now_ms - 700_000);
+        h.state = HealthState::Healthy;
+
+        let is_hung = h.check_hang(
+            AgentState::Active,
+            Duration::from_secs(700),
+            Duration::from_secs(0),
+            1_000_000,
+            0,
+        );
+        assert!(
+            is_hung,
+            "check_hang must return true when MCP activity is stale"
+        );
+        assert_eq!(h.state, HealthState::Hung, "state must transition to Hung");
     }
 }
