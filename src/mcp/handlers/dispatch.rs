@@ -365,7 +365,10 @@ pub(crate) fn rule_is_relevant(rule_text: &str, keywords: &[String]) -> bool {
 pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
     if ctx.args["action"].as_str() == Some("create") {
         let mut modified_args = ctx.args.clone();
-        let original_message = modified_args["description"].as_str().unwrap_or("").to_string();
+        let original_message = modified_args["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         if let Some(agent_name) = modified_args["assignee"].as_str() {
             if !agent_name.is_empty() {
                 let mut sections = vec![original_message.to_string()];
@@ -502,8 +505,8 @@ fn dispatch_decompose_task(description: &str) -> Option<Vec<String>> {
 async fn decompose_task_with_ollama(description: &str) -> Option<Vec<String>> {
     let base_url =
         std::env::var("OLLAMA_HTTP_URL").unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let model = std::env::var("OLLAMA_DECOMPOSE_MODEL")
-        .unwrap_or_else(|_| "qwen2.5:7b".to_string());
+    let model =
+        std::env::var("OLLAMA_DECOMPOSE_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
     let client = ollama_http_client()?;
     decompose_task_with_client(client, &base_url, &model, description).await
 }
@@ -1320,8 +1323,8 @@ mod tests {
 
     #[test]
     fn parse_decompose_subtasks_accepts_json_array() {
-        let parsed = parse_decompose_subtasks(r#"["subtask one", "subtask two"]"#)
-            .expect("two subtasks");
+        let parsed =
+            parse_decompose_subtasks(r#"["subtask one", "subtask two"]"#).expect("two subtasks");
         assert_eq!(parsed, vec!["subtask one", "subtask two"]);
         assert!(parse_decompose_subtasks(r#"["only one"]"#).is_none());
         assert!(parse_decompose_subtasks("not json").is_none());
@@ -1376,7 +1379,8 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accept request");
             let mut buf = [0; 8192];
             let _ = stream.read(&mut buf);
-            let body = r#"{"message":{"content":"[\"build API endpoint\", \"add integration tests\"]"}}"#;
+            let body =
+                r#"{"message":{"content":"[\"build API endpoint\", \"add integration tests\"]"}}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 body.len(),

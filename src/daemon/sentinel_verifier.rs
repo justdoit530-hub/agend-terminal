@@ -43,8 +43,8 @@ pub(crate) fn record_disagreement(home: &Path, obs: &DisagreementObs<'_>) {
         return;
     }
     let screen_idle = matches!(obs.screen, ScreenSignal::Idle);
-    let sentinel_idle = obs.observed_authority == Authority::Sentinel
-        && obs.observed_state == ObservedState::Idle;
+    let sentinel_idle =
+        obs.observed_authority == Authority::Sentinel && obs.observed_state == ObservedState::Idle;
     let disagrees = screen_idle != sentinel_idle
         || (sentinel_idle && !matches!(obs.raw_state, AgentState::Idle));
     if !disagrees {

@@ -5772,7 +5772,10 @@ fn context_source_stays_pattern_while_context_provider_is_statusline() {
 fn turn_sentinel_nonce_is_deterministic_and_eight_hex() {
     let a = turn_sentinel_nonce("fixup-dev");
     let b = turn_sentinel_nonce("fixup-dev");
-    assert_eq!(a, b, "nonce must be stable for the same agent (recomputable)");
+    assert_eq!(
+        a, b,
+        "nonce must be stable for the same agent (recomputable)"
+    );
     assert_eq!(a.len(), 8, "nonce is fixed 8-char hex: {a}");
     assert!(
         a.chars().all(|c| c.is_ascii_hexdigit()),
