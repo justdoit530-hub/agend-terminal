@@ -335,6 +335,11 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
     let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
         Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
+    // Keepalive: in Attached mode, setup_app_bootstrap does NOT move tui_event_tx
+    // into an API server thread (there is none), so the original tx is dropped on
+    // return — disconnecting tui_event_rx and making recv(tui_event_rx) in the
+    // select! fire at 9M Hz. Holding a clone here keeps the channel live.
+    let _tui_event_tx_keepalive = tui_event_tx.clone();
 
     // Preflight via the shared bootstrap seam so `api.cookie` is issued before
     // `api::serve` starts — otherwise `inbox::notify_agent`'s `api::call(INJECT)`
