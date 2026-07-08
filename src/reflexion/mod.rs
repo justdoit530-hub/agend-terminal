@@ -98,31 +98,63 @@ pub struct Rule {
 /// List all solidified rules for a specific agent.
 pub fn list_rules(home: &Path, agent_name: &str) -> Vec<Rule> {
     let rules_dir = home.join("rules");
-    let Ok(entries) = fs::read_dir(&rules_dir) else {
-        return vec![];
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-        .filter_map(|content| serde_json::from_str::<Rule>(&content).ok())
-        .filter(|rule| rule.agent_name == agent_name)
-        .collect()
+    let mut rules = Vec::new();
+    if let Ok(entries) = fs::read_dir(&rules_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().extension().is_some_and(|ext| ext == "json") {
+                if entry.file_name() == "shared.json" {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(rule) = serde_json::from_str::<Rule>(&content) {
+                        if rule.agent_name == agent_name {
+                            rules.push(rule);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Load shared rules from shared.json
+    let shared_path = rules_dir.join("shared.json");
+    if let Ok(content) = fs::read_to_string(&shared_path) {
+        if let Ok(shared_rules) = serde_json::from_str::<Vec<Rule>>(&content) {
+            for r in shared_rules {
+                if !rules
+                    .iter()
+                    .any(|existing| existing.id == r.id || existing.rule_text == r.rule_text)
+                {
+                    rules.push(r);
+                }
+            }
+        }
+    }
+
+    rules
 }
 
 /// List all solidified rules that belong to agents other than `exclude_agent`.
 pub fn list_cross_agent_rules(home: &Path, exclude_agent: &str) -> Vec<Rule> {
     let rules_dir = home.join("rules");
-    let Ok(entries) = fs::read_dir(&rules_dir) else {
-        return vec![];
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
-        .filter_map(|content| serde_json::from_str::<Rule>(&content).ok())
-        .filter(|rule| rule.agent_name != exclude_agent)
-        .collect()
+    let mut rules = Vec::new();
+    if let Ok(entries) = fs::read_dir(&rules_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().extension().is_some_and(|ext| ext == "json") {
+                if entry.file_name() == "shared.json" {
+                    continue;
+                }
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(rule) = serde_json::from_str::<Rule>(&content) {
+                        if rule.agent_name != exclude_agent {
+                            rules.push(rule);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rules
 }
 
 const MEM0_SYNC_URL: &str = "http://localhost:5174/add";
@@ -522,6 +554,12 @@ pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -
         return None;
     }
 
+    // Write/merge to shared.json
+    let shared_path = home.join("rules").join("shared.json");
+    if let Err(e) = merge_to_shared_rules(&shared_path, &rule) {
+        tracing::warn!(?e, "failed to merge success rule to shared.json");
+    }
+
     // Inject success pattern rule into agent's .agents/AGENTS.md
     inject_rule_to_agents_md_for_binding(home, agent_name, &rule_category, &rule_text);
 
@@ -554,6 +592,43 @@ pub fn cleanup_old_mistakes(home: &Path) {
             }
         }
     }
+}
+
+fn merge_to_shared_rules(shared_path: &Path, new_rule: &Rule) -> std::io::Result<()> {
+    if let Some(parent) = shared_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut shared_rules: Vec<Rule> = if shared_path.exists() {
+        let content = fs::read_to_string(shared_path)?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let mut found = false;
+    for rule in &mut shared_rules {
+        if rule.category == new_rule.category {
+            if new_rule.trigger_count > rule.trigger_count {
+                rule.rule_text = new_rule.rule_text.clone();
+                rule.trigger_count = new_rule.trigger_count;
+                rule.id = new_rule.id.clone();
+                rule.agent_name = new_rule.agent_name.clone();
+            }
+            found = true;
+            break;
+        }
+    }
+
+    if !found {
+        shared_rules.push(new_rule.clone());
+    }
+
+    let serialized = serde_json::to_string_pretty(&shared_rules)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    fs::write(shared_path, serialized)?;
+
+    Ok(())
 }
 
 /// Minimum increase in `trigger_count` since the last write before re-synthesizing
@@ -648,6 +723,12 @@ pub fn solidify_rule(
         if let Err(e) = fs::write(&rule_path, serialized) {
             tracing::warn!(?e, ?rule_path, "failed to write rule file");
         }
+    }
+
+    // Write/merge to shared.json
+    let shared_path = rules_dir.join("shared.json");
+    if let Err(e) = merge_to_shared_rules(&shared_path, &rule) {
+        tracing::warn!(?e, "failed to merge rule to shared.json");
     }
 
     if refresh_external {
@@ -2418,5 +2499,61 @@ mod tests {
         assert!(text.contains("- Clippy reported unused variable"));
         assert!(text.contains("- Missing derive annotation on struct"));
         assert!(text.starts_with(get_rule_text("lint_failure")));
+    }
+
+    #[test]
+    fn test_cross_worker_shared_rules_propagation() {
+        let home = tmp_home("cross_worker_rules_test");
+        let rules_dir = home.join("rules");
+        std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+        let rule_a = Rule {
+            id: "rule_agent-a_lint_failure".to_string(),
+            agent_name: "Agent-A".to_string(),
+            category: "lint_failure".to_string(),
+            rule_text: "Don't forget tests".to_string(),
+            created_at: "2026-06-26T12:00:00Z".to_string(),
+            trigger_count: 3,
+        };
+
+        // 1. Merge to shared rules
+        merge_to_shared_rules(&rules_dir.join("shared.json"), &rule_a).expect("merge failed");
+
+        // 2. list_rules for Agent-B (should return Agent-A's rule because it is shared)
+        let rules_b = list_rules(&home, "Agent-B");
+        assert_eq!(rules_b.len(), 1, "Agent-B should see the shared rule");
+        assert_eq!(rules_b[0].id, rule_a.id);
+        assert_eq!(rules_b[0].rule_text, rule_a.rule_text);
+
+        // 3. Merge a new rule with higher trigger count and updated text for same category
+        let rule_b = Rule {
+            id: "rule_agent-b_lint_failure".to_string(),
+            agent_name: "Agent-B".to_string(),
+            category: "lint_failure".to_string(),
+            rule_text: "Don't forget tests - clippy clean required".to_string(),
+            created_at: "2026-06-26T13:00:00Z".to_string(),
+            trigger_count: 5,
+        };
+        merge_to_shared_rules(&rules_dir.join("shared.json"), &rule_b).expect("merge failed");
+
+        // 4. list_rules for Agent-A (should see the updated shared rule)
+        let rules_a = list_rules(&home, "Agent-A");
+        assert_eq!(
+            rules_a.len(),
+            1,
+            "Agent-A should see exactly one shared rule"
+        );
+        assert_eq!(rules_a[0].id, rule_b.id);
+        assert_eq!(rules_a[0].rule_text, rule_b.rule_text);
+        assert_eq!(rules_a[0].trigger_count, 5);
+
+        // 5. list_cross_agent_rules for Agent-A should skip shared.json
+        let cross_rules_a = list_cross_agent_rules(&home, "Agent-A");
+        assert!(
+            cross_rules_a.is_empty(),
+            "cross_rules should be empty because we only have shared.json"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }

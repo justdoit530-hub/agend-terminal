@@ -193,10 +193,7 @@ pub fn push(agent: &str, ev: Evidence) {
 /// Called by `shadow_observe` after consuming `StateTracker::take_pending_sentinel_idle`.
 pub fn push_sentinel_idle(agent: &str, at_ms: u64) {
     use evidence::{Evidence, EvidenceKind};
-    push(
-        agent,
-        Evidence::sentinel(EvidenceKind::PromptReady, at_ms),
-    );
+    push(agent, Evidence::sentinel(EvidenceKind::PromptReady, at_ms));
 }
 
 /// Drain (remove + return, oldest-first) all evidence for `agent` — the reducer's

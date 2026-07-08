@@ -629,8 +629,7 @@ pub(crate) fn turn_sentinel_primary_enabled(backend: &crate::backend::Backend) -
 /// Should the turn-completion directive be injected at spawn? Grok always (Tier 3
 /// path); other backends only under the Phase-0 shadow soak flag.
 pub(crate) fn turn_sentinel_injection_enabled(backend: &crate::backend::Backend) -> bool {
-    matches!(backend, crate::backend::Backend::GrokCli)
-        || turn_sentinel_shadow_enabled()
+    matches!(backend, crate::backend::Backend::GrokCli) || turn_sentinel_shadow_enabled()
 }
 
 /// Per-agent sentinel nonce — deterministic from the agent name so the instruction
@@ -1631,15 +1630,10 @@ impl StateTracker {
         }
         let token = turn_sentinel_token(&self.instance_name);
         let obs = observe_turn_sentinel(tail, &token);
-        if !obs.token_seen
-            || !obs.on_last_line
-            || obs.suspected_echo
-            || obs.leak_signal
-        {
+        if !obs.token_seen || !obs.on_last_line || obs.suspected_echo || obs.leak_signal {
             return;
         }
-        self.pending_sentinel_idle_ms =
-            Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
+        self.pending_sentinel_idle_ms = Some(chrono::Utc::now().timestamp_millis().max(0) as u64);
     }
 
     /// #1523 Phase 0: turn-completion sentinel shadow telemetry.

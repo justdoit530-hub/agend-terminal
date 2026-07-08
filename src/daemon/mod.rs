@@ -33,10 +33,10 @@ pub(crate) mod per_tick;
 pub(crate) mod poll_reminder;
 pub(crate) mod pr_state;
 pub(crate) mod recovery_shadow;
-pub(crate) mod sentinel_verifier;
 pub(crate) mod restart;
 pub(crate) mod retention;
 pub(crate) mod router;
+pub(crate) mod sentinel_verifier;
 /// #2413 Shadow Observer — local plane (claude hooks side-channel). Spike, flag-OFF.
 pub mod shadow;
 pub(crate) mod supervisor;

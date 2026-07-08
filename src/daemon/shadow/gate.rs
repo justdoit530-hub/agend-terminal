@@ -192,7 +192,11 @@ mod tests {
             Some(AgentState::Active)
         );
         // Sentinel plane (grok) parity for false-idle beat.
-        let s = status(ObservedState::Active, Authority::Sentinel, Confidence::Strong);
+        let s = status(
+            ObservedState::Active,
+            Authority::Sentinel,
+            Confidence::Strong,
+        );
         assert_eq!(
             gated_override(AgentState::Idle, &s),
             Some(AgentState::Active)
