@@ -774,6 +774,37 @@ pub fn reconcile_orphans(home: &Path) {
     }
 }
 
+pub fn find_agent_by_branch_or_task(
+    home: &Path,
+    branch: &str,
+    task_id: Option<&str>,
+) -> Option<String> {
+    let runtime_dir = crate::paths::runtime_dir(home);
+    let entries = std::fs::read_dir(runtime_dir).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        if entry.path().is_dir() {
+            let agent_name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(binding) = read(home, &agent_name) {
+                if !branch.is_empty() {
+                    if let Some(b) = binding["branch"].as_str() {
+                        if b == branch {
+                            return Some(agent_name);
+                        }
+                    }
+                }
+                if let Some(tid) = task_id {
+                    if let Some(t) = binding["task_id"].as_str() {
+                        if t == tid {
+                            return Some(agent_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
