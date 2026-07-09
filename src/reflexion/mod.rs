@@ -761,6 +761,128 @@ pub fn record_success(
     Some(success_id)
 }
 
+/// Extract the `### Evidence` section from a VERIFIED report body.
+pub fn extract_evidence_from_report(text: &str) -> String {
+    const MARKER: &str = "### Evidence";
+    if let Some(idx) = text.find(MARKER) {
+        return text[idx + MARKER.len()..].trim().to_string();
+    }
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("ran:") || trimmed.starts_with("cited:")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a completed task is complex enough to auto-extract a reusable skill.
+pub fn should_create_skill(summary: &str, evidence: &str, category: &str) -> bool {
+    if matches!(category, "general" | "unclassified") {
+        return false;
+    }
+    let complexity = evidence
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("ran:") || trimmed.starts_with("cited:")
+        })
+        .count();
+    if complexity < 4 {
+        return false;
+    }
+    if summary.len() < 50 {
+        return false;
+    }
+    true
+}
+
+fn skill_auto_dir(_home: &Path) -> Option<std::path::PathBuf> {
+    if let Ok(override_dir) = std::env::var("AGEND_SKILL_AUTO_DIR") {
+        return Some(std::path::PathBuf::from(override_dir));
+    }
+    dirs::home_dir().map(|home| home.join(".claude/skills/auto"))
+}
+
+/// Generate a Markdown skill file under `~/.claude/skills/auto/` for complex successes.
+/// Fails silently when the Claude API is unavailable or returns an error.
+pub fn maybe_create_skill(
+    agent_name: &str,
+    category: &str,
+    summary: &str,
+    evidence: &str,
+    home: &Path,
+) {
+    let Some(auto_dir) = skill_auto_dir(home) else {
+        tracing::debug!("skill auto dir unavailable; skipping maybe_create_skill");
+        return;
+    };
+
+    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => key,
+        _ => return,
+    };
+
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let date = chrono::Utc::now().format("%Y%m%d").to_string();
+    let user_prompt = format!(
+        "You are extracting a reusable procedure from a completed agent task.\n\n\
+         Task summary: {summary}\n\
+         Category: {category}\n\
+         Agent: {agent_name}\n\
+         Evidence:\n{evidence}\n\n\
+         Generate a concise skill file in this exact format:\n\
+         ---\n\
+         name: {category}-{agent_name}-procedure\n\
+         description: <one sentence: when to use this skill>\n\
+         metadata:\n\
+           category: {category}\n\
+           agent: {agent_name}\n\
+           created_at: {timestamp}\n\
+           source: auto_reflexion\n\
+         ---\n\n\
+         # <Short Title>\n\n\
+         ## When to Use\n\
+         - <condition 1>\n\
+         - <condition 2>\n\n\
+         ## Steps\n\
+         1. <reusable step>\n\
+         2. <reusable step>\n\
+         ...\n\n\
+         ## Key Commands\n\
+         ```\n\
+         <important commands extracted from evidence>\n\
+         ```\n\n\
+         Focus on REUSABLE PROCEDURE. Extract the HOW, not the specific task content.\n\
+         Respond with ONLY the markdown file content, no explanation."
+    );
+
+    let system_prompt =
+        "You write concise, reusable agent skill files in Markdown with YAML frontmatter.";
+
+    let content = match call_claude_api(&api_key, system_prompt, &user_prompt) {
+        Ok(text) if !text.trim().is_empty() => text,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::debug!(?e, "maybe_create_skill: Claude API failed; skipping");
+            return;
+        }
+    };
+
+    if let Err(e) = fs::create_dir_all(&auto_dir) {
+        tracing::warn!(?e, ?auto_dir, "failed to create skill auto dir");
+        return;
+    }
+
+    let filename = format!("{category}_{agent_name}_{date}.md");
+    let path = auto_dir.join(filename);
+    if let Err(e) = fs::write(&path, content) {
+        tracing::warn!(?e, ?path, "failed to write auto skill file");
+    } else {
+        tracing::info!(?path, agent_name, category, "auto skill file created");
+    }
+}
+
 pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -> Option<String> {
     let path = home.join("successes").join(format!("{agent_name}.json"));
     let successes: Vec<Success> = fs::read_to_string(&path)
@@ -3143,6 +3265,106 @@ mod tests {
             let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
             *mock = None;
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_should_create_skill_triggers_on_complex_evidence() {
+        let summary = "VERIFIED\n\n### Summary\nCompleted reflexion synthesis_method Layer 2 implementation with full test coverage.";
+        let evidence = "### Evidence\n\
+            ran: cargo test --bin agend-terminal -- reflexion → 42 passed\n\
+            ran: cargo clippy --all-targets -- -D warnings → clean\n\
+            cited: src/reflexion/mod.rs:155 — synthesis_method field\n\
+            cited: src/reflexion/mod.rs:1038 — solidify_rule wiring";
+        assert!(should_create_skill(
+            summary,
+            evidence,
+            "missing_test_execution"
+        ));
+    }
+
+    #[test]
+    fn test_should_create_skill_skips_general_category() {
+        let summary = "VERIFIED\n\n### Summary\nCompleted reflexion synthesis_method Layer 2 implementation with full test coverage.";
+        let evidence = "### Evidence\n\
+            ran: cargo test → ok\n\
+            ran: cargo clippy → ok\n\
+            cited: src/reflexion/mod.rs:1 — field\n\
+            cited: src/reflexion/mod.rs:2 — wiring";
+        assert!(!should_create_skill(summary, evidence, "general"));
+        assert!(!should_create_skill(summary, evidence, "unclassified"));
+    }
+
+    #[test]
+    fn test_should_create_skill_skips_simple_evidence() {
+        let summary = "VERIFIED\n\n### Summary\nCompleted reflexion synthesis_method Layer 2 implementation with full test coverage.";
+        let evidence = "### Evidence\n\
+            ran: cargo test → ok\n\
+            ran: cargo clippy → ok";
+        assert!(!should_create_skill(
+            summary,
+            evidence,
+            "missing_test_execution"
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_skill_file_written_to_auto_dir() {
+        let home = tmp_home("skill_auto_dir_test");
+        let auto_dir = home.join("skills_auto");
+        std::env::set_var(
+            "AGEND_SKILL_AUTO_DIR",
+            auto_dir.to_str().expect("invalid auto dir path"),
+        );
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
+
+        let mock_skill = "---\n\
+            name: missing_test_execution-skill-agent-procedure\n\
+            description: Run cargo test before reporting VERIFIED\n\
+            metadata:\n\
+              category: missing_test_execution\n\
+              agent: skill-agent\n\
+              source: auto_reflexion\n\
+            ---\n\n\
+            # Verify Before Report\n";
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = Some(Ok(mock_skill.to_string()));
+        }
+
+        let summary = "VERIFIED\n\n### Summary\nCompleted reflexion synthesis_method Layer 2 implementation with full test coverage.";
+        let evidence = "### Evidence\n\
+            ran: cargo test --bin agend-terminal -- reflexion → 42 passed\n\
+            ran: cargo clippy --all-targets -- -D warnings → clean\n\
+            cited: src/reflexion/mod.rs:155 — synthesis_method field\n\
+            cited: src/reflexion/mod.rs:1038 — solidify_rule wiring";
+
+        maybe_create_skill(
+            "skill-agent",
+            "missing_test_execution",
+            summary,
+            evidence,
+            &home,
+        );
+
+        let date = chrono::Utc::now().format("%Y%m%d").to_string();
+        let expected_path = auto_dir.join(format!("missing_test_execution_skill-agent_{date}.md"));
+        assert!(
+            expected_path.exists(),
+            "expected skill file at {}",
+            expected_path.display()
+        );
+        let content = std::fs::read_to_string(&expected_path).expect("read skill file");
+        assert!(content.contains("name: missing_test_execution-skill-agent-procedure"));
+        assert!(content.contains("# Verify Before Report"));
+
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = None;
+        }
+        std::env::remove_var("AGEND_SKILL_AUTO_DIR");
+        std::env::remove_var("ANTHROPIC_API_KEY");
         std::fs::remove_dir_all(&home).ok();
     }
 

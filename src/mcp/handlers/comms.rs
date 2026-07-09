@@ -515,6 +515,17 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     success_category,
                 );
                 crate::reflexion::mark_mistake_corrected(home, &implementer_agent, category);
+                let evidence =
+                    crate::reflexion::extract_evidence_from_report(&evidence_body);
+                if crate::reflexion::should_create_skill(summary, &evidence, success_category) {
+                    crate::reflexion::maybe_create_skill(
+                        &implementer_agent,
+                        success_category,
+                        summary,
+                        &evidence,
+                        home,
+                    );
+                }
             }
 
             // #1666 Phase B (WARN-first): cross-check the checkable evidence and
