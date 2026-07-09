@@ -401,6 +401,182 @@ fn first_meaningful_line(text: &str) -> Option<&str> {
     None
 }
 
+#[cfg(test)]
+static CLAUDE_API_RESPONSE_MOCK: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn call_claude_api(api_key: &str, system_prompt: &str, user_prompt: &str) -> Result<String, String> {
+    #[cfg(test)]
+    {
+        let lock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+        if let Some(mock) = &*lock {
+            return mock.clone();
+        }
+    }
+
+    let api_key = api_key.to_string();
+    let system_prompt = system_prompt.to_string();
+    let user_prompt = user_prompt.to_string();
+
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to build runtime: {}", e))?;
+
+        rt.block_on(async {
+            let client = reqwest::Client::new();
+            let payload = serde_json::json!({
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 1024,
+                "system": system_prompt,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": user_prompt
+                    }
+                ]
+            });
+
+            let response = client
+                .post("https://api.anthropic.com/v1/messages")
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&payload)
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!("API error status {}: {}", status, text));
+            }
+
+            let res_json: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+
+            let text = res_json["content"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|obj| obj["text"].as_str())
+                .ok_or_else(|| format!("Invalid response format: {:?}", res_json))?;
+
+            Ok(text.to_string())
+        })
+    });
+
+    handle.join().map_err(|_| "Thread panicked".to_string())?
+}
+
+fn sanitize_llm_rule(text: &str) -> String {
+    let mut cleaned = text
+        .replace('\r', "")
+        .replace('\n', "; ")
+        .trim()
+        .to_string();
+
+    while cleaned.starts_with("- ") || cleaned.starts_with("* ") {
+        cleaned = cleaned[2..].trim().to_string();
+    }
+    if cleaned.starts_with("1. ") {
+        cleaned = cleaned[3..].trim().to_string();
+    }
+
+    while cleaned.contains(";;") {
+        cleaned = cleaned.replace(";;", ";");
+    }
+    while cleaned.contains("; ;") {
+        cleaned = cleaned.replace("; ;", ";");
+    }
+    while cleaned.contains("  ") {
+        cleaned = cleaned.replace("  ", " ");
+    }
+
+    cleaned = cleaned.trim_end_matches(';').trim().to_string();
+    cleaned
+}
+
+fn synthesize_rule_text_with_llm_fallback(
+    home: &Path,
+    agent_name: &str,
+    category: &str,
+    mistakes: &[Mistake],
+) -> String {
+    let mut rejection_lines = Vec::new();
+    for mistake in mistakes {
+        if let Some(line) = first_meaningful_line(&mistake.rejection_reason) {
+            if !rejection_lines.contains(&line) {
+                rejection_lines.push(line);
+            }
+            if rejection_lines.len() >= 3 {
+                break;
+            }
+        }
+    }
+
+    let successes_path = home.join("successes").join(format!("{agent_name}.json"));
+    let mut success_summaries = Vec::new();
+    if let Ok(content) = fs::read_to_string(&successes_path) {
+        if let Ok(mut list) = serde_json::from_str::<Vec<Success>>(&content) {
+            list.sort_by(|a, b| {
+                let ts_a = chrono::DateTime::parse_from_rfc3339(&a.recorded_at)
+                    .map(|ts| ts.with_timezone(&chrono::Utc))
+                    .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+                let ts_b = chrono::DateTime::parse_from_rfc3339(&b.recorded_at)
+                    .map(|ts| ts.with_timezone(&chrono::Utc))
+                    .unwrap_or(chrono::DateTime::UNIX_EPOCH);
+                ts_b.cmp(&ts_a)
+            });
+            for s in list {
+                if s.category == category && !success_summaries.contains(&s.summary) {
+                    success_summaries.push(s.summary);
+                }
+            }
+        }
+    }
+
+    if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        if !api_key.trim().is_empty() {
+            let bullets = rejection_lines
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let success_summary = if success_summaries.is_empty() {
+                "No matching success summary recorded yet.".to_string()
+            } else {
+                success_summaries.join("; ")
+            };
+
+            let system_prompt = "You are an expert programming assistant. Write 1-3 concise actionable rules starting with NEVER or ALWAYS to prevent recurrence of the programming mistakes described by the user. Keep it brief and return ONLY the rules themselves on a single line (no newlines, use semicolons to separate rules if there are multiple). Do not write any introduction, markdown, numbering, bullet points, or conclusion.";
+            let user_prompt = format!(
+                "Mistake category: {}\n\nGiven these failures:\n{}\n\nAnd this success:\n{}\n\nWrite the rules:",
+                category, bullets, success_summary
+            );
+
+            tracing::info!("Synthesizing rule via Claude LLM path for category: {}", category);
+            match call_claude_api(&api_key, system_prompt, &user_prompt) {
+                Ok(raw_text) => {
+                    let cleaned = sanitize_llm_rule(&raw_text);
+                    if !cleaned.is_empty() {
+                        return cleaned;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Claude API synthesis failed, falling back to template: {}", e);
+                }
+            }
+        }
+    }
+
+    synthesize_rule_text(category, mistakes)
+}
+
 fn synthesize_rule_text(category: &str, mistakes: &[Mistake]) -> String {
     let base_rule = get_rule_text(category);
     let mut rejection_lines: Vec<&str> = Vec::new();
@@ -750,7 +926,7 @@ pub fn solidify_rule(
             let delta = trigger_count.saturating_sub(existing.trigger_count);
             if delta >= RESOLIDIFY_DELTA {
                 (
-                    synthesize_rule_text(category, &recent_mistakes),
+                    synthesize_rule_text_with_llm_fallback(home, agent_name, category, &recent_mistakes),
                     existing.created_at,
                     true,
                 )
@@ -759,7 +935,7 @@ pub fn solidify_rule(
             }
         }
         None => (
-            synthesize_rule_text(category, &recent_mistakes),
+            synthesize_rule_text_with_llm_fallback(home, agent_name, category, &recent_mistakes),
             chrono::Utc::now().to_rfc3339(),
             true,
         ),
@@ -2655,5 +2831,167 @@ mod tests {
         assert!(!has_cargo_test_pass_evidence("ran: cargo test -> failed"));
         assert!(!has_cargo_test_pass_evidence("test result: ok. 45 passed; 3 failed"));
         assert!(!has_cargo_test_pass_evidence("just normal text"));
+    }
+
+    #[serial_test::serial(mem0_sync)]
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_solidify_rule_llm_synthesis_success() {
+        let home = tmp_home("solidify_llm_success");
+        let agent = "llm-agent";
+        let category = "missing_test_execution";
+
+        // Setup mock response
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = Some(Ok("ALWAYS run cargo test before submitting".to_string()));
+        }
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
+
+        // Write a success
+        let successes_dir = home.join("successes");
+        std::fs::create_dir_all(&successes_dir).unwrap();
+        let success = Success {
+            success_id: "s-1".to_string(),
+            agent_name: agent.to_string(),
+            category: category.to_string(),
+            summary: "Ran cargo test successfully".to_string(),
+            recorded_at: chrono::Utc::now().to_rfc3339(),
+        };
+        std::fs::write(
+            successes_dir.join(format!("{agent}.json")),
+            serde_json::to_string(&vec![success]).unwrap()
+        ).unwrap();
+
+        // Write a mistake
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).unwrap();
+        let mock_mistake = Mistake {
+            id: "m-1".to_string(),
+            task_id: None,
+            agent_name: agent.to_string(),
+            category: category.to_string(),
+            rejection_reason: "cargo test was not run".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        std::fs::write(
+            mistakes_dir.join("m-1.json"),
+            serde_json::to_string(&mock_mistake).unwrap()
+        ).unwrap();
+
+        let rule_id = solidify_rule(&home, agent, category, 3).expect("rule id");
+        let rule_path = home.join("rules").join(format!("{}.json", rule_id));
+        let content = std::fs::read_to_string(&rule_path).unwrap();
+        let rule: Rule = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(rule.rule_text, "ALWAYS run cargo test before submitting");
+
+        // Clean up
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = None;
+        }
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[serial_test::serial(mem0_sync)]
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_solidify_rule_llm_synthesis_fallback_on_api_error() {
+        let home = tmp_home("solidify_llm_api_error");
+        let agent = "llm-agent";
+        let category = "missing_test_execution";
+
+        // Setup mock error response
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = Some(Err("Rate Limit Exceeded".to_string()));
+        }
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
+
+        // Write a mistake
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).unwrap();
+        let mock_mistake = Mistake {
+            id: "m-1".to_string(),
+            task_id: None,
+            agent_name: agent.to_string(),
+            category: category.to_string(),
+            rejection_reason: "cargo test was not run".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        std::fs::write(
+            mistakes_dir.join("m-1.json"),
+            serde_json::to_string(&mock_mistake).unwrap()
+        ).unwrap();
+
+        let rule_id = solidify_rule(&home, agent, category, 3).expect("rule id");
+        let rule_path = home.join("rules").join(format!("{}.json", rule_id));
+        let content = std::fs::read_to_string(&rule_path).unwrap();
+        let rule: Rule = serde_json::from_str(&content).unwrap();
+
+        // Should fall back to the base rule text from get_rule_text + bullets
+        assert!(rule.rule_text.contains("NEVER report VERIFIED without running cargo test"));
+        assert!(rule.rule_text.contains("cargo test was not run"));
+
+        // Clean up
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = None;
+        }
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[serial_test::serial(mem0_sync)]
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_solidify_rule_llm_synthesis_fallback_on_missing_api_key() {
+        let home = tmp_home("solidify_llm_missing_key");
+        let agent = "llm-agent";
+        let category = "missing_test_execution";
+
+        // Setup mock response (should NOT be called)
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = Some(Ok("ALWAYS run cargo test before submitting".to_string()));
+        }
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        // Write a mistake
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).unwrap();
+        let mock_mistake = Mistake {
+            id: "m-1".to_string(),
+            task_id: None,
+            agent_name: agent.to_string(),
+            category: category.to_string(),
+            rejection_reason: "cargo test was not run".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            corrected_at: Some(chrono::Utc::now().to_rfc3339()),
+        };
+        std::fs::write(
+            mistakes_dir.join("m-1.json"),
+            serde_json::to_string(&mock_mistake).unwrap()
+        ).unwrap();
+
+        let rule_id = solidify_rule(&home, agent, category, 3).expect("rule id");
+        let rule_path = home.join("rules").join(format!("{}.json", rule_id));
+        let content = std::fs::read_to_string(&rule_path).unwrap();
+        let rule: Rule = serde_json::from_str(&content).unwrap();
+
+        // Should fall back to the base rule text from get_rule_text + bullets
+        assert!(rule.rule_text.contains("NEVER report VERIFIED without running cargo test"));
+
+        // Clean up
+        {
+            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
+            *mock = None;
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
     }
 }
