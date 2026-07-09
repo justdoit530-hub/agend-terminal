@@ -217,6 +217,100 @@ pub fn list_cross_agent_rules(home: &Path, exclude_agent: &str) -> Vec<Rule> {
     rules
 }
 
+/// Compare mistake counts before and after the most recent rule for a category.
+/// Returns `(before_30d, after_30d)`. Returns `(0, 0)` if no rule exists for category.
+#[allow(dead_code)] // consumed by rule-effectiveness dashboard (external)
+pub fn recurrence_rate_after_rule(category: &str, home: &Path) -> (usize, usize) {
+    let Some(pivot) = latest_rule_created_at_for_category(home, category) else {
+        return (0, 0);
+    };
+
+    let window = chrono::Duration::days(30);
+    let before_start = pivot - window;
+    let after_end = pivot + window;
+
+    let mistakes_dir = home.join("mistakes");
+    let Ok(entries) = fs::read_dir(&mistakes_dir) else {
+        return (0, 0);
+    };
+
+    let mut before = 0usize;
+    let mut after = 0usize;
+    for entry in entries.filter_map(Result::ok) {
+        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(mistake) = serde_json::from_str::<Mistake>(&content) else {
+            continue;
+        };
+        if mistake.category != category {
+            continue;
+        }
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&mistake.timestamp) else {
+            continue;
+        };
+        let ts = ts.with_timezone(&chrono::Utc);
+        if ts >= before_start && ts < pivot {
+            before += 1;
+        } else if ts >= pivot && ts < after_end {
+            after += 1;
+        }
+    }
+
+    (before, after)
+}
+
+fn latest_rule_created_at_for_category(
+    home: &Path,
+    category: &str,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let rules_dir = home.join("rules");
+    let mut latest: Option<chrono::DateTime<chrono::Utc>> = None;
+
+    let mut consider_rule = |rule: &Rule| {
+        if rule.category != category {
+            return;
+        }
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&rule.created_at) else {
+            return;
+        };
+        let ts = ts.with_timezone(&chrono::Utc);
+        if latest.is_none_or(|current| ts > current) {
+            latest = Some(ts);
+        }
+    };
+
+    if let Ok(entries) = fs::read_dir(&rules_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if entry.file_name() == "shared.json" {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if let Ok(rule) = serde_json::from_str::<Rule>(&content) {
+                    consider_rule(&rule);
+                }
+            }
+        }
+    }
+
+    let shared_path = rules_dir.join("shared.json");
+    if let Ok(content) = fs::read_to_string(&shared_path) {
+        if let Ok(shared_rules) = serde_json::from_str::<Vec<Rule>>(&content) {
+            for rule in &shared_rules {
+                consider_rule(rule);
+            }
+        }
+    }
+
+    latest
+}
+
 const MEM0_SYNC_URL: &str = "http://localhost:5174/add";
 
 /// Classify a mistake using regex matching on the rejection text and parent message.
@@ -3265,6 +3359,133 @@ mod tests {
             let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
             *mock = None;
         }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_recurrence_rate_no_rule() {
+        let home = tmp_home("recurrence_no_rule_test");
+        let (before, after) = recurrence_rate_after_rule("lint_failure", &home);
+        assert_eq!((before, after), (0, 0));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_recurrence_rate_rule_reduces_mistakes() {
+        let home = tmp_home("recurrence_reduces_test");
+        let rules_dir = home.join("rules");
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&rules_dir).expect("create rules dir");
+        std::fs::create_dir_all(&mistakes_dir).expect("create mistakes dir");
+
+        let pivot = chrono::Utc::now() - chrono::Duration::days(10);
+        let rule = Rule {
+            id: "rule_agent_lint_failure".to_string(),
+            agent_name: "agent".to_string(),
+            category: "lint_failure".to_string(),
+            rule_text: "No clippy warnings".to_string(),
+            created_at: pivot.to_rfc3339(),
+            trigger_count: 3,
+            synthesis_method: None,
+        };
+        std::fs::write(
+            rules_dir.join("rule_agent_lint_failure.json"),
+            serde_json::to_string(&rule).expect("serialize rule"),
+        )
+        .expect("write rule");
+
+        let category = "lint_failure";
+        let before_offsets = [25, 22, 18, 15, 12];
+        let after_offsets = [5, 8];
+        for (idx, days_before) in before_offsets.iter().enumerate() {
+            let mistake = Mistake {
+                id: format!("mstk_before_{idx}"),
+                task_id: None,
+                agent_name: "agent".to_string(),
+                category: category.to_string(),
+                rejection_reason: "clippy warning".to_string(),
+                timestamp: (pivot - chrono::Duration::days(*days_before)).to_rfc3339(),
+                corrected_at: None,
+            };
+            std::fs::write(
+                mistakes_dir.join(format!("mstk_before_{idx}.json")),
+                serde_json::to_string(&mistake).expect("serialize mistake"),
+            )
+            .expect("write mistake");
+        }
+        for (idx, days_after) in after_offsets.iter().enumerate() {
+            let mistake = Mistake {
+                id: format!("mstk_after_{idx}"),
+                task_id: None,
+                agent_name: "agent".to_string(),
+                category: category.to_string(),
+                rejection_reason: "clippy warning".to_string(),
+                timestamp: (pivot + chrono::Duration::days(*days_after)).to_rfc3339(),
+                corrected_at: None,
+            };
+            std::fs::write(
+                mistakes_dir.join(format!("mstk_after_{idx}.json")),
+                serde_json::to_string(&mistake).expect("serialize mistake"),
+            )
+            .expect("write mistake");
+        }
+
+        let (before, after) = recurrence_rate_after_rule(category, &home);
+        assert_eq!(before, 5);
+        assert_eq!(after, 2);
+        assert!(before > after);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_recurrence_rate_rule_same_category_only() {
+        let home = tmp_home("recurrence_category_filter_test");
+        let rules_dir = home.join("rules");
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&rules_dir).expect("create rules dir");
+        std::fs::create_dir_all(&mistakes_dir).expect("create mistakes dir");
+
+        let pivot = chrono::Utc::now() - chrono::Duration::days(10);
+        let rule = Rule {
+            id: "rule_agent_lint_failure".to_string(),
+            agent_name: "agent".to_string(),
+            category: "lint_failure".to_string(),
+            rule_text: "No clippy warnings".to_string(),
+            created_at: pivot.to_rfc3339(),
+            trigger_count: 3,
+            synthesis_method: None,
+        };
+        std::fs::write(
+            rules_dir.join("rule_agent_lint_failure.json"),
+            serde_json::to_string(&rule).expect("serialize rule"),
+        )
+        .expect("write rule");
+
+        for (idx, (cat, days_before)) in [("lint_failure", 15), ("missing_test_execution", 12)]
+            .iter()
+            .enumerate()
+        {
+            let mistake = Mistake {
+                id: format!("mstk_{idx}"),
+                task_id: None,
+                agent_name: "agent".to_string(),
+                category: (*cat).to_string(),
+                rejection_reason: "issue".to_string(),
+                timestamp: (pivot - chrono::Duration::days(*days_before)).to_rfc3339(),
+                corrected_at: None,
+            };
+            std::fs::write(
+                mistakes_dir.join(format!("mstk_{idx}.json")),
+                serde_json::to_string(&mistake).expect("serialize mistake"),
+            )
+            .expect("write mistake");
+        }
+
+        let (before, after) = recurrence_rate_after_rule("lint_failure", &home);
+        assert_eq!(before, 1);
+        assert_eq!(after, 0);
+
         std::fs::remove_dir_all(&home).ok();
     }
 
