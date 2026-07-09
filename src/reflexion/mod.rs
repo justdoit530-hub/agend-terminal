@@ -977,6 +977,27 @@ pub fn maybe_create_skill(
     }
 }
 
+/// Apply a single exact substring replacement to a skill Markdown file.
+#[allow(dead_code)] // consumed by skill curation pipeline (external)
+pub fn patch_skill(path: &str, old_str: &str, new_str: &str) -> Result<(), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("patch_skill: failed to read {path}: {e}"))?;
+
+    let count = content.matches(old_str).count();
+    if count == 0 {
+        return Err(format!("patch_skill: old_str not found in {path}"));
+    }
+    if count > 1 {
+        return Err(format!(
+            "patch_skill: old_str is ambiguous ({count} occurrences) in {path}"
+        ));
+    }
+
+    let updated = content.replacen(old_str, new_str, 1);
+    fs::write(path, updated).map_err(|e| format!("patch_skill: failed to write {path}: {e}"))?;
+    Ok(())
+}
+
 pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -> Option<String> {
     let path = home.join("successes").join(format!("{agent_name}.json"));
     let successes: Vec<Success> = fs::read_to_string(&path)
@@ -3485,6 +3506,50 @@ mod tests {
         let (before, after) = recurrence_rate_after_rule("lint_failure", &home);
         assert_eq!(before, 1);
         assert_eq!(after, 0);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_patch_skill_success() {
+        let home = tmp_home("patch_skill_success_test");
+        let skill_path = home.join("skill.md");
+        std::fs::write(&skill_path, "alpha OLD beta\n").expect("write skill");
+        let path = skill_path.to_str().expect("skill path");
+
+        patch_skill(path, "OLD", "NEW").expect("patch should succeed");
+
+        let updated = std::fs::read_to_string(&skill_path).expect("read skill");
+        assert_eq!(updated, "alpha NEW beta\n");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_patch_skill_not_found() {
+        let home = tmp_home("patch_skill_not_found_test");
+        let skill_path = home.join("skill.md");
+        std::fs::write(&skill_path, "alpha beta\n").expect("write skill");
+        let path = skill_path.to_str().expect("skill path");
+
+        let err = patch_skill(path, "MISSING", "NEW").expect_err("patch should fail");
+        assert!(err.contains("not found"));
+        assert!(err.contains(path));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_patch_skill_ambiguous() {
+        let home = tmp_home("patch_skill_ambiguous_test");
+        let skill_path = home.join("skill.md");
+        std::fs::write(&skill_path, "OLD text OLD tail\n").expect("write skill");
+        let path = skill_path.to_str().expect("skill path");
+
+        let err = patch_skill(path, "OLD", "NEW").expect_err("patch should fail");
+        assert!(err.contains("ambiguous"));
+        assert!(err.contains("2 occurrences"));
+        assert!(err.contains(path));
 
         std::fs::remove_dir_all(&home).ok();
     }
