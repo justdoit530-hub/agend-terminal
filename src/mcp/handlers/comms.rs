@@ -517,15 +517,23 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 crate::reflexion::mark_mistake_corrected(home, &implementer_agent, category);
                 let evidence =
                     crate::reflexion::extract_evidence_from_report(&evidence_body);
-                if crate::reflexion::should_create_skill(summary, &evidence, success_category) {
-                    crate::reflexion::maybe_create_skill(
-                        &implementer_agent,
-                        success_category,
-                        summary,
-                        &evidence,
-                        home,
-                    );
-                }
+                crate::reflexion::maybe_create_skill(
+                    &implementer_agent,
+                    success_category,
+                    summary,
+                    &evidence,
+                    home,
+                    |instance, message| {
+                        // Fire-and-forget skill-write request (no task board id).
+                        // `update` avoids kind=task's required task_id contract.
+                        let result =
+                            send_to(home, sender, instance, message, "update", None);
+                        match result.get("error").and_then(|e| e.as_str()) {
+                            Some(err) => Err(err.to_string()),
+                            None => Ok(()),
+                        }
+                    },
+                );
             }
 
             // #1666 Phase B (WARN-first): cross-check the checkable evidence and
