@@ -898,82 +898,64 @@ fn skill_auto_dir(_home: &Path) -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|home| home.join(".claude/skills/auto"))
 }
 
-/// Generate a Markdown skill file under `~/.claude/skills/auto/` for complex successes.
-/// Fails silently when the Claude API is unavailable or returns an error.
+/// Dispatch skill creation to `general` for complex successes.
+///
+/// Daemon environments often lack `ANTHROPIC_API_KEY`, so generation is no longer
+/// an in-process HTTP call. Instead we send a write-skill task to the `general`
+/// worker, which uses its own LLM session and writes `~/.claude/skills/auto/`.
+/// Fails silently when criteria are not met or `send_fn` errors.
 pub fn maybe_create_skill(
     agent_name: &str,
     category: &str,
     summary: &str,
     evidence: &str,
     home: &Path,
+    send_fn: impl Fn(&str, &str) -> Result<(), String>,
 ) {
+    if !should_create_skill(summary, evidence, category) {
+        return;
+    }
+
     let Some(auto_dir) = skill_auto_dir(home) else {
         tracing::debug!("skill auto dir unavailable; skipping maybe_create_skill");
         return;
     };
 
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(key) if !key.trim().is_empty() => key,
-        _ => return,
-    };
-
-    let timestamp = chrono::Utc::now().to_rfc3339();
     let date = chrono::Utc::now().format("%Y%m%d").to_string();
-    let user_prompt = format!(
-        "You are extracting a reusable procedure from a completed agent task.\n\n\
-         Task summary: {summary}\n\
-         Category: {category}\n\
-         Agent: {agent_name}\n\
-         Evidence:\n{evidence}\n\n\
-         Generate a concise skill file in this exact format:\n\
-         ---\n\
-         name: {category}-{agent_name}-procedure\n\
-         description: <one sentence: when to use this skill>\n\
-         metadata:\n\
-           category: {category}\n\
-           agent: {agent_name}\n\
-           created_at: {timestamp}\n\
-           source: auto_reflexion\n\
-         ---\n\n\
-         # <Short Title>\n\n\
-         ## When to Use\n\
-         - <condition 1>\n\
-         - <condition 2>\n\n\
-         ## Steps\n\
-         1. <reusable step>\n\
-         2. <reusable step>\n\
-         ...\n\n\
-         ## Key Commands\n\
-         ```\n\
-         <important commands extracted from evidence>\n\
-         ```\n\n\
-         Focus on REUSABLE PROCEDURE. Extract the HOW, not the specific task content.\n\
-         Respond with ONLY the markdown file content, no explanation."
+    let filename = format!("{category}_{agent_name}_{date}.md");
+    let path = auto_dir.join(&filename);
+
+    let prompt = format!(
+        "Write a reusable skill file for `~/.claude/skills/auto/{filename}`.\n\
+         The skill documents a procedure that worked well for category '{category}' by agent '{agent_name}'.\n\n\
+         Evidence summary:\n{summary}\n\nEvidence details:\n{evidence}\n\n\
+         Follow the skill-creator format: frontmatter (name, description, when_to_use), \
+         then a ## Procedure section with concrete numbered steps derived from the evidence.\n\
+         Keep it under 80 lines. Write the file to: {path}\n\
+         Confirm with: SKILL_WRITTEN: {filename}",
+        filename = filename,
+        category = category,
+        agent_name = agent_name,
+        summary = summary,
+        evidence = evidence,
+        path = path.display(),
     );
 
-    let system_prompt =
-        "You write concise, reusable agent skill files in Markdown with YAML frontmatter.";
-
-    let content = match call_claude_api(&api_key, system_prompt, &user_prompt) {
-        Ok(text) if !text.trim().is_empty() => text,
-        Ok(_) => return,
-        Err(e) => {
-            tracing::debug!(?e, "maybe_create_skill: Claude API failed; skipping");
-            return;
+    match send_fn("general", &prompt) {
+        Ok(()) => {
+            tracing::info!(
+                agent_name,
+                category,
+                filename = %filename,
+                "dispatched skill creation to general"
+            );
         }
-    };
-
-    if let Err(e) = fs::create_dir_all(&auto_dir) {
-        tracing::warn!(?e, ?auto_dir, "failed to create skill auto dir");
-        return;
-    }
-
-    let filename = format!("{category}_{agent_name}_{date}.md");
-    let path = auto_dir.join(filename);
-    if let Err(e) = fs::write(&path, content) {
-        tracing::warn!(?e, ?path, "failed to write auto skill file");
-    } else {
-        tracing::info!(?path, agent_name, category, "auto skill file created");
+        Err(e) => {
+            tracing::debug!(
+                ?e,
+                "maybe_create_skill: send to general failed; skipping"
+            );
+        }
     }
 }
 
@@ -3596,28 +3578,13 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn test_skill_file_written_to_auto_dir() {
-        let home = tmp_home("skill_auto_dir_test");
+    fn test_maybe_create_skill_dispatches_to_general() {
+        let home = tmp_home("skill_dispatch_test");
         let auto_dir = home.join("skills_auto");
         std::env::set_var(
             "AGEND_SKILL_AUTO_DIR",
             auto_dir.to_str().expect("invalid auto dir path"),
         );
-        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
-
-        let mock_skill = "---\n\
-            name: missing_test_execution-skill-agent-procedure\n\
-            description: Run cargo test before reporting VERIFIED\n\
-            metadata:\n\
-              category: missing_test_execution\n\
-              agent: skill-agent\n\
-              source: auto_reflexion\n\
-            ---\n\n\
-            # Verify Before Report\n";
-        {
-            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
-            *mock = Some(Ok(mock_skill.to_string()));
-        }
 
         let summary = "VERIFIED\n\n### Summary\nCompleted reflexion synthesis_method Layer 2 implementation with full test coverage.";
         let evidence = "### Evidence\n\
@@ -3626,31 +3593,97 @@ mod tests {
             cited: src/reflexion/mod.rs:155 — synthesis_method field\n\
             cited: src/reflexion/mod.rs:1038 — solidify_rule wiring";
 
+        let sent: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
         maybe_create_skill(
             "skill-agent",
             "missing_test_execution",
             summary,
             evidence,
             &home,
+            |instance, message| {
+                sent.lock()
+                    .unwrap()
+                    .push((instance.to_string(), message.to_string()));
+                Ok(())
+            },
         );
 
+        let calls = sent.lock().unwrap();
+        assert_eq!(calls.len(), 1, "expected one dispatch to general");
+        assert_eq!(calls[0].0, "general");
         let date = chrono::Utc::now().format("%Y%m%d").to_string();
-        let expected_path = auto_dir.join(format!("missing_test_execution_skill-agent_{date}.md"));
+        let filename = format!("missing_test_execution_skill-agent_{date}.md");
         assert!(
-            expected_path.exists(),
-            "expected skill file at {}",
-            expected_path.display()
+            calls[0].1.contains(&format!("SKILL_WRITTEN: {filename}")),
+            "prompt should ask for SKILL_WRITTEN confirm"
         );
-        let content = std::fs::read_to_string(&expected_path).expect("read skill file");
-        assert!(content.contains("name: missing_test_execution-skill-agent-procedure"));
-        assert!(content.contains("# Verify Before Report"));
+        assert!(
+            calls[0].1.contains(auto_dir.join(&filename).to_str().unwrap()),
+            "prompt should include target path"
+        );
+        assert!(calls[0].1.contains(summary));
+        assert!(calls[0].1.contains("missing_test_execution"));
+        assert!(calls[0].1.contains("skill-agent"));
 
-        {
-            let mut mock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
-            *mock = None;
-        }
         std::env::remove_var("AGEND_SKILL_AUTO_DIR");
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_maybe_create_skill_skips_when_criteria_not_met() {
+        let home = tmp_home("skill_dispatch_skip_test");
+        let sent: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+        maybe_create_skill(
+            "skill-agent",
+            "general",
+            "short",
+            "ran: one\n",
+            &home,
+            |instance, message| {
+                sent.lock()
+                    .unwrap()
+                    .push((instance.to_string(), message.to_string()));
+                Ok(())
+            },
+        );
+
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "must not dispatch when should_create_skill is false"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn test_maybe_create_skill_send_error_is_silent() {
+        let home = tmp_home("skill_dispatch_err_test");
+        let auto_dir = home.join("skills_auto");
+        std::env::set_var(
+            "AGEND_SKILL_AUTO_DIR",
+            auto_dir.to_str().expect("invalid auto dir path"),
+        );
+
+        let summary = "VERIFIED\n\n### Summary\nCompleted reflexion synthesis_method Layer 2 implementation with full test coverage.";
+        let evidence = "### Evidence\n\
+            ran: cargo test --bin agend-terminal -- reflexion → 42 passed\n\
+            ran: cargo clippy --all-targets -- -D warnings → clean\n\
+            cited: src/reflexion/mod.rs:155 — synthesis_method field\n\
+            cited: src/reflexion/mod.rs:1038 — solidify_rule wiring";
+
+        // Must not panic when send_fn fails.
+        maybe_create_skill(
+            "skill-agent",
+            "missing_test_execution",
+            summary,
+            evidence,
+            &home,
+            |_instance, _message| Err("general offline".to_string()),
+        );
+
+        std::env::remove_var("AGEND_SKILL_AUTO_DIR");
         std::fs::remove_dir_all(&home).ok();
     }
 
