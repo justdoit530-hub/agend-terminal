@@ -980,6 +980,27 @@ pub fn patch_skill(path: &str, old_str: &str, new_str: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Apply a single exact substring replacement to a skill Markdown file.
+#[allow(dead_code)] // consumed by skill curation pipeline (external)
+pub fn patch_skill(path: &str, old_str: &str, new_str: &str) -> Result<(), String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("patch_skill: failed to read {path}: {e}"))?;
+
+    let count = content.matches(old_str).count();
+    if count == 0 {
+        return Err(format!("patch_skill: old_str not found in {path}"));
+    }
+    if count > 1 {
+        return Err(format!(
+            "patch_skill: old_str is ambiguous ({count} occurrences) in {path}"
+        ));
+    }
+
+    let updated = content.replacen(old_str, new_str, 1);
+    fs::write(path, updated).map_err(|e| format!("patch_skill: failed to write {path}: {e}"))?;
+    Ok(())
+}
+
 pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -> Option<String> {
     let path = home.join("successes").join(format!("{agent_name}.json"));
     let successes: Vec<Success> = fs::read_to_string(&path)
