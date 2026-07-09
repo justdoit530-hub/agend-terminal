@@ -74,11 +74,7 @@ pub fn mark_mistake_corrected<'a>(
     }
 }
 
-pub fn auto_correct_on_ci_pass(
-    home: &Path,
-    agent_name: &str,
-    category_hint: Option<&str>,
-) {
+pub fn auto_correct_on_ci_pass(home: &Path, agent_name: &str, category_hint: Option<&str>) {
     if let Some(cat) = category_hint {
         mark_mistake_corrected(home, agent_name, cat);
     } else {
@@ -111,11 +107,17 @@ pub fn has_cargo_test_pass_evidence(body: &str) -> bool {
     if !has_test {
         return false;
     }
-    let has_ok = b.contains("test result: ok") || b.contains("passed") || b.contains("success") || b.contains("green");
+    let has_ok = b.contains("test result: ok")
+        || b.contains("passed")
+        || b.contains("success")
+        || b.contains("green");
     if !has_ok {
         return false;
     }
-    let has_fail = b.contains("failed") || b.contains("failures") || b.contains("error") || b.contains("panic");
+    let has_fail = b.contains("failed")
+        || b.contains("failures")
+        || b.contains("error")
+        || b.contains("panic");
     if has_fail {
         static ZERO_FAIL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
         let re = ZERO_FAIL_RE.get_or_init(|| {
@@ -402,10 +404,15 @@ fn first_meaningful_line(text: &str) -> Option<&str> {
 }
 
 #[cfg(test)]
-static CLAUDE_API_RESPONSE_MOCK: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
+static CLAUDE_API_RESPONSE_MOCK: std::sync::Mutex<Option<Result<String, String>>> =
+    std::sync::Mutex::new(None);
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-fn call_claude_api(api_key: &str, system_prompt: &str, user_prompt: &str) -> Result<String, String> {
+fn call_claude_api(
+    api_key: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> Result<String, String> {
     #[cfg(test)]
     {
         let lock = CLAUDE_API_RESPONSE_MOCK.lock().unwrap();
@@ -559,7 +566,10 @@ fn synthesize_rule_text_with_llm_fallback(
                 category, bullets, success_summary
             );
 
-            tracing::info!("Synthesizing rule via Claude LLM path for category: {}", category);
+            tracing::info!(
+                "Synthesizing rule via Claude LLM path for category: {}",
+                category
+            );
             match call_claude_api(&api_key, system_prompt, &user_prompt) {
                 Ok(raw_text) => {
                     let cleaned = sanitize_llm_rule(&raw_text);
@@ -568,7 +578,10 @@ fn synthesize_rule_text_with_llm_fallback(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Claude API synthesis failed, falling back to template: {}", e);
+                    tracing::warn!(
+                        "Claude API synthesis failed, falling back to template: {}",
+                        e
+                    );
                 }
             }
         }
@@ -666,6 +679,11 @@ pub fn record_mistake(
         for entry in entries.filter_map(Result::ok) {
             if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
                 if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(m_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if m_val["orphaned"].as_bool() == Some(true) {
+                            continue;
+                        }
+                    }
                     if let Ok(m) = serde_json::from_str::<Mistake>(&content) {
                         if m.agent_name == real_agent_name && m.category == category {
                             if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&m.timestamp) {
@@ -823,6 +841,87 @@ pub fn cleanup_old_mistakes(home: &Path) {
             }
         }
     }
+    sweep_orphan_mistakes(home);
+}
+
+pub fn sweep_orphan_mistakes(home: &Path) {
+    let fleet_path = crate::fleet::fleet_yaml_path(home);
+    let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) else {
+        tracing::warn!(?fleet_path, "failed to load fleet.yaml, skipping sweep");
+        return;
+    };
+    let active_agents: std::collections::HashSet<String> =
+        config.instances.keys().cloned().collect();
+
+    let mistakes_dir = home.join("mistakes");
+    let Ok(entries) = fs::read_dir(&mistakes_dir) else {
+        return;
+    };
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(mut m_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let mut is_orphan = false;
+                    let mut agent_name = String::new();
+                    if let Some(name) = m_val["agent_name"].as_str() {
+                        if !active_agents.contains(name) {
+                            if let Some(timestamp_str) = m_val["timestamp"].as_str() {
+                                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp_str)
+                                {
+                                    if ts.with_timezone(&chrono::Utc) < cutoff {
+                                        is_orphan = true;
+                                        agent_name = name.to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if is_orphan && m_val["orphaned"].as_bool() != Some(true) {
+                        m_val["orphaned"] = serde_json::Value::Bool(true);
+                        if let Ok(serialized) = serde_json::to_string_pretty(&m_val) {
+                            if let Err(e) = fs::write(&path, serialized) {
+                                tracing::warn!(?e, ?path, "failed to write orphaned mistake file");
+                            } else {
+                                copy_orphaned_agent_rules_to_shared(home, &agent_name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn copy_orphaned_agent_rules_to_shared(home: &Path, agent_name: &str) {
+    let rules_dir = home.join("rules");
+    let Ok(entries) = fs::read_dir(&rules_dir) else {
+        return;
+    };
+    let shared_path = rules_dir.join("shared.json");
+    for entry in entries.filter_map(Result::ok) {
+        if entry.path().extension().is_some_and(|ext| ext == "json") {
+            if entry.file_name() == "shared.json" {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                if let Ok(rule) = serde_json::from_str::<Rule>(&content) {
+                    if rule.agent_name == agent_name {
+                        if let Err(e) = merge_to_shared_rules(&shared_path, &rule) {
+                            tracing::warn!(
+                                ?e,
+                                ?shared_path,
+                                "failed to merge orphaned agent rule to shared"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn merge_to_shared_rules(shared_path: &Path, new_rule: &Rule) -> std::io::Result<()> {
@@ -879,6 +978,11 @@ pub fn solidify_rule(
         for entry in entries.filter_map(Result::ok) {
             if entry.path().extension().and_then(|s| s.to_str()) == Some("json") {
                 if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(m_val) = serde_json::from_str::<serde_json::Value>(&content) {
+                        if m_val["orphaned"].as_bool() == Some(true) {
+                            continue;
+                        }
+                    }
                     if let Ok(m) = serde_json::from_str::<Mistake>(&content) {
                         if m.agent_name == agent_name && m.category == category {
                             recent_mistakes.push(m);
@@ -926,7 +1030,12 @@ pub fn solidify_rule(
             let delta = trigger_count.saturating_sub(existing.trigger_count);
             if delta >= RESOLIDIFY_DELTA {
                 (
-                    synthesize_rule_text_with_llm_fallback(home, agent_name, category, &recent_mistakes),
+                    synthesize_rule_text_with_llm_fallback(
+                        home,
+                        agent_name,
+                        category,
+                        &recent_mistakes,
+                    ),
                     existing.created_at,
                     true,
                 )
@@ -2816,7 +2925,8 @@ mod tests {
         auto_correct_on_ci_pass(&home, agent, None);
 
         // Verify mistake is marked corrected
-        let content = std::fs::read_to_string(mistakes_dir.join(format!("{}.json", mistake.id))).expect("read mistake file");
+        let content = std::fs::read_to_string(mistakes_dir.join(format!("{}.json", mistake.id)))
+            .expect("read mistake file");
         let updated: Mistake = serde_json::from_str(&content).expect("deserialize mistake");
         assert!(updated.corrected_at.is_some());
 
@@ -2827,9 +2937,13 @@ mod tests {
     fn test_has_cargo_test_pass_evidence() {
         assert!(has_cargo_test_pass_evidence("ran: cargo test -> passed"));
         assert!(has_cargo_test_pass_evidence("ran: cargo test -> success"));
-        assert!(has_cargo_test_pass_evidence("test result: ok. 45 passed; 0 failed"));
+        assert!(has_cargo_test_pass_evidence(
+            "test result: ok. 45 passed; 0 failed"
+        ));
         assert!(!has_cargo_test_pass_evidence("ran: cargo test -> failed"));
-        assert!(!has_cargo_test_pass_evidence("test result: ok. 45 passed; 3 failed"));
+        assert!(!has_cargo_test_pass_evidence(
+            "test result: ok. 45 passed; 3 failed"
+        ));
         assert!(!has_cargo_test_pass_evidence("just normal text"));
     }
 
@@ -2860,8 +2974,9 @@ mod tests {
         };
         std::fs::write(
             successes_dir.join(format!("{agent}.json")),
-            serde_json::to_string(&vec![success]).unwrap()
-        ).unwrap();
+            serde_json::to_string(&vec![success]).unwrap(),
+        )
+        .unwrap();
 
         // Write a mistake
         let mistakes_dir = home.join("mistakes");
@@ -2877,8 +2992,9 @@ mod tests {
         };
         std::fs::write(
             mistakes_dir.join("m-1.json"),
-            serde_json::to_string(&mock_mistake).unwrap()
-        ).unwrap();
+            serde_json::to_string(&mock_mistake).unwrap(),
+        )
+        .unwrap();
 
         let rule_id = solidify_rule(&home, agent, category, 3).expect("rule id");
         let rule_path = home.join("rules").join(format!("{}.json", rule_id));
@@ -2925,8 +3041,9 @@ mod tests {
         };
         std::fs::write(
             mistakes_dir.join("m-1.json"),
-            serde_json::to_string(&mock_mistake).unwrap()
-        ).unwrap();
+            serde_json::to_string(&mock_mistake).unwrap(),
+        )
+        .unwrap();
 
         let rule_id = solidify_rule(&home, agent, category, 3).expect("rule id");
         let rule_path = home.join("rules").join(format!("{}.json", rule_id));
@@ -2934,7 +3051,9 @@ mod tests {
         let rule: Rule = serde_json::from_str(&content).unwrap();
 
         // Should fall back to the base rule text from get_rule_text + bullets
-        assert!(rule.rule_text.contains("NEVER report VERIFIED without running cargo test"));
+        assert!(rule
+            .rule_text
+            .contains("NEVER report VERIFIED without running cargo test"));
         assert!(rule.rule_text.contains("cargo test was not run"));
 
         // Clean up
@@ -2975,8 +3094,9 @@ mod tests {
         };
         std::fs::write(
             mistakes_dir.join("m-1.json"),
-            serde_json::to_string(&mock_mistake).unwrap()
-        ).unwrap();
+            serde_json::to_string(&mock_mistake).unwrap(),
+        )
+        .unwrap();
 
         let rule_id = solidify_rule(&home, agent, category, 3).expect("rule id");
         let rule_path = home.join("rules").join(format!("{}.json", rule_id));
@@ -2984,7 +3104,9 @@ mod tests {
         let rule: Rule = serde_json::from_str(&content).unwrap();
 
         // Should fall back to the base rule text from get_rule_text + bullets
-        assert!(rule.rule_text.contains("NEVER report VERIFIED without running cargo test"));
+        assert!(rule
+            .rule_text
+            .contains("NEVER report VERIFIED without running cargo test"));
 
         // Clean up
         {
@@ -2993,5 +3115,126 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
     }
+
+    #[test]
+    fn test_sweep_orphan_mistakes() {
+        let home = tmp_home("sweep_orphan_mistakes_test");
+        let mistakes_dir = home.join("mistakes");
+        let rules_dir = home.join("rules");
+        std::fs::create_dir_all(&mistakes_dir).expect("failed to create mistakes dir");
+        std::fs::create_dir_all(&rules_dir).expect("failed to create rules dir");
+
+        // Create fleet.yaml
+        let fleet_yaml = r#"
+instances:
+  agy-worker-4:
+    backend: agy
+    id: 208500a4-df14-420a-8f14-4ff9fa66e7d0
+"#;
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), fleet_yaml)
+            .expect("failed to write fleet.yaml");
+
+        // 1. Mistake for active agent (agy-worker-4), > 30 days old -> should NOT be orphaned
+        let time_old = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        let m_active = Mistake {
+            id: "mstk_active".to_string(),
+            task_id: None,
+            agent_name: "agy-worker-4".to_string(),
+            category: "lint_failure".to_string(),
+            rejection_reason: "unused variable".to_string(),
+            timestamp: time_old.clone(),
+            corrected_at: None,
+        };
+        std::fs::write(
+            mistakes_dir.join(format!("{}.json", m_active.id)),
+            serde_json::to_string(&m_active).expect("failed to serialize active mistake"),
+        )
+        .expect("failed to write active mistake");
+
+        // 2. Mistake for orphan agent (test-dynamic), > 30 days old -> should be orphaned
+        let m_orphan_old = Mistake {
+            id: "mstk_orphan_old".to_string(),
+            task_id: None,
+            agent_name: "test-dynamic".to_string(),
+            category: "lint_failure".to_string(),
+            rejection_reason: "clippy warning".to_string(),
+            timestamp: time_old.clone(),
+            corrected_at: None,
+        };
+        std::fs::write(
+            mistakes_dir.join(format!("{}.json", m_orphan_old.id)),
+            serde_json::to_string(&m_orphan_old).expect("failed to serialize old orphan mistake"),
+        )
+        .expect("failed to write old orphan mistake");
+
+        // 3. Mistake for orphan agent (test-dynamic), < 30 days old -> should NOT be orphaned
+        let time_new = (chrono::Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+        let m_orphan_new = Mistake {
+            id: "mstk_orphan_new".to_string(),
+            task_id: None,
+            agent_name: "test-dynamic".to_string(),
+            category: "lint_failure".to_string(),
+            rejection_reason: "clippy warning 2".to_string(),
+            timestamp: time_new,
+            corrected_at: None,
+        };
+        std::fs::write(
+            mistakes_dir.join(format!("{}.json", m_orphan_new.id)),
+            serde_json::to_string(&m_orphan_new).expect("failed to serialize new orphan mistake"),
+        )
+        .expect("failed to write new orphan mistake");
+
+        // 4. Solidified rule for orphan agent (test-dynamic)
+        let rule_orphan = Rule {
+            id: "rule_test-dynamic_lint_failure".to_string(),
+            agent_name: "test-dynamic".to_string(),
+            category: "lint_failure".to_string(),
+            rule_text: "Clean compile required for test-dynamic".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            trigger_count: 3,
+        };
+        std::fs::write(
+            rules_dir.join(format!("{}.json", rule_orphan.id)),
+            serde_json::to_string(&rule_orphan).expect("failed to serialize orphan rule"),
+        )
+        .expect("failed to write orphan rule");
+
+        // Run sweep
+        sweep_orphan_mistakes(&home);
+
+        // Read and assert results
+        let m_active_read: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mistakes_dir.join(format!("{}.json", m_active.id)))
+                .expect("failed to read active mistake"),
+        )
+        .expect("failed to parse active mistake");
+        assert_eq!(m_active_read["orphaned"].as_bool(), None);
+
+        let m_orphan_old_read: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mistakes_dir.join(format!("{}.json", m_orphan_old.id)))
+                .expect("failed to read old orphan mistake"),
+        )
+        .expect("failed to parse old orphan mistake");
+        assert_eq!(m_orphan_old_read["orphaned"].as_bool(), Some(true));
+
+        let m_orphan_new_read: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mistakes_dir.join(format!("{}.json", m_orphan_new.id)))
+                .expect("failed to read new orphan mistake"),
+        )
+        .expect("failed to parse new orphan mistake");
+        assert_eq!(m_orphan_new_read["orphaned"].as_bool(), None);
+
+        // Verify rule copied to shared.json
+        let shared_path = rules_dir.join("shared.json");
+        assert!(shared_path.exists());
+        let shared_rules: Vec<Rule> = serde_json::from_str(
+            &std::fs::read_to_string(&shared_path).expect("failed to read shared rules"),
+        )
+        .expect("failed to parse shared rules");
+        assert_eq!(shared_rules.len(), 1);
+        assert_eq!(shared_rules[0].agent_name, "test-dynamic");
+        assert_eq!(shared_rules[0].id, rule_orphan.id);
+
+        std::fs::remove_dir_all(&home).ok();
     }
 }
