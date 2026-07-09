@@ -3716,6 +3716,7 @@ fn test_list_rules_via_mcp() {
         rule_text: "Don't forget tests".to_string(),
         created_at: "2026-06-26T12:00:00Z".to_string(),
         trigger_count: 3,
+        synthesis_method: None,
     };
     std::fs::write(
         rules_dir.join("rule_test.json"),
@@ -3768,6 +3769,7 @@ fn test_dispatch_task_injects_rules() {
         rule_text: "Always run tests before push".to_string(),
         created_at: "2026-06-26T12:00:00Z".to_string(),
         trigger_count: 1,
+        synthesis_method: None,
     };
     std::fs::write(
         rules_dir.join("rule_inject.json"),
@@ -3837,6 +3839,7 @@ fn test_dispatch_task_injects_cross_agent_rules() {
         rule_text: "Always run tests before push".to_string(),
         created_at: "2026-06-26T12:00:00Z".to_string(),
         trigger_count: 1,
+        synthesis_method: None,
     };
     let cross_rule = crate::reflexion::Rule {
         id: "rule_agent_b".to_string(),
@@ -3845,6 +3848,7 @@ fn test_dispatch_task_injects_cross_agent_rules() {
         rule_text: "Capture reviewer evidence before reporting".to_string(),
         created_at: "2026-06-26T12:01:00Z".to_string(),
         trigger_count: 2,
+        synthesis_method: None,
     };
     std::fs::write(
         rules_dir.join("rule_agent_a.json"),
@@ -3899,6 +3903,7 @@ fn test_dispatch_task_dedupes_cross_agent_rule_text() {
         rule_text: "Always run tests before push".to_string(),
         created_at: "2026-06-26T12:00:00Z".to_string(),
         trigger_count: 1,
+        synthesis_method: None,
     };
     let duplicate_cross_rule = crate::reflexion::Rule {
         id: "rule_agent_b_duplicate".to_string(),
@@ -3907,6 +3912,7 @@ fn test_dispatch_task_dedupes_cross_agent_rule_text() {
         rule_text: "Always run tests before push".to_string(),
         created_at: "2026-06-26T12:01:00Z".to_string(),
         trigger_count: 2,
+        synthesis_method: None,
     };
     let unique_cross_rule = crate::reflexion::Rule {
         id: "rule_agent_b_unique".to_string(),
@@ -3915,6 +3921,7 @@ fn test_dispatch_task_dedupes_cross_agent_rule_text() {
         rule_text: "Collect evidence before reporting".to_string(),
         created_at: "2026-06-26T12:02:00Z".to_string(),
         trigger_count: 3,
+        synthesis_method: None,
     };
     std::fs::write(
         rules_dir.join("rule_agent_a_duplicate.json"),
@@ -3977,6 +3984,7 @@ fn test_dispatch_task_filters_irrelevant_cross_agent_rules() {
         rule_text: "Always run cargo test before push".to_string(),
         created_at: "2026-06-26T12:00:00Z".to_string(),
         trigger_count: 1,
+        synthesis_method: None,
     };
     let pr_rule = crate::reflexion::Rule {
         id: "rule_pr_irrelevant".to_string(),
@@ -3985,6 +3993,7 @@ fn test_dispatch_task_filters_irrelevant_cross_agent_rules() {
         rule_text: "NEVER open a PR to suzuke/agend-terminal".to_string(),
         created_at: "2026-06-26T12:01:00Z".to_string(),
         trigger_count: 2,
+        synthesis_method: None,
     };
     std::fs::write(
         rules_dir.join("rule_test_relevant.json"),

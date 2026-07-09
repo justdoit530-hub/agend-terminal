@@ -150,6 +150,9 @@ pub struct Rule {
     pub created_at: String,
     #[serde(default)]
     pub trigger_count: usize,
+    /// How `rule_text` was produced: `"llm"` or `"template"`. Absent on legacy rules.
+    #[serde(default)]
+    pub synthesis_method: Option<String>,
 }
 
 /// List all solidified rules for a specific agent.
@@ -508,12 +511,15 @@ fn sanitize_llm_rule(text: &str) -> String {
     cleaned
 }
 
+const SYNTHESIS_METHOD_LLM: &str = "llm";
+const SYNTHESIS_METHOD_TEMPLATE: &str = "template";
+
 fn synthesize_rule_text_with_llm_fallback(
     home: &Path,
     agent_name: &str,
     category: &str,
     mistakes: &[Mistake],
-) -> String {
+) -> (String, String) {
     let mut rejection_lines = Vec::new();
     for mistake in mistakes {
         if let Some(line) = first_meaningful_line(&mistake.rejection_reason) {
@@ -574,7 +580,7 @@ fn synthesize_rule_text_with_llm_fallback(
                 Ok(raw_text) => {
                     let cleaned = sanitize_llm_rule(&raw_text);
                     if !cleaned.is_empty() {
-                        return cleaned;
+                        return (cleaned, SYNTHESIS_METHOD_LLM.to_string());
                     }
                 }
                 Err(e) => {
@@ -587,7 +593,10 @@ fn synthesize_rule_text_with_llm_fallback(
         }
     }
 
-    synthesize_rule_text(category, mistakes)
+    (
+        synthesize_rule_text(category, mistakes),
+        SYNTHESIS_METHOD_TEMPLATE.to_string(),
+    )
 }
 
 fn synthesize_rule_text(category: &str, mistakes: &[Mistake]) -> String {
@@ -789,6 +798,7 @@ pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -
         rule_text: rule_text.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         trigger_count: recent.len(),
+        synthesis_method: None,
     };
 
     if let Some(parent) = rule_path.parent() {
@@ -1025,29 +1035,31 @@ pub fn solidify_rule(
         .ok()
         .and_then(|content| serde_json::from_str(&content).ok());
 
-    let (rule_text, created_at, refresh_external) = match existing_rule {
+    let (rule_text, synthesis_method, created_at, refresh_external) = match existing_rule {
         Some(existing) => {
             let delta = trigger_count.saturating_sub(existing.trigger_count);
             if delta >= RESOLIDIFY_DELTA {
-                (
-                    synthesize_rule_text_with_llm_fallback(
-                        home,
-                        agent_name,
-                        category,
-                        &recent_mistakes,
-                    ),
-                    existing.created_at,
-                    true,
-                )
+                let (text, method) = synthesize_rule_text_with_llm_fallback(
+                    home,
+                    agent_name,
+                    category,
+                    &recent_mistakes,
+                );
+                (text, Some(method), existing.created_at, true)
             } else {
-                (existing.rule_text, existing.created_at, false)
+                (
+                    existing.rule_text,
+                    existing.synthesis_method,
+                    existing.created_at,
+                    false,
+                )
             }
         }
-        None => (
-            synthesize_rule_text_with_llm_fallback(home, agent_name, category, &recent_mistakes),
-            chrono::Utc::now().to_rfc3339(),
-            true,
-        ),
+        None => {
+            let (text, method) =
+                synthesize_rule_text_with_llm_fallback(home, agent_name, category, &recent_mistakes);
+            (text, Some(method), chrono::Utc::now().to_rfc3339(), true)
+        }
     };
 
     let rule = Rule {
@@ -1057,6 +1069,7 @@ pub fn solidify_rule(
         rule_text: rule_text.clone(),
         trigger_count,
         created_at,
+        synthesis_method,
     };
 
     if let Ok(serialized) = serde_json::to_string_pretty(&rule) {
@@ -1930,6 +1943,7 @@ mod tests {
                 rule_text: "No lint warnings".to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
                 trigger_count: 2,
+                synthesis_method: None,
             };
 
             spawn_mem0_sync(&rule);
@@ -2018,6 +2032,7 @@ mod tests {
             rule_text: "Don't forget tests".to_string(),
             created_at: "2026-06-26T12:00:00Z".to_string(),
             trigger_count: 3,
+            synthesis_method: None,
         };
         let rule_b = Rule {
             id: "rule_agent_b_cat".to_string(),
@@ -2026,6 +2041,7 @@ mod tests {
             rule_text: "No lint warnings".to_string(),
             created_at: "2026-06-26T12:05:00Z".to_string(),
             trigger_count: 4,
+            synthesis_method: None,
         };
 
         std::fs::write(
@@ -2854,6 +2870,7 @@ mod tests {
             rule_text: "Don't forget tests".to_string(),
             created_at: "2026-06-26T12:00:00Z".to_string(),
             trigger_count: 3,
+            synthesis_method: None,
         };
 
         // 1. Merge to shared rules
@@ -2873,6 +2890,7 @@ mod tests {
             rule_text: "Don't forget tests - clippy clean required".to_string(),
             created_at: "2026-06-26T13:00:00Z".to_string(),
             trigger_count: 5,
+            synthesis_method: None,
         };
         merge_to_shared_rules(&rules_dir.join("shared.json"), &rule_b).expect("merge failed");
 
@@ -3002,6 +3020,10 @@ mod tests {
         let rule: Rule = serde_json::from_str(&content).unwrap();
 
         assert_eq!(rule.rule_text, "ALWAYS run cargo test before submitting");
+        assert_eq!(
+            rule.synthesis_method.as_deref(),
+            Some(SYNTHESIS_METHOD_LLM)
+        );
 
         // Clean up
         {
@@ -3055,6 +3077,10 @@ mod tests {
             .rule_text
             .contains("NEVER report VERIFIED without running cargo test"));
         assert!(rule.rule_text.contains("cargo test was not run"));
+        assert_eq!(
+            rule.synthesis_method.as_deref(),
+            Some(SYNTHESIS_METHOD_TEMPLATE)
+        );
 
         // Clean up
         {
@@ -3107,6 +3133,10 @@ mod tests {
         assert!(rule
             .rule_text
             .contains("NEVER report VERIFIED without running cargo test"));
+        assert_eq!(
+            rule.synthesis_method.as_deref(),
+            Some(SYNTHESIS_METHOD_TEMPLATE)
+        );
 
         // Clean up
         {
@@ -3114,6 +3144,21 @@ mod tests {
             *mock = None;
         }
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_rule_deserializes_without_synthesis_method() {
+        let legacy_json = r#"{
+            "rule_id": "rule_legacy-agent_lint_failure",
+            "agent_name": "legacy-agent",
+            "category": "lint_failure",
+            "rule_text": "NEVER submit code with clippy warnings",
+            "created_at": "2026-06-01T00:00:00Z",
+            "trigger_count": 3
+        }"#;
+        let rule: Rule = serde_json::from_str(legacy_json).expect("legacy rule should parse");
+        assert_eq!(rule.agent_name, "legacy-agent");
+        assert!(rule.synthesis_method.is_none());
     }
 
     #[test]
@@ -3192,6 +3237,7 @@ instances:
             rule_text: "Clean compile required for test-dynamic".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             trigger_count: 3,
+            synthesis_method: None,
         };
         std::fs::write(
             rules_dir.join(format!("{}.json", rule_orphan.id)),
