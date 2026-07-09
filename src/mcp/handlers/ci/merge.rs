@@ -237,12 +237,15 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         // reported merged:true while still OPEN, commits unpushed). Verify the
         // post-condition with `gh pr view` before claiming success.
         Ok(crate::scm::MergeOutcome::Submitted) => match verify_merge_landed(&repo, pr) {
-            MergeVerdict::Confirmed(merge_commit) => json!({
-                "merged": true,
-                "pr": pr,
-                "forced": force,
-                "mergeCommit": merge_commit,
-            }),
+            MergeVerdict::Confirmed(merge_commit) => {
+                crate::reflexion::auto_correct_on_ci_pass(home, instance_name, None);
+                json!({
+                    "merged": true,
+                    "pr": pr,
+                    "forced": force,
+                    "mergeCommit": merge_commit,
+                })
+            }
             MergeVerdict::Unconfirmed {
                 state,
                 merge_state_status,

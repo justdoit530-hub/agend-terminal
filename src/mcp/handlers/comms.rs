@@ -437,6 +437,33 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
         args["correlation_id"].as_str(),
         args["artifacts"].as_str(),
     );
+
+    let correlation_id = args["correlation_id"].as_str();
+    let mut branch = None;
+    let mut task_id = None;
+    if let Some(cid) = correlation_id {
+        if cid.contains('@') {
+            branch = cid.split('@').nth(1);
+        } else {
+            task_id = Some(cid);
+        }
+    }
+
+    let implementer_agent = {
+        let resolved = if let Some(br) = branch {
+            crate::binding::find_agent_by_branch_or_task(home, br, task_id)
+        } else if let Some(tid) = task_id {
+            crate::binding::find_agent_by_branch_or_task(home, "", Some(tid))
+        } else {
+            None
+        };
+        resolved.unwrap_or_else(|| sender.as_str().to_string())
+    };
+
+    if crate::reflexion::has_cargo_test_pass_evidence(&msg) {
+        crate::reflexion::auto_correct_on_ci_pass(home, &implementer_agent, None);
+    }
+
     let result = {
         let reviewed_head = args["reviewed_head"].as_str();
 
@@ -467,13 +494,14 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             }
 
             if verdict == super::comms_gates::Verdict::Rejected {
+                let category = args["category"].as_str();
                 crate::reflexion::record_mistake(
                     home,
                     target,
-                    sender.as_str(),
+                    &implementer_agent,
                     summary,
                     args,
-                    None,
+                    category,
                 );
             }
             if verdict == super::comms_gates::Verdict::Verified {
@@ -482,11 +510,11 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                 crate::reflexion::record_success(
                     home,
                     target,
-                    sender.as_str(),
+                    &implementer_agent,
                     summary,
                     success_category,
                 );
-                crate::reflexion::mark_mistake_corrected(home, sender.as_str(), category);
+                crate::reflexion::mark_mistake_corrected(home, &implementer_agent, category);
             }
 
             // #1666 Phase B (WARN-first): cross-check the checkable evidence and

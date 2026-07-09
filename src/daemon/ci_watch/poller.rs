@@ -1883,8 +1883,12 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
             correlation_id,
             supersede_token,
             ..
+        } => {
+            deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token);
+            crate::reflexion::auto_correct_on_ci_pass(&event.home, target, None);
+            true
         }
-        | crate::daemon::event_bus::EventKind::CiFail {
+        crate::daemon::event_bus::EventKind::CiFail {
             target,
             body,
             correlation_id,

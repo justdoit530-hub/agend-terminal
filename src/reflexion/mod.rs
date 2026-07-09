@@ -74,6 +74,61 @@ pub fn mark_mistake_corrected<'a>(
     }
 }
 
+pub fn auto_correct_on_ci_pass(
+    home: &Path,
+    agent_name: &str,
+    category_hint: Option<&str>,
+) {
+    if let Some(cat) = category_hint {
+        mark_mistake_corrected(home, agent_name, cat);
+    } else {
+        let mistakes_dir = home.join("mistakes");
+        let Ok(entries) = fs::read_dir(&mistakes_dir) else {
+            return;
+        };
+        let mut categories = std::collections::HashSet::new();
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Ok(m) = serde_json::from_str::<Mistake>(&content) {
+                        if m.agent_name == agent_name && m.corrected_at.is_none() {
+                            categories.insert(m.category);
+                        }
+                    }
+                }
+            }
+        }
+        for cat in categories {
+            mark_mistake_corrected(home, agent_name, cat.as_str());
+        }
+    }
+}
+
+pub fn has_cargo_test_pass_evidence(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    let has_test = b.contains("cargo test") || b.contains("test result: ok");
+    if !has_test {
+        return false;
+    }
+    let has_ok = b.contains("test result: ok") || b.contains("passed") || b.contains("success") || b.contains("green");
+    if !has_ok {
+        return false;
+    }
+    let has_fail = b.contains("failed") || b.contains("failures") || b.contains("error") || b.contains("panic");
+    if has_fail {
+        static ZERO_FAIL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let re = ZERO_FAIL_RE.get_or_init(|| {
+            regex::Regex::new(r"(?i)(0\s+failed|0\s+failures|no\s+failures|zero\s+failures|zero\s+failed|0\s+errors)")
+                .expect("valid zero failures regex")
+        });
+        if !re.is_match(&b) {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Success {
     pub success_id: String,
@@ -2555,5 +2610,50 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_auto_correct_on_ci_pass() {
+        let home = tmp_home("auto_correct_ci_test");
+        let agent = "test-agent-ci";
+        let category = "test_failure";
+        let mistakes_dir = home.join("mistakes");
+        std::fs::create_dir_all(&mistakes_dir).expect("create mistakes dir");
+
+        // Write a mistake
+        let mistake = Mistake {
+            id: "mstk_ci_1".to_string(),
+            task_id: Some("t-ci-1".to_string()),
+            agent_name: agent.to_string(),
+            category: category.to_string(),
+            rejection_reason: "Tests failed".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            corrected_at: None,
+        };
+        std::fs::write(
+            mistakes_dir.join(format!("{}.json", mistake.id)),
+            serde_json::to_string(&mistake).expect("serialize mistake"),
+        )
+        .expect("write mistake");
+
+        // Call auto_correct_on_ci_pass
+        auto_correct_on_ci_pass(&home, agent, None);
+
+        // Verify mistake is marked corrected
+        let content = std::fs::read_to_string(mistakes_dir.join(format!("{}.json", mistake.id))).expect("read mistake file");
+        let updated: Mistake = serde_json::from_str(&content).expect("deserialize mistake");
+        assert!(updated.corrected_at.is_some());
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn test_has_cargo_test_pass_evidence() {
+        assert!(has_cargo_test_pass_evidence("ran: cargo test -> passed"));
+        assert!(has_cargo_test_pass_evidence("ran: cargo test -> success"));
+        assert!(has_cargo_test_pass_evidence("test result: ok. 45 passed; 0 failed"));
+        assert!(!has_cargo_test_pass_evidence("ran: cargo test -> failed"));
+        assert!(!has_cargo_test_pass_evidence("test result: ok. 45 passed; 3 failed"));
+        assert!(!has_cargo_test_pass_evidence("just normal text"));
     }
 }
