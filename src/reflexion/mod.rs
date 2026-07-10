@@ -980,6 +980,27 @@ pub fn patch_skill(path: &str, old_str: &str, new_str: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Patch a skill file: replace `old_str` with `new_str`.
+/// Returns Err if the file doesn't exist or old_str is not found (exactly once).
+#[allow(dead_code)]
+pub fn patch_skill(path: &Path, old_str: &str, new_str: &str) -> Result<(), String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let count = content.matches(old_str).count();
+    if count == 0 {
+        return Err(format!("old_str not found in {}", path.display()));
+    }
+    if count > 1 {
+        return Err(format!(
+            "old_str matches {count} times in {} — must be unique",
+            path.display()
+        ));
+    }
+    let patched = content.replacen(old_str, new_str, 1);
+    std::fs::write(path, patched).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
 pub fn solidify_success_pattern(home: &Path, agent_name: &str, category: &str) -> Option<String> {
     let path = home.join("successes").join(format!("{agent_name}.json"));
     let successes: Vec<Success> = fs::read_to_string(&path)
@@ -1275,8 +1296,12 @@ pub fn solidify_rule(
             }
         }
         None => {
-            let (text, method) =
-                synthesize_rule_text_with_llm_fallback(home, agent_name, category, &recent_mistakes);
+            let (text, method) = synthesize_rule_text_with_llm_fallback(
+                home,
+                agent_name,
+                category,
+                &recent_mistakes,
+            );
             (text, Some(method), chrono::Utc::now().to_rfc3339(), true)
         }
     };
@@ -3239,10 +3264,7 @@ mod tests {
         let rule: Rule = serde_json::from_str(&content).unwrap();
 
         assert_eq!(rule.rule_text, "ALWAYS run cargo test before submitting");
-        assert_eq!(
-            rule.synthesis_method.as_deref(),
-            Some(SYNTHESIS_METHOD_LLM)
-        );
+        assert_eq!(rule.synthesis_method.as_deref(), Some(SYNTHESIS_METHOD_LLM));
 
         // Clean up
         {
@@ -3493,13 +3515,12 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_skill_success() {
+    fn test_patch_skill_replaces_unique_match() {
         let home = tmp_home("patch_skill_success_test");
         let skill_path = home.join("skill.md");
         std::fs::write(&skill_path, "alpha OLD beta\n").expect("write skill");
-        let path = skill_path.to_str().expect("skill path");
 
-        patch_skill(path, "OLD", "NEW").expect("patch should succeed");
+        patch_skill(&skill_path, "OLD", "NEW").expect("patch should succeed");
 
         let updated = std::fs::read_to_string(&skill_path).expect("read skill");
         assert_eq!(updated, "alpha NEW beta\n");
@@ -3508,30 +3529,28 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_skill_not_found() {
+    fn test_patch_skill_errors_on_missing_str() {
         let home = tmp_home("patch_skill_not_found_test");
         let skill_path = home.join("skill.md");
         std::fs::write(&skill_path, "alpha beta\n").expect("write skill");
-        let path = skill_path.to_str().expect("skill path");
 
-        let err = patch_skill(path, "MISSING", "NEW").expect_err("patch should fail");
+        let err = patch_skill(&skill_path, "MISSING", "NEW").expect_err("patch should fail");
         assert!(err.contains("not found"));
-        assert!(err.contains(path));
+        assert!(err.contains(&skill_path.display().to_string()));
 
         std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
-    fn test_patch_skill_ambiguous() {
+    fn test_patch_skill_errors_on_ambiguous_str() {
         let home = tmp_home("patch_skill_ambiguous_test");
         let skill_path = home.join("skill.md");
         std::fs::write(&skill_path, "OLD text OLD tail\n").expect("write skill");
-        let path = skill_path.to_str().expect("skill path");
 
-        let err = patch_skill(path, "OLD", "NEW").expect_err("patch should fail");
-        assert!(err.contains("ambiguous"));
-        assert!(err.contains("2 occurrences"));
-        assert!(err.contains(path));
+        let err = patch_skill(&skill_path, "OLD", "NEW").expect_err("patch should fail");
+        assert!(err.contains("must be unique"));
+        assert!(err.contains("2 times"));
+        assert!(err.contains(&skill_path.display().to_string()));
 
         std::fs::remove_dir_all(&home).ok();
     }
