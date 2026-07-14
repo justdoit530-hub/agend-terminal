@@ -537,9 +537,965 @@ pub fn has_uncommitted_changes(worktree_dir: &Path) -> bool {
     // exits 0 there, and trimming can't turn non-empty porcelain output empty (a
     // theoretical non-zero exit, unreachable for a valid worktree, now also maps to
     // fail-closed `true` rather than the prior raw-bytes `false`).
-    crate::git_helpers::git_cmd(worktree_dir, &["status", "--porcelain"])
-        .map(|s| !s.is_empty())
-        .unwrap_or(true)
+    // P0/P1 (codex R2): `--ignore-submodules=none` overrides any
+    // `submodule.<name>.ignore=all|dirty` config that would HIDE submodule dirt
+    // (else a submodule-only-dirty worktree reads clean → WIP loss); global
+    // `--no-optional-locks` (first) stops `status` opportunistically rewriting the
+    // live index. Both are git GLOBAL options, so they precede `status`.
+    crate::git_helpers::git_cmd(
+        worktree_dir,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+    )
+    .map(|s| !s.is_empty())
+    .unwrap_or(true)
+}
+
+// ── #2158-adjacent: dirty-WIP preservation on MANUAL worktree release ──────
+//
+// The daemon's AUTO-release already refuses to remove a dirty worktree
+// (auto_release.rs SkipDirtyWorktree). The two MANUAL release paths —
+// `worktree_pool::release_full` (release_worktree force:false) and
+// `mcp::handlers::force_release::rebase_clean_self` (force:true) — removed a
+// dirty worktree UNCONDITIONALLY, silently losing uncommitted WIP. Before that
+// destructive removal we snapshot the WIP into a durable git ref that outlives
+// the worktree dir, and notify the operator with a one-line recovery command.
+// A clean worktree is a no-op → zero behaviour change.
+
+/// Namespace for WIP-recovery refs. Each ref is
+/// `refs/agend/recovery/<branch>/<UTC YYYYMMDDTHHMMSSZ>` and points at a commit
+/// whose tree is the WORKING-tree snapshot (tracked + untracked), parented on
+/// `HEAD`. When the STAGED index differed from BOTH `HEAD` and the working tree,
+/// that staged tree is captured as a distinct second parent, recoverable at
+/// `<ref>^2` (see [`preserve_dirty_worktree`]). NEVER captures submodule-internal
+/// dirt — that case refuses removal (`UnpreservableNestedDirty`) instead of
+/// minting a false-"preserved" ref.
+pub(crate) const RECOVERY_REF_PREFIX: &str = "refs/agend/recovery";
+
+/// Recovery-ref retention (lead-vetted 2026-07-07: 14-day TTL + at most 3 per
+/// branch). Enforced at creation time against the branch's own refs — see
+/// [`prune_recovery_refs`].
+const RECOVERY_TTL_DAYS: i64 = 14;
+const RECOVERY_MAX_PER_BRANCH: usize = 3;
+
+/// Is there WIP in this worktree worth preserving? Any `git status --porcelain`
+/// entry that is NOT the daemon's own `.agend-managed` marker counts (porcelain
+/// without `--ignored` already excludes gitignored build artifacts). This
+/// deliberately differs from [`has_uncommitted_changes`]: a freshly-leased
+/// worktree ALWAYS carries the untracked marker, which must NOT trigger a
+/// recovery snapshot on an otherwise-clean release (mirrors the marker-exempt
+/// rule in `retention::worktrees::maybe_remove_candidate`). Fail-closed
+/// (`Err => true`): a status failure attempts preservation rather than risk
+/// dropping WIP — a broken git then fails the snapshot gracefully (`None`).
+fn worktree_has_preservable_wip(wt_path: &Path) -> bool {
+    // P0/P1 (codex R2): force submodule dirt to SHOW (`--ignore-submodules=none`
+    // overrides `submodule.<name>.ignore=all|dirty`, which would otherwise hide it
+    // and make this classifier read Clean → the worktree removed → nested WIP lost)
+    // and keep the live index byte-untouched (`--no-optional-locks`). Both global.
+    match crate::git_helpers::git_cmd(
+        wt_path,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain",
+            "--ignore-submodules=none",
+        ],
+    ) {
+        Ok(s) => s.lines().any(|line| {
+            let path = line.get(3..).map(str::trim).unwrap_or("");
+            !path.is_empty() && path != crate::worktree_pool::MANAGED_MARKER
+        }),
+        Err(_) => true,
+    }
+}
+
+/// Outcome of a pre-removal WIP-preservation attempt. `#[must_use]` so a release
+/// path cannot silently drop it and destroy the worktree regardless — the
+/// fail-OPEN bug reviewer4 caught in the first cut: a contended `index.lock`
+/// made `git add -A` fail, the ignored `None` let `release_full` proceed, and the
+/// dirty untracked WIP evaporated with zero recovery ref. A caller MUST refuse to
+/// remove the worktree on [`WipPreservation::Blocked`].
+#[must_use]
+pub(crate) enum WipPreservation {
+    /// No preservable WIP (clean, or only the daemon `.agend-managed` marker) —
+    /// safe to remove; zero behaviour change vs a pre-guard release.
+    Clean,
+    /// WIP was snapshotted to a recovery ref (name logged + surfaced to the
+    /// operator inside `preserve_dirty_worktree`) — safe to remove.
+    Preserved,
+    /// Preservable WIP EXISTS but could NOT be snapshotted (git failure or a
+    /// contended index) — the caller MUST NOT remove the worktree, so the operator
+    /// can recover the WIP in place. Carries a human-readable reason.
+    Blocked(String),
+    /// `git status` is dirty, but a non-destructive parent snapshot proves BOTH
+    /// the live-index tree AND the working-tree tree equal `HEAD^{tree}` — i.e. the
+    /// ONLY residual dirt is a submodule's INTERNAL working tree (unchanged
+    /// gitlinks), which a parent recovery ref cannot capture. Minting a ref would
+    /// be a false "preserved". Fail-closed: the caller MUST NOT remove the worktree
+    /// (the nested WIP lives only in the worktree dir); a serialized, de-duped
+    /// actionable notice is emitted so the operator resolves the nested repo in
+    /// place. Distinct from `Blocked` (a genuine snapshot FAILURE).
+    UnpreservableNestedDirty(String),
+}
+
+/// Operator-visible effects produced while classifying/preserving WIP. Release
+/// transactions collect these under their flocks and emit them only after the
+/// branch + agent + binding guards have dropped.
+pub(crate) enum ReleaseNotice {
+    WipPreserved {
+        recipient: String,
+        text: String,
+    },
+    UnpreservableNestedDirty {
+        agent: String,
+        branch: String,
+        wt_path: PathBuf,
+        nested_status: String,
+        sender: Option<String>,
+    },
+}
+
+impl ReleaseNotice {
+    pub(crate) fn emit(self, home: &Path) {
+        #[cfg(test)]
+        crate::worktree_pool::release_test_seam::hit(
+            crate::worktree_pool::ReleaseTestPhase::BeforeNoticeEmit,
+        );
+        match self {
+            ReleaseNotice::WipPreserved { recipient, text } => {
+                let source = crate::inbox::NotifySource::System("release_dirty_wip_preserved");
+                crate::inbox::notify_agent(home, &recipient, &source, &text);
+            }
+            ReleaseNotice::UnpreservableNestedDirty {
+                agent,
+                branch,
+                wt_path,
+                nested_status,
+                sender,
+            } => notify_unpreservable_nested_dirty(
+                home,
+                &agent,
+                &branch,
+                &wt_path,
+                &nested_status,
+                sender.as_deref(),
+            ),
+        }
+    }
+}
+
+impl WipPreservation {
+    /// The reason the caller MUST refuse to remove the worktree (fail-closed):
+    /// preservation FAILED (`Blocked`) OR the dirt is nested-submodule-internal and
+    /// unpreservable by a parent snapshot (`UnpreservableNestedDirty`). `None` for
+    /// `Clean`/`Preserved` (safe to remove).
+    pub(crate) fn blocked_reason(&self) -> Option<&str> {
+        match self {
+            WipPreservation::Blocked(reason)
+            | WipPreservation::UnpreservableNestedDirty(reason) => Some(reason),
+            WipPreservation::Clean | WipPreservation::Preserved => None,
+        }
+    }
+}
+
+/// Snapshot a dirty worktree's uncommitted WIP into a durable recovery ref BEFORE
+/// a manual release removes the worktree dir. Returns [`WipPreservation`]:
+/// `Clean` (nothing to preserve → safe to remove), `Preserved` (WIP captured →
+/// safe to remove), `Blocked(reason)` (WIP present but the snapshot genuinely
+/// FAILED → the caller MUST NOT remove; fail-closed), or
+/// `UnpreservableNestedDirty(reason)` (the ONLY dirt is submodule-internal, which
+/// a parent ref cannot capture → refuse + notify so the operator resolves it in
+/// place; also fail-closed).
+///
+/// Mechanism (race-free, untracked-complete, bypass-only — no raw subprocess, and
+/// **the LIVE index is never mutated**):
+///  - `head_tree` = `HEAD^{tree}`; `index_tree` = `write-tree` of the LIVE index
+///    (READ-ONLY — never `add`/`read-tree`/`reset` the live index); `worktree_tree`
+///    = the working tree snapshotted through a TEMP index
+///    ([`snapshot_worktree_tree`]) so the live index stays byte-identical.
+///  - Classification: if the recursive nested walk finds ANY submodule with
+///    INTERNAL working-tree dirt (`m`/`u`, gitlink unchanged) — sole OR mixed with
+///    parent dirt — a parent recovery commit cannot capture it (`git add -A`
+///    records the gitlink, not the submodule's internal edits), so minting one is a
+///    false "preserved" that silently loses the nested WIP on removal. Refuse
+///    (`UnpreservableNestedDirty`) instead. A pure gitlink MOVE (`SC..`) is NOT
+///    internal dirt and stays preservable. The same refusal also fires for an
+///    UNTRACKED embedded git repo at any depth (a `?`-row dir with a `.git`; the
+///    walk uses `--untracked-files=all` so git surfaces each foreign-repo boundary
+///    as its own row) — its internal content is equally uncapturable by a parent ref.
+///  - BOUNDARY (out of contract): content under a GITIGNORE'd path — including an
+///    ignored embedded repo — is NOT covered. `git status`/`add -A` never list or
+///    capture ignored paths, so no gitlink or recovery ref ever falsely claims it;
+///    it is universal accepted-loss on every release path (a plain ignored file is
+///    dropped identically). Preserving it would be an ignore-semantics change, not
+///    this data-safety fix. Pinned by `preserve_ignored_dir_embedded_repo_*`.
+///  - Otherwise PRESERVE: anchor a commit whose tree = `worktree_tree` to a ref in
+///    the SHARED object/ref store (survives the worktree-dir removal). When the
+///    STAGED tree differs from BOTH HEAD and the working tree, it is captured as a
+///    second parent (`ref^2`) so staged-only WIP stays recoverable. Unlike
+///    `git stash create` this captures untracked files; unlike `git stash push` it
+///    never touches the shared `refs/stash` stack, so two concurrent dirty releases
+///    can't cross-contaminate.
+pub(crate) fn preserve_dirty_worktree(
+    home: &Path,
+    agent: &str,
+    wt_path: &Path,
+    branch: &str,
+    sender: Option<&str>,
+) -> WipPreservation {
+    let (outcome, notices) = preserve_dirty_worktree_collect(home, agent, wt_path, branch, sender);
+    for notice in notices {
+        notice.emit(home);
+    }
+    outcome
+}
+
+/// Transaction-facing variant of [`preserve_dirty_worktree`]. It performs the
+/// same snapshot/classification work but returns notice payloads instead of
+/// emitting while the caller's release flocks are held.
+pub(crate) fn preserve_dirty_worktree_collect(
+    home: &Path,
+    agent: &str,
+    wt_path: &Path,
+    branch: &str,
+    sender: Option<&str>,
+) -> (WipPreservation, Vec<ReleaseNotice>) {
+    use crate::git_helpers::git_cmd;
+    if branch.is_empty() {
+        return (WipPreservation::Clean, Vec::new()); // unknown branch → nothing to key a recovery ref on
+    }
+    // Not a LIVE git worktree (a pruned/dangling stale dir — its `.git` gitlink
+    // points at a removed gitdir, or there is none) → there is no git WIP to
+    // snapshot, so removal is safe. Gate here so the fail-closed WIP path below
+    // fires ONLY for a real worktree whose preservation genuinely failed (e.g. a
+    // contended `index.lock`), NOT for a stale dir git can't read at all — which
+    // would wrongly block the force_release stale-dir cleanup this backs. Our
+    // call sites pass `home/worktrees/...` (outside any repo), so rev-parse can't
+    // resolve a spurious ancestor `.git`.
+    if git_cmd(wt_path, &["rev-parse", "--git-dir"]).is_err() {
+        return (WipPreservation::Clean, Vec::new());
+    }
+    if !worktree_has_preservable_wip(wt_path) {
+        return (WipPreservation::Clean, Vec::new()); // clean / marker-only → zero behaviour change
+    }
+    // Branch tip tree. Err → Blocked (fail-closed): a repo we can't read HEAD^{tree}
+    // from is one we can't safely snapshot, so refuse removal.
+    let head_tree = match git_cmd(wt_path, &["rev-parse", "HEAD^{tree}"]) {
+        Ok(t) if !t.is_empty() => t,
+        other => {
+            tracing::warn!(agent, branch, ?other,
+                "preserve dirty WIP: HEAD^{{tree}} resolve failed — refusing to remove (fail-closed)");
+            return (
+                WipPreservation::Blocked(format!(
+                    "`git rev-parse HEAD^{{tree}}` failed: {other:?}"
+                )),
+                Vec::new(),
+            );
+        }
+    };
+    // LIVE index tree — READ-ONLY. `write-tree` reads the current index and writes
+    // tree objects WITHOUT mutating the index file (no `add`/`read-tree`/`reset`),
+    // so the live index stays byte-identical on every path below. An UNMERGED index
+    // makes `write-tree` fail → Blocked (fail-closed).
+    // P1 (codex R2): global `--no-optional-locks` (first) so `write-tree` does not
+    // persist a refreshed cache-tree back to the LIVE index — keeps it byte-identical.
+    let index_tree = match git_cmd(wt_path, &["--no-optional-locks", "write-tree"]) {
+        Ok(t) if !t.is_empty() => t,
+        other => {
+            tracing::warn!(agent, branch, ?other,
+                "preserve dirty WIP: `write-tree` (live index) failed — refusing to remove (fail-closed)");
+            return (
+                WipPreservation::Blocked(format!(
+                    "`git write-tree` (live index) failed: {other:?}"
+                )),
+                Vec::new(),
+            );
+        }
+    };
+    // Working-tree tree via a TEMP index so the LIVE index is byte-untouched.
+    let worktree_tree = match snapshot_worktree_tree(wt_path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(agent, branch, error = %e,
+                "preserve dirty WIP: working-tree snapshot failed — refusing to remove (fail-closed)");
+            return (WipPreservation::Blocked(e), Vec::new());
+        }
+    };
+    // Classification (R5 data-safety, 2nd-seat blocker @ fc8481d3): ANY nested-
+    // submodule INTERNAL dirt (a submodule's own modified/untracked content, gitlink
+    // unchanged) is UNPRESERVABLE by a parent snapshot — `git add -A` records the
+    // gitlink, NEVER the submodule's internal edits — WHETHER OR NOT parent dirt
+    // co-occurs. Detect it DIRECTLY via the recursive walk (which excludes a
+    // preservable gitlink MOVE, `SC..`) and refuse fail-closed + emit a serialized,
+    // de-duped notice; the caller MUST NOT remove the worktree.
+    //
+    // The prior `index_tree == head_tree && worktree_tree == head_tree` proxy caught
+    // ONLY the sole-nested case; any co-occurring parent dirt made `worktree_tree !=
+    // HEAD`, skipped the refusal, and the preserve path below then snapshotted the
+    // gitlink only → the nested WIP was SILENTLY LOST on removal. A non-empty walk —
+    // including an explicit `[truncated:/skipped:]` can't-enumerate line — is treated
+    // as "nested dirt present" → fail-closed. (Trees are still computed above so an
+    // unmerged live index / snapshot failure keeps its `Blocked` precedence.)
+    let nested = enumerate_nested_dirty(wt_path);
+    if !nested.is_empty() {
+        tracing::warn!(agent, branch,
+            "preserve dirty WIP: nested submodule-internal dirt present (unpreservable by a parent ref — sole or mixed with parent dirt) — refusing removal (fail-closed)");
+        return (
+            WipPreservation::UnpreservableNestedDirty(
+                "worktree has uncommitted changes inside a nested submodule's working tree \
+                 (gitlink unchanged); a parent recovery ref cannot capture them, so removal was \
+                 refused to preserve the nested WIP in place"
+                    .into(),
+            ),
+            vec![ReleaseNotice::UnpreservableNestedDirty {
+                agent: agent.to_string(),
+                branch: branch.to_string(),
+                wt_path: wt_path.to_path_buf(),
+                nested_status: nested,
+                sender: sender.map(str::to_string),
+            }],
+        );
+    }
+    // PRESERVE. commit-tree needs a committer identity supplied via `-c` so the
+    // daemon never depends on ambient user.name/email. Parent = HEAD (branch tip).
+    // When the STAGED tree differs from BOTH HEAD and the working tree, snapshot it
+    // as a distinct reachable second parent (`ref^2`) so staged-only WIP survives.
+    let parent2 = if index_tree != head_tree && index_tree != worktree_tree {
+        match git_cmd(
+            wt_path,
+            &[
+                "-c",
+                "user.name=agend-recovery",
+                "-c",
+                "user.email=recovery@agend.local",
+                "commit-tree",
+                index_tree.as_str(),
+                "-p",
+                "HEAD",
+                "-m",
+                "agend recovery: staged index snapshot",
+            ],
+        ) {
+            Ok(c) if !c.is_empty() => Some(c),
+            other => {
+                tracing::warn!(agent, branch, ?other,
+                    "preserve dirty WIP: staged-snapshot `commit-tree` failed — refusing to remove (fail-closed)");
+                return (
+                    WipPreservation::Blocked(format!(
+                        "`git commit-tree` (staged snapshot) failed: {other:?}"
+                    )),
+                    Vec::new(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let msg = format!("agend recovery: dirty WIP for {branch} preserved on release");
+    let mut commit_args: Vec<&str> = vec![
+        "-c",
+        "user.name=agend-recovery",
+        "-c",
+        "user.email=recovery@agend.local",
+        "commit-tree",
+        worktree_tree.as_str(),
+        "-p",
+        "HEAD",
+    ];
+    if let Some(p2) = parent2.as_deref() {
+        commit_args.push("-p");
+        commit_args.push(p2);
+    }
+    commit_args.push("-m");
+    commit_args.push(&msg);
+    let commit = match git_cmd(wt_path, &commit_args) {
+        Ok(c) if !c.is_empty() => c,
+        other => {
+            tracing::warn!(
+                agent,
+                branch,
+                ?other,
+                "preserve dirty WIP: `commit-tree` failed — refusing to remove (fail-closed)"
+            );
+            return (
+                WipPreservation::Blocked(format!("`git commit-tree` failed: {other:?}")),
+                Vec::new(),
+            );
+        }
+    };
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let ref_name = format!("{RECOVERY_REF_PREFIX}/{branch}/{ts}");
+    if let Err(e) = git_cmd(wt_path, &["update-ref", &ref_name, &commit]) {
+        tracing::warn!(agent, branch, error = %e,
+            "preserve dirty WIP: `update-ref` failed — refusing to remove (fail-closed)");
+        return (
+            WipPreservation::Blocked(format!("`git update-ref {ref_name}` failed: {e}")),
+            Vec::new(),
+        );
+    }
+    tracing::info!(agent, branch, %ref_name, dual_parent = parent2.is_some(),
+        "preserve dirty WIP: uncommitted worktree changes snapshotted before manual release");
+    prune_recovery_refs(wt_path, branch);
+    let recipient = wip_notice_recipient(home, agent, sender);
+    let text = wip_preserved_notice(agent, branch, &ref_name, parent2.is_some());
+    (
+        WipPreservation::Preserved,
+        vec![ReleaseNotice::WipPreserved { recipient, text }],
+    )
+}
+
+/// Bound the recovery-ref set for `branch`: keep at most
+/// [`RECOVERY_MAX_PER_BRANCH`] newest and drop any older than
+/// [`RECOVERY_TTL_DAYS`]. Enforced at CREATION time against THIS branch's own
+/// refs, in the repo the worktree shares — deliberately NOT a periodic
+/// retention-tick sweep: recovery refs live in the canonical repo's ref store,
+/// which `retention::worktrees` (a `.trash`-directory mtime GC) does not
+/// enumerate, and per-branch growth is already bounded to the cap.
+///
+/// Known gap (accepted, lead-vetted 2026-07-07): a branch dirty-released exactly
+/// once keeps its single ref indefinitely — the 14d TTL only re-fires on that
+/// branch's NEXT dirty release. The footprint is ≤ cap tiny refs per such branch
+/// (each a single small commit object), so this is negligible. If orphan
+/// recovery refs ever accumulate in practice, escalate to a periodic
+/// repo-registry sweep (enumerate managed repos → prune `refs/agend/recovery/*`
+/// by TTL) rather than widening this per-branch creation-time prune.
+///
+/// Best-effort: a prune failure is logged, never fatal.
+pub(crate) fn prune_recovery_refs(git_dir: &Path, branch: &str) {
+    let pattern = format!("{RECOVERY_REF_PREFIX}/{branch}/");
+    // Timestamp names sort lexically == chronologically → `-refname` == newest-first.
+    let listing = match crate::git_helpers::git_cmd(
+        git_dir,
+        &[
+            "for-each-ref",
+            "--sort=-refname",
+            "--format=%(refname)",
+            &pattern,
+        ],
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(branch, error = %e, "prune recovery refs: for-each-ref failed");
+            return;
+        }
+    };
+    let refs: Vec<&str> = listing.lines().filter(|l| !l.is_empty()).collect();
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(RECOVERY_TTL_DAYS);
+    for (idx, ref_name) in refs.iter().enumerate() {
+        let over_cap = idx >= RECOVERY_MAX_PER_BRANCH;
+        if over_cap || recovery_ref_expired(ref_name, cutoff) {
+            if let Err(e) = crate::git_helpers::git_cmd(git_dir, &["update-ref", "-d", ref_name]) {
+                tracing::warn!(%ref_name, error = %e, "prune recovery refs: delete failed");
+            }
+        }
+    }
+}
+
+/// Parse the trailing `YYYYMMDDTHHMMSSZ` segment of a recovery ref and report
+/// whether it predates `cutoff`. An unparseable name is treated as NOT expired
+/// (fail-safe — never delete WIP we can't date; the per-branch cap still bounds
+/// growth).
+fn recovery_ref_expired(ref_name: &str, cutoff: chrono::DateTime<chrono::Utc>) -> bool {
+    let Some(ts) = ref_name.rsplit('/').next() else {
+        return false;
+    };
+    match chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%dT%H%M%SZ") {
+        Ok(naive) => naive.and_utc() < cutoff,
+        Err(_) => false,
+    }
+}
+
+/// Resolve the recipient for a WIP-preserved notice: the release's CALLER when
+/// known (`sender`), else the agent's team orchestrator, else the operator inbox
+/// (`general`) as a last resort — never a hardcoded recipient (#t-…61315-2 Bug1).
+fn wip_notice_recipient(home: &Path, agent: &str, sender: Option<&str>) -> String {
+    sender
+        .map(str::to_string)
+        .or_else(|| crate::teams::find_team_for(home, agent).and_then(|t| t.orchestrator))
+        .unwrap_or_else(|| "general".to_string())
+}
+
+/// The WIP-preserved notice BODY. The `[system:release_dirty_wip_preserved]`
+/// marker is added by the notify layer (`NotifySource::System`); the body must
+/// NOT embed a second (double-prefix bug, #t-…61315-2 Bug2). When `dual_parent`
+/// (the staged index tree differed from BOTH HEAD and the working tree) the
+/// recovery commit carries the staged snapshot as a second parent — surface where
+/// to recover it (`<ref>^2`).
+fn wip_preserved_notice(agent: &str, branch: &str, ref_name: &str, dual_parent: bool) -> String {
+    let staged = if dual_parent {
+        format!(
+            "\nThe staged (index) state is preserved separately at `{ref_name}^2` \
+                 (inspect: git show {ref_name}^2)."
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "Agent `{agent}` released a DIRTY worktree \
+         for branch `{branch}`; its uncommitted WIP (tracked + untracked) was snapshotted \
+         to recovery ref:\n  {ref_name}\nRecover it from the canonical repo with:\n  \
+         git worktree add ../wip-recover {ref_name}\n(or inspect: git log -p {ref_name}).{staged} \
+         Auto-pruned after {RECOVERY_TTL_DAYS}d / max {RECOVERY_MAX_PER_BRANCH} per branch. \
+         #2158-adjacent."
+    )
+}
+
+/// Monotonic sequence for per-worktree TEMP artifacts (temp index files + atomic
+/// marker rename staging). `pid`-qualified names already avoid cross-process
+/// collision; this avoids intra-process reuse across concurrent preserves.
+static PRESERVE_TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Build the working-tree tree (tracked + untracked, respecting `.gitignore`) in a
+/// TEMP index so the LIVE index is byte-unchanged. Every op runs with
+/// `GIT_INDEX_FILE=<temp>` + `AGEND_GIT_BYPASS=1`, cwd = `wt_path`, bounded by
+/// [`LOCAL_GIT_TIMEOUT`] via [`spawn_group_bounded`]. The temp index is removed on
+/// EVERY return path (success and error). Err carries a human-readable reason the
+/// caller maps to `Blocked`.
+fn snapshot_worktree_tree(wt_path: &Path) -> Result<String, String> {
+    let git_dir = crate::git_helpers::git_cmd(wt_path, &["rev-parse", "--absolute-git-dir"])
+        .map_err(|e| format!("snapshot_worktree_tree: rev-parse --absolute-git-dir failed: {e}"))?;
+    let seq = PRESERVE_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = Path::new(&git_dir).join(format!(
+        "index.agend-preserve.{}.{}",
+        std::process::id(),
+        seq
+    ));
+    // Run a git op against the TEMP index (bypass + bounded). Never touches the
+    // live index (which lives at `<git_dir>/index`).
+    let run = |args: &[&str], label: &str| -> Result<std::process::Output, String> {
+        // git-raw-allowed: this temp-index snapshot needs per-command
+        // GIT_INDEX_FILE while retaining the shared bounded process-group runner.
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args)
+            .current_dir(wt_path)
+            .env("GIT_INDEX_FILE", &temp)
+            .env("AGEND_GIT_BYPASS", "1");
+        crate::git_helpers::spawn_group_bounded(cmd, label, crate::git_helpers::LOCAL_GIT_TIMEOUT)
+            .map_err(|e| format!("snapshot_worktree_tree: {label} spawn failed: {e}"))
+    };
+    // Inner closure so the single `remove_file` below covers EVERY exit path.
+    let result = (|| -> Result<String, String> {
+        for (args, label) in [
+            (&["read-tree", "HEAD"][..], "read-tree HEAD (temp index)"),
+            (&["add", "-A"][..], "add -A (temp index)"),
+        ] {
+            let out = run(args, label)?;
+            if !out.status.success() {
+                return Err(format!(
+                    "snapshot_worktree_tree: {label} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        let out = run(&["write-tree"], "write-tree (temp index)")?;
+        if !out.status.success() {
+            return Err(format!(
+                "snapshot_worktree_tree: write-tree failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if tree.is_empty() {
+            return Err("snapshot_worktree_tree: write-tree returned empty".to_string());
+        }
+        Ok(tree)
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
+/// A parsed `git status --porcelain=v2 -z` record we care about: its display
+/// `token` (the XY field / `??` / `!!`), `path`, and the submodule `<sub>` field.
+struct V2Entry {
+    token: String,
+    path: String,
+    sub: String,
+}
+
+impl V2Entry {
+    /// The `<sub>` field is `N...` for a non-submodule and `S<c><m><u>` for a
+    /// submodule (`c`=commit/gitlink changed, `m`=modified tracked content,
+    /// `u`=untracked content).
+    fn is_submodule(&self) -> bool {
+        self.sub.as_bytes().first() == Some(&b'S')
+    }
+
+    /// A submodule with INTERNAL working-tree dirt (`m` or `u`) — the kind a parent
+    /// ref cannot preserve. A pure gitlink move (`SC..`) is NOT this (it IS
+    /// preservable), so it is excluded.
+    fn dirty_submodule(&self) -> bool {
+        let b = self.sub.as_bytes();
+        b.first() == Some(&b'S') && b.len() >= 4 && (b[2] == b'M' || b[3] == b'U')
+    }
+}
+
+/// Parse a NUL-separated porcelain-v2 stream into path-bearing records. Walks
+/// field-by-field so rename (`2`) records — which carry an EXTRA NUL-terminated
+/// original-path field — keep the stream aligned. Paths (which may contain spaces)
+/// are preserved verbatim via `splitn` (never `split_whitespace`).
+fn parse_porcelain_v2_z(raw: &str) -> Vec<V2Entry> {
+    let fields: Vec<&str> = raw.split('\0').collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let rec = fields[i];
+        match rec.as_bytes().first() {
+            Some(b'1') => {
+                // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+                let parts: Vec<&str> = rec.splitn(9, ' ').collect();
+                if parts.len() == 9 {
+                    out.push(V2Entry {
+                        token: parts[1].to_string(),
+                        path: parts[8].to_string(),
+                        sub: parts[2].to_string(),
+                    });
+                }
+                i += 1;
+            }
+            Some(b'2') => {
+                // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path> \0 <orig>
+                let parts: Vec<&str> = rec.splitn(10, ' ').collect();
+                if parts.len() == 10 {
+                    out.push(V2Entry {
+                        token: parts[1].to_string(),
+                        path: parts[9].to_string(),
+                        sub: parts[2].to_string(),
+                    });
+                }
+                i += 2; // consume the trailing original-path field
+            }
+            Some(b'u') => {
+                // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+                let parts: Vec<&str> = rec.splitn(11, ' ').collect();
+                if parts.len() == 11 {
+                    out.push(V2Entry {
+                        token: format!("u{}", parts[1]),
+                        path: parts[10].to_string(),
+                        sub: String::new(),
+                    });
+                }
+                i += 1;
+            }
+            Some(b'?') => {
+                out.push(V2Entry {
+                    token: "??".to_string(),
+                    path: rec.get(2..).unwrap_or("").to_string(),
+                    sub: String::new(),
+                });
+                i += 1;
+            }
+            Some(b'!') => {
+                out.push(V2Entry {
+                    token: "!!".to_string(),
+                    path: rec.get(2..).unwrap_or("").to_string(),
+                    sub: String::new(),
+                });
+                i += 1;
+            }
+            _ => i += 1, // blank tail field or `#` header — skip
+        }
+    }
+    out
+}
+
+/// Upper bound on distinct submodules walked before we stop and say so EXPLICITLY
+/// (never a silent depth cap — correction a).
+const NESTED_ENUM_MAX: usize = 256;
+
+/// Recursively enumerate the DIRTY nested (submodule) content of `wt_path` as a
+/// human-readable, multi-line string: `<submodule-path>:` followed by its own
+/// dirty entries, one per nested repo. Uses `git status --porcelain=v2 -z` (NUL
+/// safe — handles spaces/newlines in paths). Every submodule descent is guarded by
+/// canonical CONTAINMENT (reject `..`/symlink escape) + a visited-set (cycle
+/// guard); exceeding [`NESTED_ENUM_MAX`] or any git error appends an explicit
+/// `[truncated: …]` / `[skipped: …]` line rather than stopping silently.
+fn enumerate_nested_dirty(wt_path: &Path) -> String {
+    let root = match std::fs::canonicalize(wt_path) {
+        Ok(p) => p,
+        Err(e) => return format!("[truncated: canonicalize worktree root failed: {e}]\n"),
+    };
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    visited.insert(root.clone());
+    let mut out = String::new();
+    walk_nested_dirty(&root, "", &root, &mut visited, &mut out);
+    out
+}
+
+/// One level of [`enumerate_nested_dirty`]. `dir_canon` is the canonical repo dir;
+/// `display_prefix` is its path relative to the super (`""` for the super root).
+fn walk_nested_dirty(
+    dir_canon: &Path,
+    display_prefix: &str,
+    root: &Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+    out: &mut String,
+) {
+    // P0/P1 (codex R2): reveal submodule dirt (`--ignore-submodules=none`) at BOTH
+    // the super and every recursive nested call (this one line serves both via the
+    // recursion), and never rewrite the live index (`--no-optional-locks`, global).
+    //
+    // r7 (P4 class-closure): `--untracked-files=all`. Without it git COLLAPSES an
+    // entirely-untracked tree into one `?? junk/` row, hiding an embedded repo at
+    // `junk/deep/repo/` from the `?`-row check below (depth ≥2 slipped — reviewer5
+    // P4). With `-uall` git enumerates every untracked path AND — crucially — never
+    // descends INTO a foreign git repo, so it emits every embedded repo as its own
+    // `? <path>/` row at ANY depth. The check below then catches each. (IGNORED
+    // content is deliberately still NOT listed — it is out of the no-silent-loss
+    // contract: `add -A` never captures it, so no gitlink/recovery-ref falsely claims
+    // it; a documented boundary, pinned by a test.)
+    let entries = match crate::git_helpers::git_cmd(
+        dir_canon,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--ignore-submodules=none",
+            "--untracked-files=all",
+        ],
+    ) {
+        Ok(s) => parse_porcelain_v2_z(&s),
+        Err(e) => {
+            out.push_str(&format!(
+                "[truncated: git status failed at '{display_prefix}': {e}]\n"
+            ));
+            return;
+        }
+    };
+    // A nested repo emits its OWN dirty (non-submodule) files under its header. The
+    // super root (empty prefix) has no "own" nested files — only submodule pointers.
+    if !display_prefix.is_empty() {
+        out.push_str(&format!("{display_prefix}:\n"));
+        for e in &entries {
+            if !e.is_submodule() {
+                out.push_str(&format!("  {} {}\n", e.token, e.path));
+            }
+        }
+    }
+    // Descend into each submodule with INTERNAL dirt.
+    for e in &entries {
+        if !e.dirty_submodule() {
+            continue;
+        }
+        let disp = if display_prefix.is_empty() {
+            e.path.clone()
+        } else {
+            format!("{display_prefix}/{}", e.path)
+        };
+        let sub_canon = match std::fs::canonicalize(dir_canon.join(&e.path)) {
+            Ok(p) => p,
+            Err(err) => {
+                out.push_str(&format!(
+                    "{disp}:\n  [skipped: containment (canonicalize failed: {err})]\n"
+                ));
+                continue;
+            }
+        };
+        if !sub_canon.starts_with(root) {
+            out.push_str(&format!("{disp}:\n  [skipped: containment]\n"));
+            continue;
+        }
+        if !visited.insert(sub_canon.clone()) {
+            out.push_str(&format!("{disp}:\n  [skipped: already visited]\n"));
+            continue;
+        }
+        if visited.len() > NESTED_ENUM_MAX {
+            out.push_str(&format!(
+                "{disp}:\n  [truncated: visited-set exceeded {NESTED_ENUM_MAX}]\n"
+            ));
+            return;
+        }
+        walk_nested_dirty(&sub_canon, &disp, root, visited, out);
+    }
+    // r6 (P3b): an UNTRACKED directory that is itself a git repo (an in-worktree
+    // clone / `git init`, NOT a registered submodule — so it shows as a porcelain
+    // `?` row with no `S` field and the submodule descent above never saw it) holds
+    // content a superproject `add -A` records only as a GITLINK. On removal the
+    // embedded repo's uncommitted WIP AND its `.git` object store are destroyed and
+    // any recovery ref's gitlink dangles — the SAME unpreservable-content invariant
+    // as a dirty submodule. Surface it so the refusal + notice fire. (A commit-LESS
+    // embed already fails the temp-index `add -A` upstream → `Blocked`, so only the
+    // committed shape reaches here.)
+    for e in &entries {
+        if e.token != "??" {
+            continue; // only an untracked `?` row can be an unregistered embedded repo
+        }
+        let candidate = dir_canon.join(&e.path);
+        if !candidate.join(".git").exists() {
+            continue; // an ordinary untracked file/dir, not an embedded repo
+        }
+        let disp = if display_prefix.is_empty() {
+            e.path.clone()
+        } else {
+            format!("{display_prefix}/{}", e.path)
+        };
+        let embed_canon = match std::fs::canonicalize(&candidate) {
+            Ok(p) => p,
+            Err(err) => {
+                out.push_str(&format!(
+                    "{disp}: [untracked embedded git repo — skipped: canonicalize failed: {err}]\n"
+                ));
+                continue;
+            }
+        };
+        if !embed_canon.starts_with(root) {
+            out.push_str(&format!(
+                "{disp}: [untracked embedded git repo — skipped: containment]\n"
+            ));
+            continue;
+        }
+        if !visited.insert(embed_canon) {
+            continue; // already surfaced via the submodule descent or a prior entry
+        }
+        out.push_str(&format!(
+            "{disp}: [untracked embedded git repo — internal WIP/object store is unpreservable by a parent ref]\n"
+        ));
+    }
+}
+
+/// Hex digest of a `Hash`-able value via `DefaultHasher` (bounded, allocation-free
+/// key). Used both for the per-worktree marker filename (path) and the last-seen
+/// nested-status content.
+fn hash_hex<T: std::hash::Hash>(v: &T) -> String {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// The per-worktree refusal-notice directory: `<runtime>/release_refusal_notices`.
+fn refusal_notice_dir(home: &Path) -> std::path::PathBuf {
+    crate::paths::runtime_dir(home).join("release_refusal_notices")
+}
+
+/// The actionable UNPRESERVABLE-nested-dirty notice BODY. The `system:` marker is
+/// added by the notify layer; the body must NOT embed a second one.
+fn unpreservable_nested_dirty_notice(
+    agent: &str,
+    branch: &str,
+    wt_path: &Path,
+    nested_status: &str,
+) -> String {
+    let wt = wt_path.display();
+    format!(
+        "Agent `{agent}` could NOT release its worktree `{wt}` (branch `{branch}`): it has \
+         uncommitted changes INSIDE a nested submodule's working tree — the gitlink \
+         is unchanged, so a parent recovery ref CANNOT capture them (any co-occurring parent \
+         changes are NOT preserved either; the release was REFUSED whole to avoid silently \
+         losing the nested WIP).\nDirty nested content:\n\
+         {nested_status}\nResolve it IN PLACE (the worktree still exists), then release again:\n\
+         1) commit or stash INSIDE the affected submodule, OR\n\
+         2) discard it: cd {wt} && git submodule foreach 'git checkout -- . && git clean -fdx'\n\
+         #2158-adjacent."
+    )
+}
+
+/// Emit a SERIALIZED, de-duped actionable notice that a worktree's release was
+/// refused for unpreservable nested-submodule dirt (correction b). Best-effort:
+///  - Recipient = [`wip_notice_recipient`].
+///  - Serialized per worktree by a file lock at `<dir>/<hash(wt)>.lock`, held
+///    across read/compare/enqueue/marker-update.
+///  - ONE marker per worktree at `<dir>/<hash(wt)>` whose CONTENT is the last
+///    notified `hash(nested_status)`. Equal ⇒ SUPPRESS. A changed nested status
+///    (incl. A→B→A) re-notifies.
+///  - The marker advances ONLY after a successful (fallible) durable
+///    [`crate::inbox::storage::enqueue`]; on enqueue failure the marker is left
+///    unchanged so the next sweep re-notifies.
+fn notify_unpreservable_nested_dirty(
+    home: &Path,
+    agent: &str,
+    branch: &str,
+    wt_path: &Path,
+    nested_status: &str,
+    sender: Option<&str>,
+) {
+    let recipient = wip_notice_recipient(home, agent, sender);
+    let current_hash = hash_hex(&nested_status);
+    let dir = refusal_notice_dir(home);
+    let key = hash_hex(&wt_path);
+    let marker_path = dir.join(&key);
+    let lock_path = dir.join(format!("{key}.lock"));
+
+    // SERIALIZE per worktree — hold across read/compare/enqueue/update.
+    let _lock = match crate::store::acquire_file_lock(&lock_path) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(agent, branch, error = %e,
+                "unpreservable nested dirty: could not acquire notice lock — skipping notice");
+            return;
+        }
+    };
+
+    // Suppress if the last-notified nested status is byte-identical.
+    if let Ok(prev) = std::fs::read_to_string(&marker_path) {
+        if prev.trim() == current_hash {
+            return;
+        }
+    }
+
+    let text = unpreservable_nested_dirty_notice(agent, branch, wt_path, nested_status);
+    let msg = crate::inbox::InboxMessage {
+        from: crate::inbox::NotifySource::System("release_unpreservable_nested_dirty").to_string(),
+        text,
+        kind: None,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    match crate::inbox::storage::enqueue(home, &recipient, msg) {
+        Ok(()) => {
+            // Advance the marker ONLY on a durable enqueue (temp + atomic rename).
+            let seq = PRESERVE_TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = dir.join(format!("{key}.tmp.{}.{}", std::process::id(), seq));
+            let wrote = std::fs::write(&tmp, current_hash.as_bytes())
+                .and_then(|_| std::fs::rename(&tmp, &marker_path));
+            if let Err(e) = wrote {
+                let _ = std::fs::remove_file(&tmp);
+                tracing::warn!(agent, branch, error = %e,
+                    "unpreservable nested dirty: notice enqueued but marker update failed — will re-notify");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(agent, branch, error = %e,
+                "unpreservable nested dirty: durable enqueue failed — marker NOT advanced (will re-notify)");
+        }
+    }
+}
+
+/// Best-effort removal of a worktree's refusal marker + lock, so a future re-lease
+/// of the same path starts fresh. Called from `worktree_pool::release_full`'s
+/// SUCCESS (worktree-removed) path.
+pub(crate) fn clear_nested_refusal_marker(home: &Path, wt_path: &Path) {
+    let dir = refusal_notice_dir(home);
+    let key = hash_hex(&wt_path);
+    let marker_path = dir.join(&key);
+    let lock_path = dir.join(format!("{key}.lock"));
+    // P2 (codex R2 + R3): remove the marker ONLY while HOLDING the same
+    // per-worktree lock a concurrent notice takes. NON-BLOCKING (`try_`) so that if
+    // a notice is mid-flight (lock held elsewhere) we FAIL SAFE — leave the marker
+    // untouched and return; unlinking it here would delete a marker the in-flight
+    // notifier still owns, re-opening the cleanup-vs-notify race. A later
+    // lock-owning cleanup (or the next release) removes it. NEVER remove the marker
+    // without the lock, and NEVER unlink the `.lock` inode (flock is per-inode; a
+    // fresh inode is a fresh useless lock that silently breaks serialization).
+    match crate::store::try_acquire_file_lock(&lock_path) {
+        Ok(Some(_guard)) => {
+            let _ = std::fs::remove_file(&marker_path);
+        }
+        Ok(None) => {
+            tracing::debug!(
+                "clear nested refusal marker: lock held by an in-flight notice — leaving marker (fail-safe)");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e,
+                "clear nested refusal marker: could not open lock — leaving marker untouched (fail-safe)");
+        }
+    }
+>>>>>>> 6a584839 (fix: serialize exact binding release transactions (#2778))
 }
 
 /// #2234 Phase 2: resolve the worktree dir to remove for `(agent, branch)`,
