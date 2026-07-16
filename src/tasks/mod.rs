@@ -583,3 +583,110 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
     }
     Ok(MigrationReport { migrated, skipped })
 }
+
+#[derive(Debug)]
+pub enum TaskRouteError {
+    NotFound,
+    Unreadable {
+        path: std::path::PathBuf,
+        cause: String,
+    },
+    Ambiguous {
+        candidates: Vec<String>,
+        cause: String,
+    },
+}
+
+impl std::fmt::Display for TaskRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TaskRouteError::NotFound => write!(f, "task not found on any board"),
+            TaskRouteError::Unreadable { path, cause } => {
+                write!(f, "task route unreadable ({}): {cause}", path.display())
+            }
+            TaskRouteError::Ambiguous { candidates, cause } => {
+                write!(f, "task route ambiguous (candidates: {candidates:?}): {cause}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskRouteError {}
+
+pub struct RoutedTask {
+    pub task: Task,
+}
+
+pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, TaskRouteError> {
+    // Under our single-board layout, search DEFAULT_PROJECT's board first.
+    let default_project = crate::task_events::DEFAULT_PROJECT;
+    let board = crate::task_events::board_root(home, default_project);
+    let state = crate::task_events::replay_at(&board).map_err(|e| {
+        TaskRouteError::Unreadable {
+            path: board.clone(),
+            cause: e.to_string(),
+        }
+    })?;
+    if let Some(record) = state.tasks.get(&crate::task_events::TaskId(task_id.to_string())) {
+        return Ok(RoutedTask {
+            task: record_to_task(record),
+        });
+    }
+
+    // Fallback: search all other folders inside home/boards/
+    let boards_dir = home.join("boards");
+    if let Ok(entries) = std::fs::read_dir(&boards_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path != board {
+                if let Ok(state) = crate::task_events::replay_at(&path) {
+                    if let Some(record) = state.tasks.get(&crate::task_events::TaskId(task_id.to_string())) {
+                        return Ok(RoutedTask {
+                            task: record_to_task(record),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Err(TaskRouteError::NotFound)
+}
+
+pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> {
+    let mut tasks = Vec::new();
+    // Default board
+    let default_project = crate::task_events::DEFAULT_PROJECT;
+    let board = crate::task_events::board_root(home, default_project);
+    let state = crate::task_events::replay_at(&board).map_err(|e| {
+        TaskRouteError::Unreadable {
+            path: board.clone(),
+            cause: e.to_string(),
+        }
+    })?;
+    for record in state.tasks.values() {
+        tasks.push(record_to_task(record));
+    }
+
+    // Other boards
+    let boards_dir = home.join("boards");
+    if let Ok(entries) = std::fs::read_dir(&boards_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && path != board {
+                let state = crate::task_events::replay_at(&path).map_err(|e| {
+                    TaskRouteError::Unreadable {
+                        path: path.clone(),
+                        cause: e.to_string(),
+                    }
+                })?;
+                for record in state.tasks.values() {
+                    tasks.push(record_to_task(record));
+                }
+            }
+        }
+    }
+
+    Ok(tasks)
+}
+

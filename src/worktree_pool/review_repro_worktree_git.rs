@@ -68,7 +68,7 @@ fn cleanup_merged_branch_uses_true_default_not_main_worktree_git() {
 
     // Observation-only dry-run: never mutates refs, so it is safe to assert
     // the decision text without deleting anything.
-    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/merged", true);
+    let (deleted, reason) = cleanup_merged_branch(&repo, "feat/merged", true, None);
     assert!(
         !deleted,
         "dry-run must never delete (deleted should be false): {reason:?}"

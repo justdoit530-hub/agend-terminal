@@ -9,6 +9,8 @@
 //! the single source of truth for this layout; all production code
 //! paths (lease, create, release, gc, list_residual) route through it.
 
+pub mod disposition;
+
 use crate::agent_ops::validate_branch;
 use std::path::{Path, PathBuf};
 
