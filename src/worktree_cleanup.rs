@@ -346,6 +346,12 @@ pub fn sweep_from_registry(
             removed.push((branch, "(no worktree)".to_string()));
         }
     }
+    // Durable retry: settle any cleanup intents whose branches are now
+    // confirmed merged. This is the retry consumer for intents that survived
+    // a failed poller settlement or whose CI watch was removed before the
+    // settlement succeeded.
+    crate::cleanup_intents::sweep_settle_merged(home);
+    crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
     removed
 }
 
