@@ -1123,6 +1123,75 @@ mod tests {
         });
     }
 
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn fire_stage1_pty_write_failure_lands_in_stage1_pending_real_actor_2620() {
+        let registry: agent::AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
+        let cfg = agent::SpawnConfig {
+            name: "wedged-esc-target",
+            backend: None,
+            backend_command: "sh",
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+        let id = agent::spawn_agent(&cfg, &registry).expect("wedged shell must spawn");
+        // Let `stty raw -echo` take effect before writing — mirrors
+        // write_actor.rs's own `wedged_pty()` fixture's post-spawn wait.
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (core, pty_writer) = {
+            let reg = registry.lock();
+            let handle = reg.get(&id).expect("spawned handle must be present");
+            (
+                std::sync::Arc::clone(&handle.core),
+                std::sync::Arc::clone(&handle.pty_writer),
+            )
+        };
+
+        // Saturate the actor's per-writer queue so the ESC byte write below
+        // genuinely fails. A single write LARGER than the cap is rejected
+        // outright at enqueue time (never queued at all) — priming with
+        // exactly write_actor's cap (`MAX_QUEUE_BYTES_PER_WRITER`, 1 MiB at
+        // time of writing — private to write_actor.rs, so duplicated here
+        // by value) is what actually gets a near-full job INTO the queue.
+        // The wedged child never drains it, so the follow-up 1-byte ESC
+        // write either hits the instant backpressure reject (if the tiny
+        // real kernel-pty buffer hasn't drained any headroom yet) or queues
+        // behind it and times out after `PTY_WRITE_TIMEOUT` (5s) — either
+        // way, a genuine `Err`, not a race against an empty queue. Confirmed
+        // empirically (both outcomes observed as `Err` under this setup).
+        let priming_result = agent::write_to_pty(&pty_writer, &vec![b'x'; 1 << 20]);
+        assert!(
+            priming_result.is_err(),
+            "test invariant: the priming write itself must also see a saturated/wedged queue"
+        );
+
+        let target = RecoveryTarget {
+            name: "wedged-esc-target".to_string(),
+            core: std::sync::Arc::clone(&core),
+            pty_writer,
+        };
+        let _logs = capture_all_logs(|| {
+            fire_stage1_alive_stuck(
+                "wedged-esc-target",
+                &target,
+                true, // gate_active
+                Duration::from_secs(200),
+                Duration::from_secs(200),
+            );
+        });
+    }
+
     /// #1694(a): the three-way Stage2 decision — the seam that makes
     /// `handle_stage2_fire`'s no-consumer escalation testable without a full
     /// AgentHandle/PTY harness (same pattern as `classify_branch`/`Stage1Branch`).

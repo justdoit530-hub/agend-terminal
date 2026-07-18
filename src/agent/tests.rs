@@ -748,6 +748,7 @@ fn spawn_agent_refuses_mid_delete_1915() {
     let _guard = crate::agent::deleting::mark_deleting(&home, "victim");
     let cfg = SpawnConfig {
         name: "victim",
+        backend: None,
         backend_command: "true",
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -822,6 +823,7 @@ fn unmanaged_local_shell_spawns_without_fleet_entry() {
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let cfg = SpawnConfig {
         name: "shell",
+        backend: None,
         backend_command: "true", // exits immediately; we only assert it registered
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -853,6 +855,7 @@ fn deleted_agent_reaper_no_shell_fallback() {
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     let spawn_cfg = SpawnConfig {
         name: "del-test",
+        backend: None,
         backend_command: "true", // exits immediately with code 0
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1033,6 +1036,7 @@ fn build_command_strips_agend_git_bypass() {
     std::env::set_var("AGEND_GIT_BYPASS", "1");
     let config = SpawnConfig {
         name: "strip-test",
+        backend: None,
         backend_command: "echo",
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1079,6 +1083,7 @@ fn build_command_strips_agend_git_bypass() {
 fn build_command_sets_git_editor_defaults() {
     let config = SpawnConfig {
         name: "git-editor-test",
+        backend: None,
         backend_command: "echo",
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1104,6 +1109,90 @@ fn build_command_sets_git_editor_defaults() {
     }
 }
 
+/// #2801 RED: the declared backend is authoritative even when `command:` is
+/// an arbitrarily named wrapper. Basename inference cannot recover this from
+/// `backend_command`, so the spawn config must carry the resolved fleet
+/// backend into `build_command`.
+#[test]
+fn build_command_wrapper_uses_declared_backend_for_presets_and_flags_2801() {
+    let workspace = resolve_test_home("wrapper-2801");
+    std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
+    std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions").expect("agend.md");
+    std::fs::write(workspace.join("mcp-config.json"), "{}").expect("mcp-config.json");
+
+    let config = SpawnConfig {
+        name: "wrapper-2801",
+        backend: Some(&Backend::ClaudeCode),
+        backend_command: "/opt/company/bin/model-proxy.sh",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Resume,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: Some(&workspace),
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+
+    let (cmd, detected) = build_command(&config).expect("build_command");
+    assert_eq!(
+        detected,
+        Some(Backend::ClaudeCode),
+        "the declared backend must win when the wrapper basename is unknown"
+    );
+    let argv: Vec<String> = cmd
+        .get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    for expected in [
+        "--dangerously-skip-permissions",
+        "--continue",
+        "--append-system-prompt-file",
+        "--mcp-config",
+    ] {
+        assert!(
+            argv.iter().any(|arg| arg == expected),
+            "declared Claude backend must inject {expected}; argv={argv:?}"
+        );
+    }
+    std::fs::remove_dir_all(workspace).ok();
+}
+
+#[test]
+fn build_command_without_declared_backend_keeps_legacy_inference_2801() {
+    let config = SpawnConfig {
+        name: "legacy-inference-2801",
+        backend: None,
+        backend_command: "claude",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+
+    let (cmd, detected) = build_command(&config).expect("build_command");
+    assert_eq!(detected, Some(Backend::ClaudeCode));
+    let argv: Vec<String> = cmd
+        .get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        argv.iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"),
+        "legacy callers without a declaration must retain command inference; argv={argv:?}"
+    );
+}
+
 /// #2106: an operator's per-instance `ANTHROPIC_AUTH_TOKEN` in fleet.yaml
 /// `env:` must reach a claude-backed instance — it is a credential the backend
 /// declares (`credential_env_keys`) — so the operator can point that instance at
@@ -1122,6 +1211,7 @@ fn build_command_allows_operator_backend_credential_2106() {
     env.insert("MY_BENIGN_2106".to_string(), "ok".to_string());
     let config = SpawnConfig {
         name: "cred-2106",
+        backend: None,
         backend_command: "claude",
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1169,6 +1259,7 @@ fn build_command_credential_override_is_per_backend_2106() {
     );
     let config = SpawnConfig {
         name: "cred-2106-codex",
+        backend: None,
         backend_command: "codex",
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1207,6 +1298,7 @@ fn build_command_credential_override_is_per_backend_2106() {
 fn build_command_disables_opencode_autoupdate_only_for_opencode() {
     let cfg = |backend_command: &'static str, mode: crate::backend::SpawnMode| SpawnConfig {
         name: "autoupdate-test",
+        backend: None,
         backend_command,
         args: &[],
         spawn_mode: mode,
@@ -1282,6 +1374,7 @@ fn build_command_reinjects_agend_home_under_env_isolation_med5() {
     std::env::set_var("AGEND_ENV_ISOLATION", "1");
     let config = SpawnConfig {
         name: "med5-home",
+        backend: None,
         backend_command: "echo",
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1332,6 +1425,7 @@ fn build_agy_cmd(
     .expect("write fleet.yaml");
     let config = SpawnConfig {
         name: "agy-int",
+        backend: None,
         backend_command: "agy",
         args: &[],
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -2247,6 +2341,7 @@ fn matrix1_invariant_key_eq_id_eq_resolve() {
     spawn_agent(
         &SpawnConfig {
             name: "alpha",
+            backend: None,
             backend_command: "sleep",
             args: &sleep_args,
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -2349,6 +2444,7 @@ fn matrix4_spawn_fails_fast_when_absent_from_fleet() {
     let result = spawn_agent(
         &SpawnConfig {
             name: "ghost",
+            backend: None,
             backend_command: "sleep",
             args: &sleep_args,
             spawn_mode: crate::backend::SpawnMode::Fresh,
