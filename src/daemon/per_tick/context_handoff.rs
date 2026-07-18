@@ -29,9 +29,13 @@
 //! still-high agent — same accepted trade-off as `context_alert`
 //! (current-state nudge, single, self-limiting).
 
+use super::context_alert::{
+    resolve_instance_thresholds, InvalidOverrideWarnings, ThresholdTriplet,
+};
 use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Handoff-injection threshold (percent). Override: `AGEND_CONTEXT_HANDOFF_PCT`.
 const DEFAULT_HANDOFF_PCT: f32 = 85.0;
@@ -47,18 +51,14 @@ const HYSTERESIS_PCT: f32 = 5.0;
 /// incident.
 pub(crate) const HANDOFF_FILENAME: &str = "SESSION-HANDOFF.md";
 
-fn handoff_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_HANDOFF_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_HANDOFF_PCT)
-}
-
-fn escalate_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_ESCALATE_PCT)
+/// One resolve per tick: handoff and escalate must come from the SAME
+/// effective-triplet snapshot, so a config reload / env change between two
+/// separate resolves can't hand `decide` a torn pair. Overrides:
+/// `AGEND_CONTEXT_HANDOFF_PCT` / `AGEND_CONTEXT_HANDOFF_ESCALATE_PCT`.
+#[cfg(test)]
+fn tick_thresholds() -> (f32, f32) {
+    let (_, handoff, escalate) = crate::runtime_config::resolve_effective_thresholds();
+    (handoff, escalate)
 }
 
 /// Episode phase per agent. One episode = one continuous stay above the
@@ -203,13 +203,26 @@ fn handoff_written_since(working_dir: Option<&std::path::Path>, since_ms: i64) -
 pub(crate) struct ContextHandoffHandler {
     gate: crate::daemon::cadence_gate::CadenceGate,
     states: Mutex<HashMap<String, EpisodeState>>,
+    invalid_override_warnings: InvalidOverrideWarnings,
 }
 
 impl ContextHandoffHandler {
+    #[cfg(test)]
     pub(crate) fn new(every_n_ticks: u64) -> Self {
+        Self::new_with_warnings(
+            every_n_ticks,
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
+        )
+    }
+
+    pub(super) fn new_with_warnings(
+        every_n_ticks: u64,
+        invalid_override_warnings: InvalidOverrideWarnings,
+    ) -> Self {
         Self {
             gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
             states: Mutex::new(HashMap::new()),
+            invalid_override_warnings,
         }
     }
 }
@@ -246,11 +259,19 @@ impl PerTickHandler for ContextHandoffHandler {
             live
         };
 
-        let handoff_pct = handoff_threshold();
-        let escalate_pct = escalate_threshold();
+        let (alert, handoff, escalate) = crate::runtime_config::resolve_effective_thresholds();
+        let global = ThresholdTriplet {
+            alert,
+            handoff,
+            escalate,
+        };
+        let fleet = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home))
+            .unwrap_or_else(|_| Arc::new(crate::fleet::FleetConfig::default()));
         let now_ms = chrono::Utc::now().timestamp_millis();
         let mut states = self.states.lock();
         for (name, pct, is_idle) in snapshot {
+            let thresholds =
+                resolve_instance_thresholds(&name, global, &fleet, &self.invalid_override_warnings);
             let state = states.entry(name.clone()).or_default();
             let working_dir = ctx
                 .configs
@@ -263,8 +284,8 @@ impl PerTickHandler for ContextHandoffHandler {
                 is_idle,
                 |since| handoff_written_since(working_dir.as_deref(), since),
                 now_ms,
-                handoff_pct,
-                escalate_pct,
+                thresholds.handoff,
+                thresholds.escalate,
             );
             match action {
                 Some(Action::Inject) => {
@@ -317,9 +338,10 @@ impl PerTickHandler for ContextHandoffHandler {
                 }
                 Some(Action::Escalate) => {
                     let msg = format!(
-                        "[context-handoff] agent '{name}' context at {pct:.0}% and no \
-                         {HANDOFF_FILENAME} update since the {handoff_pct:.0}% nudge — \
-                         consider a manual handoff + restart_instance. (One-time notice.)"
+                        "[context-handoff] agent '{name}' context at {pct:.1}% and no \
+                         {HANDOFF_FILENAME} update since the {thresholds_handoff:.1}% nudge — \
+                         consider a manual handoff + restart_instance. (One-time notice.)",
+                        thresholds_handoff = thresholds.handoff
                     );
                     crate::channel::notify_all_escalation_channels(
                         &name,
@@ -336,6 +358,9 @@ impl PerTickHandler for ContextHandoffHandler {
         // #latch-prune: drop episode latches for agents gone from the registry
         // (cleanup-on-delete) so a deleted agent leaves no stale episode state.
         states.retain(|name, _| live.contains(name));
+        self.invalid_override_warnings
+            .lock()
+            .retain(|name| live.contains(name));
     }
 }
 
