@@ -1897,7 +1897,7 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: shell\n    model: model-2038-inst-wins\n",
+            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: claude\n    model: model-2038-inst-wins\n",
         )
         .expect("write fleet.yaml");
 
@@ -1948,7 +1948,7 @@ mod tests {
             &json!({
                 "name": "team2038",
                 "count": 1,
-                "backend": "/bin/sh",
+                "backend": "claude",
             }),
             &ctx,
         );
