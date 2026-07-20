@@ -657,6 +657,8 @@ mod tests {
         let reg = agent::lock_registry(ctx.registry);
         if let Some(h) = reg.values().find(|h| h.name.as_str() == name) {
             let _ = h.child.lock().kill();
+        }
+    }
     /// Slice-2 RED: the API kill producer must publish Crashed before the PTY
     /// exit path and later exact-generation admission, never Restarting itself.
     #[test]
@@ -1618,6 +1620,7 @@ mod tests {
         assert!(
             actual
                 .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-2038-fleet")),
             "fleet.yaml model MUST reach the spawned argv on a runtime SPAWN \
              (restart_instance shape); pre-#2038 it was boot-only; got {actual:?}"
         );
