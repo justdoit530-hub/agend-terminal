@@ -1618,8 +1618,12 @@ mod tests {
         assert!(
             actual
                 .as_deref()
-                .is_some_and(|argv| argv.contains("--model model-2038-fleet")),
-            "fleet.yaml model MUST reach the spawned argv on a ru    /// #2744 T3 (e2e): a fleet entry whose DECLARED backend is shell (or any
+            "fleet.yaml model MUST reach the spawned argv on a runtime SPAWN \
+             (restart_instance shape); pre-#2038 it was boot-only; got {actual:?}"
+        );
+    }
+
+    /// #2744 T3 (e2e): a fleet entry whose DECLARED backend is shell (or any
     /// capability-less backend) keeps a legacy `model:` value out of the
     /// spawned argv — warn + skip, spawn survives. Pre-#2744 the argv got a
     /// blind `--model` appended (`bash --model X` breaks outright).
