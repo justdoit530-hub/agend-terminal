@@ -233,6 +233,25 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     // usually resolve it through the fleet entry. push_model_arg enforces
     // the first tier by never duplicating an existing flag.
     let fleet_config_for_model = std::cell::OnceCell::new();
+    // #2801: keep declared backend identity independent from the executable
+    // command. A fleet entry may declare Claude while `command` is a wrapper.
+    let params_backend = params["backend"]
+        .as_str()
+        .map(crate::backend::Backend::parse_str);
+    let declared_backend = params_backend
+        .clone()
+        .filter(|b| !matches!(b, crate::backend::Backend::Raw(_)))
+        .or_else(|| fleet_resolved.as_ref().map(|r| r.backend.clone()))
+        .or_else(|| {
+            fleet_config_for_model
+                .get_or_init(|| {
+                    crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok()
+                })
+                .as_ref()
+                .and_then(|f| f.defaults.backend.clone())
+        })
+        .or(params_backend)
+        .unwrap_or(crate::backend::Backend::ClaudeCode);
     let tier_model = params["model_tier"]
         .as_str()
         .filter(|m| !m.is_empty())
@@ -250,7 +269,15 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .or(tier_model)
         .or_else(|| fleet_resolved.as_ref().and_then(|r| r.model.as_deref()))
     {
-        crate::backend::Backend::push_model_arg(&mut args, command, model);
+        // #2744: capability keys off the DECLARED identity, never the command
+        // string (wrapper basenames misclassify). The `backend` param is
+        // dual-semantic on the wire: create paths send a declared NAME, but
+        // restart_spawn_params sends the RESOLVED COMMAND (possibly a custom
+        // path). A known name parses exactly and is a declaration; a
+        // Raw-parsed value is a command guess and must yield to the fleet
+        // entry's declared backend. Params-Raw stands only when nothing else
+        // declares — a genuinely raw backend.
+        crate::backend::Backend::push_model_arg(&mut args, &declared_backend, model);
     }
     let requested_work_dir = params["working_directory"]
         .as_str()
@@ -273,7 +300,19 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    super::prepare_instructions(ctx.home, name, command, &work_dir, explicit_role);
+    // #46776 fail-closed: a workspace-identity refusal (or provisioning I/O
+    // failure) must ABORT the spawn — never fork an agent against foreign or
+    // half-written provisioned state.
+    let behavior_command = match &declared_backend {
+        crate::backend::Backend::Shell | crate::backend::Backend::Raw(_) => command.to_string(),
+        _ => declared_backend.command_string(),
+    };
+    if let Err(e) =
+        super::prepare_instructions(ctx.home, name, &behavior_command, &work_dir, explicit_role)
+    {
+        tracing::error!(agent = %name, error = %e, "SPAWN aborted: provisioning refused");
+        return json!({"ok": false, "error": format!("provisioning refused: {e}")});
+    }
 
     // #900 hybrid (b)+(c): env precedence is params.env > fleet.yaml
     // resolved env > none. `params.env` lets the SPAWN caller pass an
@@ -300,6 +339,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         &work_dir,
         size,
         env_for_spawn,
+        Some(&declared_backend),
     ) {
         Ok(_spawn_mode) => {
             // fresh-restart self-kick: fire the first-turn recovery inject ONLY when
@@ -312,9 +352,9 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
             // is harmless.
             if params["self_kick_on_ready"].as_bool().unwrap_or(false) {
                 if let Some(id) = crate::fleet::resolve_uuid(ctx.home, name) {
-                    let ready_timeout = crate::backend::Backend::from_command(command)
-                        .map(|b| b.preset().ready_timeout_secs)
-                        .unwrap_or(30)
+                    let ready_timeout = declared_backend
+                        .preset()
+                        .ready_timeout_secs
                         .saturating_add(15);
                     agent::spawn_self_kick_bootstrap(
                         std::sync::Arc::clone(ctx.registry),
@@ -587,6 +627,7 @@ mod tests {
         // Spawn a real shell agent so the registry has an entry with a HealthTracker.
         let spawn_cfg = agent::SpawnConfig {
             name,
+            backend: None,
             backend_command: crate::default_shell(),
             args: &[],
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -618,7 +659,182 @@ mod tests {
             let _ = h.child.lock().kill();
         }
     }
+    /// Slice-2 RED: the API kill producer must publish Crashed before the PTY
+    /// exit path and later exact-generation admission, never Restarting itself.
+    #[test]
+    fn handle_kill_keeps_agent_crashed_until_execution_admission_slice2_red() {
+        let name = "slice2-kill-producer";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let response = handle_kill(&json!({"name": name}), &ctx);
+        assert_eq!(
+            response["ok"],
+            json!(true),
+            "kill must succeed: {response:?}"
+        );
 
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        let state = {
+            let reg = agent::lock_registry(ctx.registry);
+            let core = Arc::clone(
+                &reg.get(&id)
+                    .expect("kill does not remove the registry entry")
+                    .core,
+            );
+            drop(reg);
+            let state = core.lock().state.get_state();
+            state
+        };
+        assert_eq!(
+            state,
+            crate::state::AgentState::Crashed,
+            "API kill must not publish Restarting before permit admission"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+    /// Slice-2 RED: Crashed has a distinct INJECT rejection message; calling
+    /// it "restarting" hides the fact that no execution permit was admitted.
+    #[test]
+    fn inject_rejection_names_crashed_state_slice2_red() {
+        let name = "slice2-inject-crashed";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        {
+            let reg = agent::lock_registry(ctx.registry);
+            reg.get(&id)
+                .expect("spawned handle")
+                .core
+                .lock()
+                .state
+                .current = crate::state::AgentState::Crashed;
+        }
+
+        let response = handle_inject(&json!({"name": name, "data": "x", "raw": true}), &ctx);
+        assert_eq!(response["ok"], json!(false));
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("crashed")),
+            "Crashed INJECT rejection must say crashed: {response:?}"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+    /// Sibling of [`test_ctx_with_agent`]: spawns a REAL, permanently-wedged
+    /// agent (`stty raw -echo; sleep 30` — never drains stdin) instead of a
+    /// healthy shell, so a caller can force a genuine PTY write failure
+    /// through the real `write_actor::register`ed production path (#2620).
+    /// `cfg`-gated with its sole caller below (Unix-only) to avoid an
+    /// unused-fn warning on Windows.
+    #[cfg(not(target_os = "windows"))]
+    fn test_ctx_with_wedged_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
+        let home = Box::new(std::env::temp_dir().join(format!(
+            "agend-api-inst-wedged-{}-{}",
+            name,
+            std::process::id()
+        )));
+        std::fs::create_dir_all(home.as_ref()).ok();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home.as_ref()),
+            format!(
+                "instances:\n  {name}:\n    id: {}\n",
+                crate::types::InstanceId::new().full()
+            ),
+        )
+        .ok();
+
+        let registry: &'static agent::AgentRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let configs: &'static crate::api::ConfigRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+        let externals: &'static agent::ExternalRegistry =
+            Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
+
+        let wedge_args = vec!["-c".to_string(), "stty raw -echo; sleep 30".to_string()];
+        let spawn_cfg = agent::SpawnConfig {
+            name,
+            backend: None,
+            backend_command: "sh",
+            args: &wedge_args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: Some(home.as_ref()),
+            crash_tx: None,
+            shutdown: None,
+        };
+        agent::spawn_agent(&spawn_cfg, registry).expect("spawn wedged test agent");
+        // Let `stty raw -echo` take effect — mirrors write_actor.rs's own
+        // `wedged_pty()` fixture's post-spawn wait.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let home_ref: &'static std::path::Path = Box::leak(home.clone());
+        let ctx = HandlerCtx {
+            registry,
+            configs,
+            externals,
+            notifier: None,
+            home: home_ref,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+        };
+        (ctx, home)
+    }
+
+    /// t-...14440-6 caller-level integration pin: the API INJECT handler's
+    /// `{"ok":false,"error":...}` shape (instance.rs:57, post-#2620) survives
+    /// a GENUINE write failure through the real actor-mediated path — not a
+    /// panic, not a hang, not a silently-`true` response. Backpressure-
+    /// saturates the target's real write_actor queue first (same recipe as
+    /// `recovery_dispatcher`'s #2620 caller pin), so the raw inject below is
+    /// guaranteed to hit the `Err` arm.
+    ///
+    /// Unix-only: the wedge fixture (`sh -c "stty raw -echo; sleep 30"`) and
+    /// `write_actor` itself don't exist on Windows.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn handle_inject_returns_ok_false_on_genuine_actor_write_failure_2620() {
+        let name = "wedged-inject-target";
+        let (ctx, home) = test_ctx_with_wedged_agent(name);
+
+        let pty_writer = {
+            let reg = agent::lock_registry(ctx.registry);
+            let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet.yaml seeded id");
+            let handle = reg.get(&id).expect("spawned handle must be present");
+            Arc::clone(&handle.pty_writer)
+        };
+        // Saturate the queue (see write_actor.rs's MAX_QUEUE_BYTES_PER_WRITER,
+        // 1 MiB at time of writing — duplicated here by value, private to
+        // that module) so the handler's own write below genuinely fails.
+        let priming_result = agent::write_to_pty(&pty_writer, &vec![b'x'; 1 << 20]);
+        assert!(
+            priming_result.is_err(),
+            "test invariant: the priming write itself must also see a saturated/wedged queue"
+        );
+
+        let resp = handle_inject(&json!({"name": name, "data": "x", "raw": true}), &ctx);
+
+        assert_eq!(
+            resp["ok"],
+            json!(false),
+            "a genuine write failure must surface as ok:false, not panic/hang: {resp:?}"
+        );
+        assert!(
+            resp["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "the false response must carry a non-empty error string: {resp:?}"
+        );
+
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+>>>>>>> 6312e512 (fix: preserve declared backend through wrapper commands (#2834))
     /// t-90 (direction-b common case): a name already held by an EXTERNAL agent
     /// must NOT be spawnable as a managed agent — `handle_spawn` rejects it at
     /// the external check (Option B) BEFORE any registry lock or spawn.
@@ -1009,6 +1225,7 @@ mod tests {
             &work_dir,
             size,
             None,
+            None,
         );
         assert!(result.is_ok(), "spawn_one must succeed: {result:?}");
 
@@ -1345,7 +1562,10 @@ mod tests {
     /// Write a tiny shell script that captures its own argv (`$*`) to
     /// `sentinel_path` then sleeps so the agent stays alive long enough for
     /// cleanup_agent to reap it. The daemon-appended `--model <val>` lands in
-    /// the script's argv, so the sentinel content IS the spawned argv tail.
+    /// the script's argv, so the sentinel content IS the spawned argv tail. The
+    /// file is executable so it can stand in for a realistically named wrapper:
+    /// declared backend presets may precede caller args without `/bin/sh`
+    /// interpreting them as shell options (#2801).
     #[cfg(unix)]
     fn write_argv_capture_script(
         home: &std::path::Path,
@@ -1357,6 +1577,12 @@ mod tests {
             sentinel_path.display()
         );
         std::fs::write(&script, body).expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make script executable");
         script
     }
 
@@ -1380,8 +1606,7 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "model-fleet-test",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
                 // No --model in args, none in params — must come from fleet.yaml.
             }),
             &ctx,
@@ -1392,18 +1617,160 @@ mod tests {
         cleanup_agent(&ctx, "model-fleet-test");
         let _ = std::fs::remove_dir_all(&home);
 
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-fleet"),
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-2038-fleet")),
             "fleet.yaml model MUST reach the spawned argv on a runtime SPAWN \
-             (restart_instance shape); pre-#2038 it was boot-only"
+             (restart_instance shape); pre-#2038 it was boot-only; got {actual:?}"
         );
     }
 
-    /// #2038 ingress 2 (replace_instance shape) — SPAWN params omit `args`
-    /// entirely; handle_spawn MUST fall back to the fleet entry's resolved
-    /// `args` AND append its `model`. Pre-fix replace respawned with empty
-    /// argv: both fleet args and model were dropped.
+    /// #2744 T3 (e2e): a fleet entry whose DECLARED backend is shell (or any
+    /// capability-less backend) keeps a legacy `model:` value out of the
+    /// spawned argv — warn + skip, spawn survives. Pre-#2744 the argv got a
+    /// blind `--model` appended (`bash --model X` breaks outright).
+    #[cfg(unix)]
+    #[test]
+    fn handle_spawn_declared_shell_never_injects_model_2744() {
+        let (ctx, home) = env_test_ctx("handle-spawn-shell-no-model");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  shell-no-model-test:\n    backend: shell\n    model: legacy-model\n",
+        )
+        .expect("write fleet.yaml");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "shell-no-model-test",
+                "backend": script.display().to_string(),
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "shell-no-model-test");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(
+            actual.as_deref(),
+            Some("__NO_ARGS__"),
+            "a declared-shell entry's legacy model MUST be withheld from argv \
+             (warn + skip), not blindly appended (#2744)"
+        );
+    }
+
+    /// #2744 T1 (§3.9 persistence replay): MCP set_model → fleet.yaml →
+    /// the real SPAWN entry (restart wire shape: params.backend carries the
+    /// resolved command) → child argv, for all six declared backends. Pins
+    /// per-backend value normalization (opencode provider prefix).
+    #[cfg(unix)]
+    #[test]
+    fn set_model_write_restart_argv_replay_all_backends_2744() {
+        let cases = [
+            ("claude", "claude-opus-4-8", "--model claude-opus-4-8"),
+            ("codex", "gpt-5.5", "--model gpt-5.5"),
+            ("kiro-cli", "claude-sonnet-4.5", "--model claude-sonnet-4.5"),
+            ("opencode", "opus", "--model anthropic/opus"),
+            ("agy", "gemini-3-pro", "--model gemini-3-pro"),
+            ("grok", "grok-4.5", "--model grok-4.5"),
+        ];
+        for (backend, model, want) in cases {
+            let tag = format!("setmodel-replay-{backend}");
+            let (ctx, home) = env_test_ctx(&tag);
+            let sentinel = home.join("sentinel.txt");
+            let script = write_argv_capture_script(&home, &sentinel);
+            std::fs::write(
+                crate::fleet::fleet_yaml_path(&home),
+                format!("instances:\n  seat:\n    backend: {backend}\n"),
+            )
+            .expect("write fleet.yaml");
+
+            let r = crate::mcp::handlers::instance_state::set_model::handle_set_model(
+                &home,
+                &json!({"instance": "seat", "model": model}),
+                &None,
+            );
+            assert_eq!(r["persisted"], true, "{backend}: must persist, got {r}");
+
+            let result = handle_spawn(
+                &json!({
+                    "name": "seat",
+                    "backend": script.display().to_string(),
+                }),
+                &ctx,
+            );
+            assert_eq!(
+                result["ok"], true,
+                "{backend}: spawn must succeed: {result}"
+            );
+            let actual = await_sentinel_nonempty(&sentinel);
+            cleanup_agent(&ctx, "seat");
+            let _ = std::fs::remove_dir_all(&home);
+            assert!(
+                actual.as_deref().is_some_and(|argv| argv.contains(want)),
+                "{backend}: persisted model must reach the spawned argv; got {actual:?}"
+            );
+        }
+    }
+
+    /// #2744 T9: an external (operator hand-)edit of fleet.yaml AFTER a
+    /// set_model write is honoured by the next SPAWN — the handler re-reads
+    /// disk at the boundary (#2038); set_model leaves no cached intent.
+    #[cfg(unix)]
+    #[test]
+    fn set_model_then_external_edit_reload_2744() {
+        let (ctx, home) = env_test_ctx("setmodel-external-edit");
+        let sentinel = home.join("sentinel.txt");
+        let script = write_argv_capture_script(&home, &sentinel);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  seat:\n    backend: claude\n",
+        )
+        .expect("write fleet.yaml");
+
+        let r = crate::mcp::handlers::instance_state::set_model::handle_set_model(
+            &home,
+            &json!({"instance": "seat", "model": "model-from-tool"}),
+            &None,
+        );
+        assert_eq!(r["persisted"], true, "got {r}");
+
+        // Operator hand-edit AFTER the tool write (keep the entry shape).
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  seat:\n    backend: claude\n    model: model-hand-edited\n",
+        )
+        .expect("external edit");
+
+        let result = handle_spawn(
+            &json!({
+                "name": "seat",
+                "backend": script.display().to_string(),
+            }),
+            &ctx,
+        );
+        assert_eq!(result["ok"], true, "spawn must succeed: {result}");
+        let actual = await_sentinel_nonempty(&sentinel);
+        cleanup_agent(&ctx, "seat");
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-hand-edited")),
+            "the external edit must win on the next spawn (disk re-read); got {actual:?}"
+        );
+    }
+
+    /// #2038 ingress 2 (deploy Phase 3 / args-less SPAWN shape) — SPAWN
+    /// params omit `args` entirely; handle_spawn MUST fall back to the
+    /// fleet entry's resolved `args` AND append its `model`. Pre-fix an
+    /// args-less respawn had empty argv: both fleet args and model were
+    /// dropped.
     #[cfg(unix)]
     #[test]
     fn handle_spawn_falls_back_to_fleet_yaml_args_and_model_2038() {
@@ -1413,18 +1780,15 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            format!(
-                "instances:\n  args-fleet-test:\n    backend: shell\n    args:\n      - {}\n    model: model-2038-replace\n",
-                script.display()
-            ),
+            "instances:\n  args-fleet-test:\n    backend: claude\n    args:\n      - from-fleet\n    model: model-2038-replace\n",
         )
         .expect("write fleet.yaml");
 
         let result = handle_spawn(
             &json!({
                 "name": "args-fleet-test",
-                "backend": "/bin/sh",
-                // No "args" field at all — the replace_instance wire shape.
+                "backend": script.display().to_string(),
+                // No "args" field at all — the deploy Phase 3 (args-less SPAWN) wire shape.
             }),
             &ctx,
         );
@@ -1436,11 +1800,12 @@ mod tests {
 
         // The script itself ran (proving fleet args fallback) and saw the
         // appended model flag (proving model fallback).
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-replace"),
-            "an args-less SPAWN (replace_instance shape) MUST respawn with the \
-             fleet entry's args + model"
+        assert!(
+            actual.as_deref().is_some_and(|argv| {
+                argv.contains("from-fleet") && argv.contains("--model model-2038-replace")
+            }),
+            "an args-less SPAWN (deploy Phase 3 shape) MUST respawn with the \
+             fleet entry's args + model; got {actual:?}"
         );
     }
 
@@ -1463,8 +1828,8 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "model-prec-test",
-                "backend": "/bin/sh",
-                "args": format!("{} --model model-2038-explicit", script.display()),
+                "backend": script.display().to_string(),
+                "args": "--model model-2038-explicit",
             }),
             &ctx,
         );
@@ -1476,8 +1841,13 @@ mod tests {
 
         let argv = actual.expect("sentinel must have content");
         assert_eq!(
-            argv, "--model model-2038-explicit",
-            "caller-passed --model MUST win over fleet.yaml model with no duplicate flag"
+            argv.matches("--model").count(),
+            1,
+            "caller-passed --model MUST win over fleet.yaml model with no duplicate flag; got {argv}"
+        );
+        assert!(
+            argv.contains("--model model-2038-explicit"),
+            "caller model value must be preserved; got {argv}"
         );
     }
 
@@ -1502,8 +1872,7 @@ mod tests {
         let result = handle_spawn(
             &json!({
                 "name": "params-model-test",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
                 "model": "model-2038-params",
             }),
             &ctx,
@@ -1514,10 +1883,11 @@ mod tests {
         cleanup_agent(&ctx, "params-model-test");
         let _ = std::fs::remove_dir_all(&home);
 
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-params"),
-            "params.model MUST be honoured and win over the fleet entry's model"
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-2038-params")),
+            "params.model MUST be honoured and win over the fleet entry's model; got {actual:?}"
         );
     }
 
@@ -1534,15 +1904,14 @@ mod tests {
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: shell\n    model: model-2038-inst-wins\n",
+            "defaults:\n  model: model-2038-default-loser\ninstances:\n  inst-model-test:\n    backend: claude\n    model: model-2038-inst-wins\n",
         )
         .expect("write fleet.yaml");
 
         let result = handle_spawn(
             &json!({
                 "name": "inst-model-test",
-                "backend": "/bin/sh",
-                "args": script.display().to_string(),
+                "backend": script.display().to_string(),
             }),
             &ctx,
         );
@@ -1552,10 +1921,11 @@ mod tests {
         cleanup_agent(&ctx, "inst-model-test");
         let _ = std::fs::remove_dir_all(&home);
 
-        assert_eq!(
-            actual.as_deref(),
-            Some("--model model-2038-inst-wins"),
-            "per-instance model MUST override defaults.model at the SPAWN entry"
+        assert!(
+            actual
+                .as_deref()
+                .is_some_and(|argv| argv.contains("--model model-2038-inst-wins")),
+            "per-instance model MUST override defaults.model at the SPAWN entry; got {actual:?}"
         );
     }
 
@@ -1585,7 +1955,7 @@ mod tests {
             &json!({
                 "name": "team2038",
                 "count": 1,
-                "backend": "/bin/sh",
+                "backend": "claude",
             }),
             &ctx,
         );

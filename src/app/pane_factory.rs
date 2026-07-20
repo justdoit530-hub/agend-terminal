@@ -124,19 +124,71 @@ pub(super) fn create_pane(
     name_counter: &mut HashMap<String, usize>,
     identity: SpawnIdentity,
 ) -> Result<Pane> {
+    create_pane_with_backend(
+        layout,
+        registry,
+        home,
+        base_name,
+        command,
+        args,
+        spawn_mode,
+        working_dir,
+        env,
+        submit_key,
+        cols,
+        rows,
+        wakeup_tx,
+        name_counter,
+        identity,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_pane_with_backend(
+    layout: &mut Layout,
+    registry: &AgentRegistry,
+    home: &Path,
+    base_name: &str,
+    command: &str,
+    args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
+    working_dir: Option<&Path>,
+    env: &HashMap<String, String>,
+    submit_key: &str,
+    cols: u16,
+    rows: u16,
+    wakeup_tx: &crossbeam_channel::Sender<usize>,
+    name_counter: &mut HashMap<String, usize>,
+    identity: SpawnIdentity,
+    declared_backend: Option<&Backend>,
+) -> Result<Pane> {
     let (mut pane, fwd_tx) = build_pane_placeholder(
         layout,
         home,
         base_name,
         command,
+        declared_backend,
         working_dir,
         cols,
         rows,
         name_counter,
     );
     attach_agent_to_pane(
-        &mut pane, fwd_tx, registry, home, command, args, spawn_mode, env, submit_key, cols, rows,
-        wakeup_tx, identity,
+        &mut pane,
+        fwd_tx,
+        registry,
+        home,
+        command,
+        args,
+        spawn_mode,
+        env,
+        submit_key,
+        cols,
+        rows,
+        wakeup_tx,
+        identity,
+        declared_backend,
     )?;
     Ok(pane)
 }
@@ -158,6 +210,7 @@ fn build_pane_placeholder(
     home: &Path,
     base_name: &str,
     command: &str,
+    declared_backend: Option<&Backend>,
     working_dir: Option<&Path>,
     cols: u16,
     rows: u16,
@@ -179,7 +232,9 @@ fn build_pane_placeholder(
 
     let pane_id = layout.next_pane_id();
     let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-    let backend = Backend::from_command(command);
+    let backend = declared_backend
+        .cloned()
+        .or_else(|| Backend::from_command(command));
 
     let pane = Pane {
         agent_name: name.into(),
@@ -226,6 +281,7 @@ fn attach_agent_to_pane(
     rows: u16,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
     identity: SpawnIdentity,
+    declared_backend: Option<&Backend>,
 ) -> Result<()> {
     let name = pane.agent_name.to_string();
     let work_dir = pane
@@ -239,8 +295,19 @@ fn attach_agent_to_pane(
     // `spawn_and_subscribe` on a background worker (touches only the shareable
     // registry) while the render thread runs `apply_attachment` (pane mutation).
     let (instance_id, rx, dump) = spawn_and_subscribe(
-        registry, home, &name, command, args, spawn_mode, env, submit_key, &work_dir, cols, rows,
+        registry,
+        home,
+        &name,
+        command,
+        args,
+        spawn_mode,
+        env,
+        submit_key,
+        &work_dir,
+        cols,
+        rows,
         identity,
+        declared_backend,
     )?;
     apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
     Ok(())
@@ -267,14 +334,34 @@ fn spawn_and_subscribe(
     cols: u16,
     rows: u16,
     identity: SpawnIdentity,
+    declared_backend: Option<&Backend>,
 ) -> Result<(
     crate::types::InstanceId,
     crossbeam_channel::Receiver<Vec<u8>>,
     Vec<u8>,
 )> {
+    let effective_backend = declared_backend
+        .cloned()
+        .or_else(|| Backend::from_command(command));
+    let behavior_command = declared_backend
+        .filter(|backend| !matches!(backend, Backend::Shell | Backend::Raw(_)))
+        .map(Backend::command_string)
+        .unwrap_or_else(|| command.to_string());
+
     // Generate MCP config for agent backends
-    if Backend::from_command(command).is_some() {
-        crate::instructions::generate(work_dir, command);
+    if effective_backend
+        .as_ref()
+        .is_some_and(|backend| !matches!(backend, Backend::Shell | Backend::Raw(_)))
+    {
+        match identity {
+            SpawnIdentity::Managed => {
+                crate::instructions::generate_for_owner(work_dir, &behavior_command, name)
+            }
+            SpawnIdentity::UnmanagedLocalShell => {
+                crate::instructions::generate(work_dir, &behavior_command)
+            }
+        }
+        .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     }
 
     // #1083: install skills for TUI-spawned panes (app mode).
@@ -292,7 +379,7 @@ fn spawn_and_subscribe(
                 .ok()
                 .and_then(|c| c.instances.get(name).and_then(|i| i.skills_path.clone()))
                 .map(|p| crate::fleet::resolve::expand_tilde_path(&p));
-        let backend_skill = Backend::from_command(command).and_then(|b| b.skill_dir_name());
+        let backend_skill = effective_backend.and_then(|b| b.skill_dir_name());
         match crate::skills::install_for_agent_backend_with_source(
             home,
             work_dir,
@@ -333,6 +420,7 @@ fn spawn_and_subscribe(
     let instance_id = agent::spawn_agent(
         &agent::SpawnConfig {
             name,
+            backend: declared_backend,
             backend_command: command,
             args,
             spawn_mode,
@@ -581,6 +669,7 @@ pub(super) fn build_deferred_agent_pane(
         home,
         fleet_name,
         &resolved.backend_command,
+        Some(&resolved.backend),
         resolved.working_directory.as_deref(),
         cols,
         rows,
@@ -626,6 +715,7 @@ pub(super) fn build_deferred_direct_pane(
         home,
         base_name,
         command,
+        None,
         working_dir,
         cols,
         rows,
@@ -795,6 +885,7 @@ pub(super) fn run_attach(
                 cols,
                 rows,
                 SpawnIdentity::Managed,
+                Some(&resolved.backend),
             ) {
                 Ok((instance_id, rx, dump)) => {
                     // Overwrite basic instructions with the fleet-aware version
@@ -813,7 +904,19 @@ pub(super) fn run_attach(
                         team: team_ctx.as_ref(),
                         extra_instructions: extra_instructions.as_deref(),
                     };
-                    crate::instructions::generate_with_context(&work_dir, &command, Some(&ctx));
+                    let behavior_command = resolved.backend.command_string();
+                    if let Err(e) = crate::instructions::generate_with_context(
+                        &work_dir,
+                        &behavior_command,
+                        Some(&ctx),
+                    ) {
+                        tracing::error!(agent = %deduped_name, error = %e, "provisioning refused; not attaching");
+                        return AttachOutcome::Failed {
+                            pane_id,
+                            name: deduped_name,
+                            err: format!("provisioning refused: {e}"),
+                        };
+                    }
                     finish_attach(
                         registry,
                         pane_id,
@@ -856,6 +959,7 @@ pub(super) fn run_attach(
             // AttachSpec::Direct is the deferred SHELL / direct-command path
             // (see `build_deferred_direct_pane`) — unmanaged, no fleet.yaml entry.
             SpawnIdentity::UnmanagedLocalShell,
+            None,
         ) {
             Ok((instance_id, rx, dump)) => {
                 finish_attach(registry, pane_id, instance_id, rx, dump, work_dir, name)
@@ -1073,7 +1177,7 @@ pub(super) fn create_pane_from_resolved(
         args.push(model_val);
     }
 
-    let mut pane = create_pane(
+    let mut pane = create_pane_with_backend(
         layout,
         registry,
         home,
@@ -1089,11 +1193,14 @@ pub(super) fn create_pane_from_resolved(
         wakeup_tx,
         name_counter,
         SpawnIdentity::Managed,
+        Some(&resolved.backend),
     )?;
 
     // Overwrite basic instructions with fleet-aware version
     if let Some(ref wd) = pane.working_dir {
-        crate::instructions::generate_with_context(wd, &resolved.backend_command, Some(&ctx));
+        let behavior_command = resolved.backend.command_string();
+        crate::instructions::generate_with_context(wd, &behavior_command, Some(&ctx))
+            .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     }
     pane.fleet_instance_name = Some(fleet_name.to_string());
     Ok(pane)
@@ -1276,6 +1383,211 @@ mod tests {
         String::from_utf8_lossy(&pane.vterm.dump_screen()).to_string()
     }
 
+    // ── #2744 r1: app-path model chokepoint (deferred + sync entries) ──
+
+    #[cfg(unix)]
+    fn argv_capture_script(home: &std::path::Path, sentinel: &std::path::Path) -> String {
+        let script = home.join("argv-capture.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"${{*:-__NO_ARGS__}}\" > '{}'\nsleep 30\n",
+                sentinel.display()
+            ),
+        )
+        .expect("write script");
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).expect("make script executable");
+        script.display().to_string()
+    }
+
+    #[cfg(unix)]
+    fn register_seat(home: &std::path::Path, name: &str) {
+        // #1441: managed spawns refuse unregistered instances — give the seat
+        // an authoritative fleet.yaml id.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            format!(
+                "instances:\n  {name}:\n    id: {}\n",
+                crate::types::InstanceId::new().full()
+            ),
+        )
+        .expect("write fleet.yaml");
+    }
+
+    #[cfg(unix)]
+    fn await_sentinel(path: &std::path::Path) -> Option<String> {
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    fn resolved_seat(
+        name: &str,
+        backend: crate::backend::Backend,
+        args: Vec<String>,
+        model: Option<&str>,
+        work_dir: &std::path::Path,
+    ) -> crate::fleet::ResolvedInstance {
+        crate::fleet::ResolvedInstance {
+            name: name.into(),
+            backend,
+            // The command wire stays /bin/sh (capture harness) — the declared
+            // identity above must drive the model decision, not this string.
+            backend_command: "/bin/sh".into(),
+            args,
+            env: HashMap::new(),
+            working_directory: Some(work_dir.to_path_buf()),
+            ready_pattern: None,
+            submit_key: "\r".into(),
+            role: None,
+            cols: None,
+            rows: None,
+            topic_id: None,
+            git_branch: None,
+            model: model.map(String::from),
+            worktree: Some(false),
+            instructions: None,
+            source_repo: None,
+            repo: None,
+        }
+    }
+
+    /// #2744 r1 (deferred app path): `run_attach` — the real deferred-spawn
+    /// entry — must route model intent through the capability chokepoint:
+    /// declared opencode identity formats the value under a non-opencode
+    /// command wire (wrapper class), and a declared shell seat never
+    /// receives --model.
+    #[cfg(unix)]
+    #[test]
+    fn run_attach_routes_model_through_chokepoint_2744() {
+        let registry: &'static AgentRegistry = Box::leak(Box::default());
+        for (tag, backend, model, want) in [
+            (
+                "wrap",
+                crate::backend::Backend::OpenCode,
+                Some("opus"),
+                "--model anthropic/opus",
+            ),
+            (
+                "shell",
+                crate::backend::Backend::Shell,
+                Some("legacy"),
+                "__NO_ARGS__",
+            ),
+        ] {
+            let home = tmp_home(&format!("rf_model_{tag}"));
+            let sentinel = home.join("sentinel.txt");
+            let script = argv_capture_script(&home, &sentinel);
+            register_seat(&home, &format!("seat-{tag}"));
+            let resolved = resolved_seat(
+                &format!("seat-{tag}"),
+                backend.clone(),
+                vec![script],
+                model,
+                &home,
+            );
+            let outcome = run_attach(
+                AttachSpec::Agent {
+                    fleet_name: format!("seat-{tag}"),
+                    deduped_name: format!("seat-{tag}"),
+                    resolved,
+                    spawn_mode: crate::backend::SpawnMode::Fresh,
+                    cols: 80,
+                    rows: 24,
+                },
+                0,
+                registry,
+                &home,
+            );
+            assert!(
+                matches!(outcome, AttachOutcome::Ready { .. }),
+                "{tag}: attach must succeed"
+            );
+            let actual = await_sentinel(&sentinel);
+            crate::agent::lock_registry(registry).clear();
+            std::fs::remove_dir_all(&home).ok();
+            let actual = actual.expect("capture output");
+            if tag == "wrap" {
+                assert!(
+                    actual.contains(want),
+                    "{tag}: declared backend must preserve the model flag among preset args; got {actual}"
+                );
+            } else {
+                assert_eq!(
+                    actual, want,
+                    "{tag}: deferred app path must apply the capability gate"
+                );
+            }
+        }
+    }
+
+    /// #2744 r1 (sync app path): `create_pane_from_resolved` — the real
+    /// synchronous pane entry — must route model intent through the same
+    /// chokepoint (dedupe: an explicit args flag wins with no duplicate).
+    #[cfg(unix)]
+    #[test]
+    fn create_pane_from_resolved_routes_model_through_chokepoint_2744() {
+        let registry: &'static AgentRegistry = Box::leak(Box::default());
+        let home = tmp_home("sync_model");
+        let sentinel = home.join("sentinel.txt");
+        let script = argv_capture_script(&home, &sentinel);
+        register_seat(&home, "seat-sync");
+        let mut resolved = resolved_seat(
+            "seat-sync",
+            crate::backend::Backend::ClaudeCode,
+            vec!["--model".into(), "pinned".into()],
+            Some("fleet-loser"),
+            &home,
+        );
+        // Use the capture script itself as the wrapper executable. The declared
+        // Claude identity must enrich its argv without relying on its basename.
+        resolved.backend_command = script;
+        let mut layout = Layout::new();
+        let mut name_counter = HashMap::new();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let pane = create_pane_from_resolved(
+            "seat-sync",
+            &resolved,
+            &mut layout,
+            registry,
+            &home,
+            80,
+            24,
+            &wakeup_tx,
+            &mut name_counter,
+            crate::backend::SpawnMode::Fresh,
+        )
+        .expect("pane must spawn");
+        let actual = await_sentinel(&sentinel);
+        drop(pane);
+        crate::agent::lock_registry(registry).clear();
+        std::fs::remove_dir_all(&home).ok();
+        let actual = actual.expect("capture output");
+        assert_eq!(
+            actual.matches("--model").count(),
+            1,
+            "sync app path must dedupe against the explicit args flag; got {actual}"
+        );
+        assert!(
+            actual.contains("--model pinned")
+                && actual.contains("--dangerously-skip-permissions")
+                && actual.contains("--append-system-prompt-file")
+                && actual.contains("--mcp-config"),
+            "declared Claude identity must provision and inject its preset flags through a wrapper; got {actual}"
+        );
+    }
     /// #render-first phase-(b) — must-resolve #4 (new behavior) + deferral proof:
     /// the placeholder is built WITHOUT spawning (no registry needed) and shows a
     /// "Starting" banner; the spawn recipe rides along in the AttachJob.
