@@ -3,9 +3,9 @@
 //! alert goes to the agent's team orchestrator (and the usage is visible via
 //! LIST `context_pct`/`context_source`); nothing is auto-restarted.
 //!
-//! Source per agent (see `StateTracker::resolved_context`): typed context
-//! providers. Today only statusline providers produce readings; unavailable
-//! backends are honestly `unknown` (no alert, `null` in LIST).
+//! Source per agent (see `StateTracker::resolved_context`): the statusline
+//! `pattern` ONLY — a pane whose statusline can't be read is honestly
+//! `unknown` (no alert, `null` in LIST).
 //!
 //! #1945-disable (operator decision, 2026-06-10): the transcript-estimate
 //! fallback is DISABLED — its first live minute fired a triple false 100%
@@ -21,22 +21,66 @@
 
 use super::{PerTickHandler, TickContext};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Default alert threshold (percent). Override: `AGEND_CONTEXT_ALERT_PCT`.
-const DEFAULT_ALERT_PCT: f32 = 80.0;
-/// Re-arm requires dropping this far below the threshold (compact/restart),
-/// so boundary noise can't re-fire.
-const HYSTERESIS_PCT: f32 = 5.0;
 /// Re-alert cadence while usage stays continuously above the threshold.
 const REALERT_AFTER: Duration = Duration::from_secs(30 * 60);
 
+#[cfg(test)]
 fn alert_threshold() -> f32 {
-    std::env::var("AGEND_CONTEXT_ALERT_PCT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_ALERT_PCT)
+    let (alert, _, _) = crate::runtime_config::resolve_effective_thresholds();
+    alert
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ThresholdTriplet {
+    pub(super) alert: f32,
+    pub(super) handoff: f32,
+    pub(super) escalate: f32,
+}
+
+pub(super) type InvalidOverrideWarnings = Arc<Mutex<HashSet<String>>>;
+
+pub(super) fn resolve_instance_thresholds(
+    name: &str,
+    global: ThresholdTriplet,
+    fleet: &crate::fleet::FleetConfig,
+    warnings: &InvalidOverrideWarnings,
+) -> ThresholdTriplet {
+    let Some(instance) = fleet.instances.get(name) else {
+        warnings.lock().remove(name);
+        return global;
+    };
+    let composed = ThresholdTriplet {
+        alert: instance.context_alert_pct.unwrap_or(global.alert),
+        handoff: instance.context_handoff_pct.unwrap_or(global.handoff),
+        escalate: instance
+            .context_handoff_escalate_pct
+            .unwrap_or(global.escalate),
+    };
+    if crate::runtime_config::validate_thresholds(
+        composed.alert,
+        composed.handoff,
+        composed.escalate,
+    )
+    .is_ok()
+    {
+        warnings.lock().remove(name);
+        return composed;
+    }
+
+    if warnings.lock().insert(name.to_string()) {
+        tracing::warn!(
+            agent = %name,
+            alert = composed.alert,
+            handoff = composed.handoff,
+            escalate = composed.escalate,
+            "context thresholds invalid for instance; using complete global triplet"
+        );
+    }
+    global
 }
 
 /// Per-agent alert latch.
@@ -71,7 +115,7 @@ fn decide(state: &mut AlertState, pct: f32, threshold: f32, now: Instant) -> boo
         }
         return false;
     }
-    if pct < threshold - HYSTERESIS_PCT {
+    if pct < threshold - crate::runtime_config::HYSTERESIS_PCT {
         state.armed = true;
     }
     false
@@ -80,14 +124,39 @@ fn decide(state: &mut AlertState, pct: f32, threshold: f32, now: Instant) -> boo
 pub(crate) struct ContextAlertHandler {
     gate: crate::daemon::cadence_gate::CadenceGate,
     states: Mutex<HashMap<String, AlertState>>,
+    invalid_override_warnings: InvalidOverrideWarnings,
 }
 
 impl ContextAlertHandler {
     pub(crate) fn new(every_n_ticks: u64) -> Self {
+        Self::new_with_warnings(every_n_ticks, Arc::new(Mutex::new(HashSet::new())))
+    }
+
+    pub(super) fn new_with_warnings(
+        every_n_ticks: u64,
+        invalid_override_warnings: InvalidOverrideWarnings,
+    ) -> Self {
         Self {
             gate: crate::daemon::cadence_gate::CadenceGate::new(every_n_ticks),
             states: Mutex::new(HashMap::new()),
+            invalid_override_warnings,
         }
+    }
+
+    /// Test-only: whether `name`'s alert latch is currently armed (`None` if
+    /// the agent has no latch entry yet). Used by the #2549 W5 merge's
+    /// cross-independence pin — proves `ContextHandoffHandler` firing never
+    /// touches this handler's OWN latch, and vice versa (P2-2549-SPIKE.md
+    /// §3c: the two handlers' latch/hysteresis state must stay independent
+    /// after the merge).
+    #[cfg(test)]
+    pub(crate) fn is_armed(&self, name: &str) -> Option<bool> {
+        self.states.lock().get(name).map(|s| s.armed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalid_warning_count(&self) -> usize {
+        self.invalid_override_warnings.lock().len()
     }
 }
 
@@ -101,9 +170,9 @@ impl PerTickHandler for ContextAlertHandler {
             return;
         }
 
-        // Phase 1 (cheap, locks only): snapshot each agent's resolved context.
-        // Unavailable providers return None, so they stay unknown and never
-        // alert as a guessed 100%.
+        // Phase 1 (cheap, locks only): snapshot each agent's resolved context
+        // — statusline pattern only (#1945-disable: no transcript estimate;
+        // an unreadable pane is unknown and never alerts).
         let mut resolved: Vec<(String, f32, &'static str)> = Vec::new();
         // #latch-prune (cleanup-on-delete, #1923 G5 class): capture ALL live
         // agent names — not just those with a context reading — so the per-agent
@@ -114,22 +183,29 @@ impl PerTickHandler for ContextAlertHandler {
             let mut live = std::collections::HashSet::new();
             for handle in reg.values() {
                 live.insert(handle.name.as_str().to_string());
-                if let Some((pct, source)) =
-                    handle.core.lock().state.resolved_context(Some(ctx.home))
-                {
+                if let Some((pct, source)) = handle.core.lock().state.resolved_context(Some(ctx.home)) {
                     resolved.push((handle.name.as_str().to_string(), pct, source.source_name()));
                 }
             }
             live
         };
 
-        // Phase 2: threshold/hysteresis evaluation + orchestrator notify.
-        let threshold = alert_threshold();
+        // Phase 2: resolve one global snapshot, then overlay each instance's
+        // optional fields while evaluating its own latch.
+        let (alert, handoff, escalate) = crate::runtime_config::resolve_effective_thresholds();
+        let global = ThresholdTriplet {
+            alert,
+            handoff,
+            escalate,
+        };
         let now = Instant::now();
-        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home))
-            .unwrap_or_default();
+        let fleet = crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(ctx.home))
+            .unwrap_or_else(|_| Arc::new(crate::fleet::FleetConfig::default()));
         let mut states = self.states.lock();
         for (name, pct, source) in resolved {
+            let threshold =
+                resolve_instance_thresholds(&name, global, &fleet, &self.invalid_override_warnings)
+                    .alert;
             let state = states.entry(name.clone()).or_default();
             if !decide(state, pct, threshold, now) {
                 continue;
@@ -145,8 +221,8 @@ impl PerTickHandler for ContextAlertHandler {
                 continue;
             }
             let text = format!(
-                "[context_alert] agent '{name}' context usage at {pct:.0}% \
-                 (source: {source}, threshold {threshold:.0}%). Handling is NOT \
+                "[context_alert] agent '{name}' context usage at {pct:.1}% \
+                 (source: {source}, threshold {threshold:.1}%). Handling is NOT \
                  automated — at a natural boundary consider a handoff + \
                  restart_instance to free the context. Re-alerts every 30min \
                  while it stays high."
@@ -168,12 +244,17 @@ impl PerTickHandler for ContextAlertHandler {
         // #latch-prune: drop latch entries for agents gone from the registry
         // (cleanup-on-delete) so a deleted agent leaves no stale state.
         states.retain(|name, _| live.contains(name));
+        self.invalid_override_warnings
+            .lock()
+            .retain(|name| live.contains(name));
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     const T: f32 = 80.0;
 
@@ -312,6 +393,128 @@ mod tests {
             "a LIVE agent with no context reading must KEEP its latch — `live.insert` must be \
              UNCONDITIONAL, not gated on resolved_context()"
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn alert_threshold_precedence() {
+        let temp_dir = std::env::temp_dir().join("agend-test-clean-alert");
+        std::fs::create_dir_all(&temp_dir).ok();
+
+        // 1. Write non-default valid config to check loader/consumer fallback
+        std::fs::write(
+            temp_dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        crate::runtime_config::reload(&temp_dir);
+
+        let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Runtime config non-default value resolved
+        assert_eq!(alert_threshold(), 60.0);
+
+        // 2. Env var set overrides config
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "55.5");
+        assert_eq!(alert_threshold(), 55.5);
+
+        // 3. Invalid env var resolved combination falls back to config value
+        // alert 95.0, handoff in config is 70.0 -> invalid triplet combination (alert >= handoff), should fallback to config (60.0)
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "95.0");
+        assert_eq!(alert_threshold(), 60.0);
+
+        // Restore env var
+        if let Some(val) = old_env {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+
+        // Clean up global config back to default
+        std::fs::write(
+            temp_dir.join("runtime-config.json"),
+            r#"{"schema_version": 1}"#,
+        )
+        .unwrap();
+        crate::runtime_config::reload(&temp_dir);
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// #2781: the PRODUCTION context_alert message must render usage and
+    /// threshold with one decimal place. Drives the real ContextAlertHandler
+    /// with a mock agent at 82.0% (above the 80.0% default threshold),
+    /// drains the orchestrator inbox, and asserts the rendered text contains
+    /// one-decimal values.
+    #[test]
+    #[serial(runtime_config)]
+    fn context_alert_production_renders_one_decimal() {
+        use parking_lot::Mutex as PLMutex;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let home =
+            std::env::temp_dir().join(format!("agend-ctxalert-decimal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Save + clear env so default thresholds (alert=80.0) apply.
+        let old_pct = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Fleet with a team so alert routes to orchestrator.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  lead:\n    backend: claude\n  watched:\n    backend: claude\n\
+             teams:\n  test:\n    members: [lead, watched]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+
+        let registry: crate::agent::AgentRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let (handle, _reader) =
+            crate::daemon::per_tick::mock_live_agent_with_context("watched", 82.0);
+        registry.lock().insert(handle.id, handle);
+        let externals: crate::agent::ExternalRegistry = Arc::new(PLMutex::new(HashMap::new()));
+        let configs: Arc<PLMutex<HashMap<String, crate::daemon::AgentConfig>>> =
+            Arc::new(PLMutex::new(HashMap::new()));
+
+        let h = ContextAlertHandler::new(1);
+        let ctx = TickContext {
+            home: &home,
+            registry: &registry,
+            externals: &externals,
+            configs: &configs,
+        };
+        h.run(&ctx);
+
+        // Drain orchestrator inbox and check the rendered message.
+        let msgs = crate::inbox::drain(&home, "lead");
+        let alert_msg = msgs
+            .iter()
+            .find(|m| m.text.contains("[context_alert]"))
+            .expect("#2781: context_alert must deliver an inbox message to the orchestrator");
+        assert!(
+            alert_msg.text.contains("82.0%"),
+            "#2781: usage must render one decimal: {}",
+            alert_msg.text
+        );
+        assert!(
+            alert_msg.text.contains("80.0%"),
+            "#2781: threshold must render one decimal: {}",
+            alert_msg.text
+        );
+
+        // Restore env + clean up.
+        if let Some(val) = old_pct {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(home.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        crate::runtime_config::reload(&home);
         std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -76,25 +76,6 @@ pub struct RuntimeConfig {
     /// `default_true` also fills the field for configs written before it existed.
     #[serde(default = "default_true")]
     pub observed_badge: bool,
-    /// #2090: origin-aware long-task progress reporting mode. `0` = off
-    /// (DEFAULT — zero behaviour change).
-    ///
-    /// `2` = report: the agent self-reports progress on the channel a request came
-    /// from; the daemon's progress-backstop watchdog only NUDGES it if a long
-    /// external-channel turn goes quiet — it never authors or relays content, so
-    /// no transcript is exfiltrated.
-    ///
-    /// `1` = mirror: the daemon tails the agent's transcript and **auto-relays the
-    /// agent's raw assistant text** back to the origin channel. ⚠ EXFILTRATION
-    /// SURFACE — this sends the FULL assistant output stream off-box: any secret
-    /// or injected content the agent echoes is relayed to the external channel.
-    /// Opt-in only; bounded by an active-turn gate (origin channel only, never
-    /// broadcast), no-backlog-replay, and truncation. See `progress_mirror.rs`.
-    ///
-    /// `#[serde(default)]` fills 0 for older configs (additive — no schema bump).
-    /// Hot-reloadable via the `config` MCP tool.
-    #[serde(default)]
-    pub progress_mode: i64,
     /// #1990: on-disk schema version. `#[serde(default)]` → an older config
     /// written before this field reads back as 0 (≤ CURRENT, loads normally);
     /// a value > CURRENT means a newer daemon wrote it and is fail-closed in
@@ -103,6 +84,18 @@ pub struct RuntimeConfig {
     /// bump — only a non-additive change to an existing field does.
     #[serde(default)]
     pub schema_version: u32,
+    /// #2090: origin-aware long-task progress reporting mode. 0 = off.
+    #[serde(default)]
+    pub progress_mode: i64,
+    /// Context-window usage percent at which the per-tick context-alert watchdog notifies.
+    #[serde(default = "default_context_alert")]
+    pub context_alert_pct: f32,
+    /// Context-window usage percent at which the context-handoff watchdog injects a handoff request.
+    #[serde(default = "default_context_handoff")]
+    pub context_handoff_pct: f32,
+    /// Higher context-window percent at which the handoff watchdog escalates to the operator.
+    #[serde(default = "default_context_handoff_escalate")]
+    pub context_handoff_escalate_pct: f32,
 }
 
 impl SchemaVersioned for RuntimeConfig {
@@ -116,6 +109,18 @@ fn default_true() -> bool {
     true
 }
 
+pub const DEFAULT_ALERT_PCT: f32 = 80.0;
+pub const DEFAULT_HANDOFF_PCT: f32 = 85.0;
+pub const DEFAULT_ESCALATE_PCT: f32 = 92.0;
+
+/// Re-arm requires the usage to drop this far below a threshold (compact/restart)
+/// before a handler's latch re-arms — the single source of truth shared by the
+/// per-tick consumers (`context_alert`/`context_handoff`) AND by
+/// `validate_thresholds`' lower bound: a threshold <= this floor makes the
+/// re-arm condition `pct < threshold - HYSTERESIS_PCT` impossible, so such
+/// values are rejected as invalid.
+pub const HYSTERESIS_PCT: f32 = 5.0;
+
 fn default_dev_idle() -> i64 {
     3600
 }
@@ -124,6 +129,15 @@ fn default_fleet_idle() -> i64 {
 }
 fn default_fleet_ack_ttl() -> i64 {
     2700
+}
+fn default_context_alert() -> f32 {
+    DEFAULT_ALERT_PCT
+}
+fn default_context_handoff() -> f32 {
+    DEFAULT_HANDOFF_PCT
+}
+fn default_context_handoff_escalate() -> f32 {
+    DEFAULT_ESCALATE_PCT
 }
 
 impl Default for RuntimeConfig {
@@ -140,6 +154,9 @@ impl Default for RuntimeConfig {
             dim_unfocused_panes: true,
             observed_badge: true,
             progress_mode: 0,
+            context_alert_pct: default_context_alert(),
+            context_handoff_pct: default_context_handoff(),
+            context_handoff_escalate_pct: default_context_handoff_escalate(),
             schema_version: RuntimeConfig::CURRENT,
         }
     }
@@ -152,6 +169,23 @@ static RUNTIME_CONFIG: OnceLock<RwLock<RuntimeConfig>> = OnceLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// #1576: de-dupes the corrupt-config warning across 10s ticks.
 static CORRUPT_WARNED: AtomicBool = AtomicBool::new(false);
+/// #2753: de-dupes the invalid-effective-thresholds warning across per-tick
+/// resolves — warn on the FIRST invalid resolution of an episode, stay silent
+/// while it persists, re-arm as soon as a valid triplet resolves. Mirrors
+/// `CORRUPT_WARNED`.
+static INVALID_THRESHOLDS_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only probe: per-thread count of `resolve_effective_thresholds`
+    /// calls, pinning the per-tick consumers' one-resolve-per-tick contract.
+    static RESOLVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_calls_this_thread() -> usize {
+    RESOLVE_CALLS.with(std::cell::Cell::get)
+}
 
 fn global() -> &'static RwLock<RuntimeConfig> {
     RUNTIME_CONFIG.get_or_init(|| RwLock::new(RuntimeConfig::default()))
@@ -191,8 +225,16 @@ pub fn reload(home: &Path) {
                 ),
             ),
             Ok(config) => {
-                *global().write() = config;
-                CORRUPT_WARNED.store(false, Ordering::Relaxed);
+                if let Err(msg) = validate_thresholds(
+                    config.context_alert_pct,
+                    config.context_handoff_pct,
+                    config.context_handoff_escalate_pct,
+                ) {
+                    fail_closed(is_startup, &format!("invalid context thresholds: {msg}"));
+                } else {
+                    *global().write() = config;
+                    CORRUPT_WARNED.store(false, Ordering::Relaxed);
+                }
             }
             Err(e) => fail_closed(is_startup, &format!("unparseable: {e}")),
         },
@@ -203,6 +245,98 @@ pub fn reload(home: &Path) {
         Err(_) => {
             // Vanished at runtime — keep last-known-good rather than resetting.
             fail_closed(false, "runtime-config.json disappeared");
+        }
+    }
+}
+
+/// Validate the context threshold values triplet semantically.
+pub fn validate_thresholds(alert: f32, handoff: f32, escalate: f32) -> Result<(), String> {
+    if !alert.is_finite() || !handoff.is_finite() || !escalate.is_finite() {
+        return Err("values must be finite".to_string());
+    }
+    // Values <= HYSTERESIS_PCT are invalid: the re-arm condition
+    // `pct < threshold - HYSTERESIS_PCT` would be impossible, wedging the latch.
+    if alert <= HYSTERESIS_PCT || alert > 100.0 {
+        return Err(format!(
+            "alert_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {alert}"
+        ));
+    }
+    if handoff <= HYSTERESIS_PCT || handoff > 100.0 {
+        return Err(format!(
+            "handoff_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {handoff}"
+        ));
+    }
+    if escalate <= HYSTERESIS_PCT || escalate > 100.0 {
+        return Err(format!(
+            "escalate_pct must be in ({HYSTERESIS_PCT:.1}, 100.0], got {escalate}"
+        ));
+    }
+    if alert >= handoff {
+        return Err(format!(
+            "alert_pct ({alert}) must be less than handoff_pct ({handoff})"
+        ));
+    }
+    if handoff >= escalate {
+        return Err(format!(
+            "handoff_pct ({handoff}) must be less than escalate_pct ({escalate})"
+        ));
+    }
+    Ok(())
+}
+
+/// Latch step for the once-per-invalid-episode warning: records this
+/// resolution's validity and returns whether the invalid warning should be
+/// emitted NOW (true only on the first invalid resolution after a valid one).
+fn note_thresholds_validity(valid: bool) -> bool {
+    if valid {
+        INVALID_THRESHOLDS_WARNED.store(false, Ordering::Relaxed);
+        false
+    } else {
+        !INVALID_THRESHOLDS_WARNED.swap(true, Ordering::Relaxed)
+    }
+}
+
+/// Resolve and validate the effective context threshold triplet.
+/// Checks the environment variables first, falling back to RuntimeConfig, then to defaults.
+pub fn resolve_effective_thresholds() -> (f32, f32, f32) {
+    #[cfg(test)]
+    RESOLVE_CALLS.with(|c| c.set(c.get() + 1));
+    let config = get();
+    let alert = std::env::var("AGEND_CONTEXT_ALERT_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_alert_pct);
+    let handoff = std::env::var("AGEND_CONTEXT_HANDOFF_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_handoff_pct);
+    let escalate = std::env::var("AGEND_CONTEXT_HANDOFF_ESCALATE_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(config.context_handoff_escalate_pct);
+
+    let valid = validate_thresholds(alert, handoff, escalate).is_ok();
+    if note_thresholds_validity(valid) {
+        tracing::warn!(
+            alert,
+            handoff,
+            escalate,
+            config_alert = config.context_alert_pct,
+            config_handoff = config.context_handoff_pct,
+            config_escalate = config.context_handoff_escalate_pct,
+            "effective context thresholds combination is invalid. falling back to runtime config values."
+        );
+    }
+    if valid {
+        (alert, handoff, escalate)
+    } else {
+        let fallback_alert = config.context_alert_pct;
+        let fallback_handoff = config.context_handoff_pct;
+        let fallback_escalate = config.context_handoff_escalate_pct;
+        if validate_thresholds(fallback_alert, fallback_handoff, fallback_escalate).is_ok() {
+            (fallback_alert, fallback_handoff, fallback_escalate)
+        } else {
+            (DEFAULT_ALERT_PCT, DEFAULT_HANDOFF_PCT, DEFAULT_ESCALATE_PCT)
         }
     }
 }
@@ -231,7 +365,25 @@ fn fail_closed(is_startup: bool, reason: &str) {
 
 /// Set a single config key and persist to disk.
 pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
-    let mut config = get();
+    // AUDIT2-012: serialize the whole read-modify-write under a cross-process file
+    // lock AND base the mutation on the freshest ON-DISK config (read under the
+    // lock), not the in-memory snapshot. The TUI and the daemon are separate
+    // processes that both write this file (the TUI via `:set` / copy-on-select,
+    // the daemon via the MCP `config set` tool); basing the write on each
+    // process's stale `get()` global would let one clobber a key the other just
+    // wrote (lost update). Fall back to the in-memory keep-last-good only if the
+    // file is absent or corrupt. (The #1990 version guard below still refuses a
+    // newer-schema file before any write.)
+    let lock_path = home.join("runtime-config.json.lock");
+    // AUDIT2-012 (review): FAIL CLOSED if the lock can't be acquired — proceeding
+    // unlocked would silently re-open the cross-process lost-update this guard
+    // exists to prevent. Surface the error instead.
+    let _lock = crate::store::acquire_file_lock(&lock_path)
+        .map_err(|e| format!("runtime-config lock unavailable ({lock_path:?}): {e}"))?;
+    let mut config = std::fs::read_to_string(home.join("runtime-config.json"))
+        .ok()
+        .and_then(|d| serde_json::from_str::<RuntimeConfig>(&d).ok())
+        .unwrap_or_else(get);
     match key {
         "dev_idle_threshold_secs" => {
             config.dev_idle_threshold_secs = value
@@ -306,8 +458,6 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
             let m: i64 = value
                 .parse()
                 .map_err(|_| format!("invalid integer: {value}"))?;
-            // 0 = off (default), 1 = mirror (⚠ exfil — relays raw assistant
-            // output to the origin channel), 2 = report (self-report + nudge).
             if !matches!(m, 0..=2) {
                 return Err(format!(
                     "invalid progress_mode: {m} (0 = off, 1 = mirror, 2 = report)"
@@ -315,8 +465,28 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
             }
             config.progress_mode = m;
         }
+        "context_alert_pct" => {
+            config.context_alert_pct = value
+                .parse()
+                .map_err(|_| format!("invalid float: {value}"))?;
+        }
+        "context_handoff_pct" => {
+            config.context_handoff_pct = value
+                .parse()
+                .map_err(|_| format!("invalid float: {value}"))?;
+        }
+        "context_handoff_escalate_pct" => {
+            config.context_handoff_escalate_pct = value
+                .parse()
+                .map_err(|_| format!("invalid float: {value}"))?;
+        }
         _ => return Err(format!("unknown config key: {key}")),
     }
+    validate_thresholds(
+        config.context_alert_pct,
+        config.context_handoff_pct,
+        config.context_handoff_escalate_pct,
+    )?;
     let path = home.join("runtime-config.json");
     // #1990 (reviewer-2 P1): `config` comes from in-memory `get()` (the
     // keep-last-good snapshot), NOT the disk file — so a blind write here would
@@ -338,7 +508,10 @@ pub fn set(home: &Path, key: &str, value: &str) -> Result<String, String> {
     // #1990: stamp the current schema version on every write.
     config.schema_version = RuntimeConfig::CURRENT;
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
+    // AUDIT2-012: atomic tmp+rename (was a plain std::fs::write) so a crash mid
+    // write can't leave truncated JSON that reverts to DEFAULTS at next startup —
+    // which would silently flip watchdog / recovery gates.
+    crate::store::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     *global().write() = config.clone();
     Ok(serde_json::to_string(&config).unwrap_or_default())
 }
@@ -358,6 +531,9 @@ pub fn get_key(key: &str) -> Result<String, String> {
         "dim_unfocused_panes" => Ok(config.dim_unfocused_panes.to_string()),
         "observed_badge" => Ok(config.observed_badge.to_string()),
         "progress_mode" => Ok(config.progress_mode.to_string()),
+        "context_alert_pct" => Ok(config.context_alert_pct.to_string()),
+        "context_handoff_pct" => Ok(config.context_handoff_pct.to_string()),
+        "context_handoff_escalate_pct" => Ok(config.context_handoff_escalate_pct.to_string()),
         _ => Err(format!("unknown config key: {key}")),
     }
 }
@@ -429,27 +605,89 @@ mod tests {
     }
 
     #[test]
-    fn progress_mode_default_off() {
-        // #2090: default is 0 (OFF) — a default fleet sees zero behaviour change.
-        assert_eq!(RuntimeConfig::default().progress_mode, 0);
+    #[serial(runtime_config)]
+    fn set_uses_disk_base_preserves_concurrent_key_audit2_012() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-test-runtime-config-2012-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime-config.json");
+
+        // Simulate ANOTHER process (e.g. the daemon) having written
+        // dev_idle_threshold_secs=9999 to disk while THIS process's in-memory
+        // global is stale. (#2549: was `progress_mode` before that field was
+        // retired — any field works here, the test is about the disk-base
+        // mechanism, not this specific key's semantics.)
+        let on_disk = RuntimeConfig {
+            dev_idle_threshold_secs: 9999,
+            ..RuntimeConfig::default()
+        };
+        std::fs::write(&path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
+
+        // This process sets a DIFFERENT key. With the disk-base read under the
+        // lock, the concurrently-written key must survive (not revert to default).
+        set(&dir, "copy_on_select", "off").unwrap();
+
+        let after: RuntimeConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.dev_idle_threshold_secs, 9999,
+            "AUDIT2-012: a concurrently-written key must be preserved, not clobbered"
+        );
+        assert!(!after.copy_on_select, "the just-set key must be applied");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2549: `progress_mode` was retired (ProgressBackstop/ProgressMirror
+    /// deleted). An on-disk `runtime-config.json` from BEFORE the retirement
+    /// may still carry the now-unknown `progress_mode` key — `RuntimeConfig`
+    /// has no `#[serde(deny_unknown_fields)]`, so serde silently drops unknown
+    /// keys on deserialize, but this pins that contract explicitly rather than
+    /// relying on it staying true by accident (a future `deny_unknown_fields`
+    /// addition elsewhere in the struct would silently break old configs).
+    #[test]
+    #[serial(runtime_config)]
+    fn reload_tolerates_retired_progress_mode_key_2549() {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-test-runtime-config-2549-retired-key-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime-config.json");
+        std::fs::write(
+            &path,
+            r#"{"dev_idle_threshold_secs": 1234, "progress_mode": 1, "schema_version": 1}"#,
+        )
+        .unwrap();
+
+        reload(&dir);
+
+        let config = get();
+        assert_eq!(
+            config.dev_idle_threshold_secs, 1234,
+            "fields that still exist must load normally"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     #[serial(runtime_config)]
-    fn progress_mode_accepts_0_1_2_rejects_garbage() {
-        let dir = std::env::temp_dir().join("agend-test-runtime-config-progress");
-        std::fs::create_dir_all(&dir).ok();
-        // 0 (off), 1 (mirror), 2 (report) all accepted + round-trip.
-        for v in ["0", "1", "2"] {
-            set(&dir, "progress_mode", v).unwrap();
-            reload(&dir);
-            assert_eq!(get_key("progress_mode").unwrap(), v);
-        }
-        // Out-of-range integer → rejected.
-        assert!(set(&dir, "progress_mode", "3").is_err());
-        // Non-integer → rejected.
-        assert!(set(&dir, "progress_mode", "mirror").is_err());
-        std::fs::remove_dir_all(&dir).ok();
+    fn set_fails_closed_when_lock_unavailable_audit2_012() {
+        // `home` is a regular FILE, so `home.join("runtime-config.json.lock")`
+        // can't be created (ENOTDIR) and the lock cannot be acquired. set() must
+        // FAIL CLOSED (return Err), never proceed to write unlocked.
+        let home_file = std::env::temp_dir().join(format!(
+            "agend-test-runtime-config-2012-isfile-{}",
+            std::process::id()
+        ));
+        std::fs::write(&home_file, b"x").unwrap();
+        let res = set(&home_file, "copy_on_select", "on");
+        assert!(
+            res.is_err(),
+            "set() must fail closed when the lock is unavailable, got: {res:?}"
+        );
+        std::fs::remove_file(&home_file).ok();
     }
 
     #[test]
@@ -625,6 +863,178 @@ mod tests {
             disk.contains("999"),
             "the future-version file must be left intact, not downgraded: {disk}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[serial(runtime_config)]
+    fn context_pcts_default_and_toggleable() {
+        let c = RuntimeConfig::default();
+        assert_eq!(c.context_alert_pct, 80.0);
+        assert_eq!(c.context_handoff_pct, 85.0);
+        assert_eq!(c.context_handoff_escalate_pct, 92.0);
+
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-ctxpct");
+        std::fs::create_dir_all(&dir).ok();
+
+        // Test valid setting
+        set(&dir, "context_alert_pct", "60").unwrap();
+        set(&dir, "context_handoff_pct", "65.5").unwrap();
+        set(&dir, "context_handoff_escalate_pct", "70.2").unwrap();
+        reload(&dir);
+        assert_eq!(get_key("context_alert_pct").unwrap(), "60");
+        assert_eq!(get_key("context_handoff_pct").unwrap(), "65.5");
+        assert_eq!(get_key("context_handoff_escalate_pct").unwrap(), "70.2");
+
+        // Test invalid setting (setting a value that breaks order or bounds must return Err)
+        assert!(set(&dir, "context_alert_pct", "80.0").is_err()); // alert 80.0 >= handoff 65.5
+        assert!(set(&dir, "context_handoff_pct", "4.0").is_err()); // handoff <= 5.0 (hysteresis)
+        assert!(set(&dir, "context_handoff_escalate_pct", "NaN").is_err()); // NaN is not finite
+
+        // Test invalid disk configuration reload keeps last known good
+        // Write invalid reload file directly
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 95.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+        // Kept last good (60.0 / 65.5 / 70.2)
+        assert_eq!(get_key("context_alert_pct").unwrap(), "60");
+        assert_eq!(get_key("context_handoff_pct").unwrap(), "65.5");
+        assert_eq!(get_key("context_handoff_escalate_pct").unwrap(), "70.2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pins the single-source-of-truth coupling: `validate_thresholds`' lower
+    /// bound IS `HYSTERESIS_PCT` and is exclusive. A threshold exactly at the
+    /// floor is rejected (the re-arm condition `pct < threshold - HYSTERESIS_PCT`
+    /// would be impossible); a value just above it (with valid ordered
+    /// handoff/escalate) is accepted. If someone re-tunes `HYSTERESIS_PCT`, the
+    /// validate bound moves with it — they cannot drift apart.
+    #[test]
+    fn validate_lower_bound_is_hysteresis_pct_single_source() {
+        // Exactly at the floor is out of the exclusive lower bound → Err.
+        assert!(
+            validate_thresholds(HYSTERESIS_PCT, HYSTERESIS_PCT + 10.0, HYSTERESIS_PCT + 20.0)
+                .is_err(),
+            "a threshold == HYSTERESIS_PCT must be rejected (exclusive lower bound)"
+        );
+        // Just above the floor, ordered handoff/escalate → Ok.
+        assert!(
+            validate_thresholds(
+                HYSTERESIS_PCT + 0.1,
+                HYSTERESIS_PCT + 10.0,
+                HYSTERESIS_PCT + 20.0
+            )
+            .is_ok(),
+            "a threshold just above HYSTERESIS_PCT (ordered) must be accepted"
+        );
+    }
+
+    /// Reviewer follow-up: `set()`'s NaN rejection is tested, but the ENV path
+    /// wasn't. `"NaN".parse::<f32>()` returns `Ok(NaN)`, so a NaN env override
+    /// must NOT silently poison the effective threshold (which would disable the
+    /// watchdog) — `resolve_effective_thresholds` must fall back to the config
+    /// value because `validate_thresholds` rejects the non-finite triplet.
+    #[test]
+    #[serial(runtime_config)]
+    fn nan_env_override_falls_back_not_poisons() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-nanenv");
+        std::fs::create_dir_all(&dir).ok();
+
+        // Known-good config so the fallback value is deterministic.
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+
+        let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "NaN");
+
+        let (alert, _, _) = resolve_effective_thresholds();
+        assert!(
+            alert.is_finite(),
+            "a NaN env override must not poison the effective alert threshold"
+        );
+        assert_eq!(
+            alert, 60.0,
+            "NaN env value is rejected → falls back to the config value"
+        );
+
+        if let Some(val) = old_env {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        } else {
+            std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        }
+        std::fs::write(dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        reload(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #2753 final review: the invalid-effective-thresholds warning must fire
+    /// once per invalid EPISODE, not once per resolve —
+    /// `resolve_effective_thresholds` runs every tick from the per-tick
+    /// consumers, so an un-latched warn floods the log for as long as the
+    /// invalid override persists. A valid resolution ends the episode and
+    /// re-arms the latch.
+    #[test]
+    #[serial(runtime_config)]
+    fn invalid_thresholds_warning_latches_once_per_episode() {
+        // Normalize: a valid resolution re-arms the latch.
+        assert!(!note_thresholds_validity(true));
+        // First invalid resolution of an episode warns...
+        assert!(note_thresholds_validity(false));
+        // ...further invalid resolutions in the same episode stay silent.
+        assert!(!note_thresholds_validity(false));
+        assert!(!note_thresholds_validity(false));
+        // A valid triplet ends the episode without warning...
+        assert!(!note_thresholds_validity(true));
+        // ...and the next invalid episode warns exactly once again.
+        assert!(note_thresholds_validity(false));
+        assert!(!note_thresholds_validity(false));
+    }
+
+    /// Wiring counterpart of the latch-semantics test:
+    /// `resolve_effective_thresholds` itself must drive the latch — an invalid
+    /// env override latches it, a valid resolution re-arms it.
+    #[test]
+    #[serial(runtime_config)]
+    fn resolve_effective_thresholds_drives_warn_latch() {
+        let dir = std::env::temp_dir().join("agend-test-runtime-config-warnlatch");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(
+            dir.join("runtime-config.json"),
+            r#"{"schema_version": 1, "context_alert_pct": 60.0, "context_handoff_pct": 70.0, "context_handoff_escalate_pct": 80.0}"#,
+        )
+        .unwrap();
+        reload(&dir);
+
+        let old_env = std::env::var("AGEND_CONTEXT_ALERT_PCT").ok();
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+
+        // Valid resolution → latch re-armed.
+        resolve_effective_thresholds();
+        assert!(!INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        // Invalid override (alert >= handoff) → latch set after first resolve.
+        std::env::set_var("AGEND_CONTEXT_ALERT_PCT", "95.0");
+        resolve_effective_thresholds();
+        assert!(INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        // Back to valid → latch re-armed for the next episode.
+        std::env::remove_var("AGEND_CONTEXT_ALERT_PCT");
+        resolve_effective_thresholds();
+        assert!(!INVALID_THRESHOLDS_WARNED.load(Ordering::Relaxed));
+
+        if let Some(val) = old_env {
+            std::env::set_var("AGEND_CONTEXT_ALERT_PCT", val);
+        }
+        std::fs::write(dir.join("runtime-config.json"), r#"{"schema_version": 1}"#).unwrap();
+        reload(&dir);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

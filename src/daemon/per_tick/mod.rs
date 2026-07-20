@@ -326,6 +326,19 @@ pub(crate) fn mock_live_agent_no_context(
 }
 
 #[cfg(test)]
+pub(crate) fn mock_live_agent_with_context(
+    name: &str,
+    pct: f32,
+) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    let (handle, reader) = mock_live_agent_no_context(name);
+    let mut core = handle.core.lock();
+    core.state.set_context_pct_for_test(pct);
+    drop(core);
+    (handle, reader)
+}
+
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
