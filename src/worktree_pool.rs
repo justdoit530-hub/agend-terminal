@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 /// Marker file placed in daemon-managed worktrees (R14 mitigation).
 pub(crate) const MANAGED_MARKER: &str = ".agend-managed";
 
+/// arch14 (#2860): fsync marker contents after write so a crash cannot leave a
+/// half-written identity the deep-validated release would refuse.
+pub(crate) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.sync_all()
+}
+
 /// Root directory for daemon-managed worktrees in the new layout.
 /// `<home>/worktrees/` — contains `<agent>/<branch>/` subdirectories.
 /// Used by lease, gc_candidates, and reconcile_hooks.
@@ -82,17 +90,24 @@ pub fn lease(
         }
     };
 
-    // #1137: marker is now written inside worktree::create() immediately
-    // after checkout. Re-write here is idempotent and ensures the marker
-    // is present for reused worktrees (which skip the create path).
+    // #1137 + arch14 (#2860): re-write is idempotent for reused worktrees.
+    // Record create's canonical source_repo (never re-canonicalize a possibly
+    // alias caller path). Write/sync failure aborts the lease (no WIP delete).
     let marker = info.path.join(MANAGED_MARKER);
-    let _ = std::fs::write(
+    std::fs::write(
         &marker,
         format!(
-            "agent={agent}\nbranch={branch}\nleased_at={}\n",
+            "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+            info.source_repo.display(),
             chrono::Utc::now().to_rfc3339()
         ),
-    );
+    )
+    .and_then(|()| sync_marker_contents(&marker))
+    .map_err(|e| {
+        LeaseError::CreateFailed(format!(
+            "managed-marker write/sync failed for {agent}@{branch}: {e}"
+        ))
+    })?;
 
     Ok(WorktreeLease {
         agent: agent.to_string(),
@@ -438,19 +453,254 @@ fn resolve_branch_cleanup(
     }
 }
 
+
+/// Parse `.agend-managed` key=value lines. Distinguishes a MISSING `source_repo`
+/// line (legacy pre-#2860) from an explicit blank value.
+#[derive(Debug, Default)]
+struct ManagedMarkerIdentity {
+    agent: Option<String>,
+    branch: Option<String>,
+    /// `None` = line missing (legacy); `Some("")` = explicit blank; `Some(path)` = set.
+    source_repo: Option<Option<String>>,
+}
+
+fn parse_managed_marker(content: &str) -> ManagedMarkerIdentity {
+    let mut id = ManagedMarkerIdentity::default();
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("agent=") {
+            id.agent = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("branch=") {
+            id.branch = Some(v.to_string());
+        } else if let Some(v) = line.strip_prefix("source_repo=") {
+            // Some(Some("")) = explicit blank; Some(Some(path)) = set.
+            // Missing line leaves source_repo as None (legacy).
+            id.source_repo = Some(Some(v.to_string()));
+        }
+    }
+    id
+}
+
+/// Resolve the worktree's source repo via git's own common-dir (handles relative
+/// gitlinks). Returns the parent of the absolute common-dir.
+fn source_from_git_common_dir(worktree: &Path) -> Result<PathBuf, String> {
+    let out = crate::git_helpers::git_bypass(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map_err(|e| format!("rev-parse --git-common-dir failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "rev-parse --git-common-dir failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let common = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let common_path = PathBuf::from(&common);
+    common_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| format!("common-dir '{common}' has no parent source"))
+}
+
+fn worktree_head_branch(worktree: &Path) -> Result<String, String> {
+    let out = crate::git_helpers::git_bypass(worktree, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map_err(|e| format!("rev-parse HEAD failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "rev-parse --abbrev-ref HEAD failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if b.is_empty() || b == "HEAD" {
+        return Err("detached or empty HEAD".into());
+    }
+    Ok(b)
+}
+
+/// Collect directories under `root` that contain a `.agend-managed` marker.
+/// Branches with `/` nest (e.g. `feat/foo`), so a shallow `read_dir` misses them.
+fn collect_managed_worktree_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let marker = dir.join(MANAGED_MARKER);
+        if marker.is_file() {
+            out.push(dir);
+            // Marker marks the worktree root — do not descend further.
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// arch14 (#2862): when binding.json is gone but a managed worktree residue
+/// remains under `worktrees/<agent>/`, release it only if the marker carries
+/// non-empty agent+branch and the worktree's Git linkage corroborates branch
+/// (and source when present). Explicit blank `source_repo=` is refused.
+fn release_absent_binding_legacy(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
+    let mut out = ReleaseOutcome::default();
+    let agent_root = daemon_managed_worktree_root(home).join(agent);
+    if !agent_root.is_dir() {
+        out.released = true;
+        out.already_released = true;
+        return out;
+    }
+
+    let mut any_found = false;
+    let mut any_removed = false;
+    for path in collect_managed_worktree_dirs(&agent_root) {
+        let marker_path = path.join(MANAGED_MARKER);
+        let Ok(content) = std::fs::read_to_string(&marker_path) else {
+            continue;
+        };
+        any_found = true;
+        let id = parse_managed_marker(&content);
+        let mk_agent = id.agent.as_deref().unwrap_or("").trim();
+        let mk_branch = id.branch.as_deref().unwrap_or("").trim();
+        if mk_agent.is_empty() || mk_branch.is_empty() {
+            out.error = Some(format!(
+                "legacy marker at {} missing agent/branch identity — refusing",
+                path.display()
+            ));
+            continue;
+        }
+        if mk_agent != agent {
+            out.error = Some(format!(
+                "marker agent '{mk_agent}' does not match release target '{agent}' — refusing"
+            ));
+            continue;
+        }
+        // Explicit blank source_repo= is refused (distinct from missing line).
+        if matches!(id.source_repo, Some(Some(ref s)) if s.is_empty()) {
+            out.error = Some(format!(
+                "marker at {} has explicit blank source_repo — refusing",
+                path.display()
+            ));
+            continue;
+        }
+
+        let source = match source_from_git_common_dir(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                out.error = Some(format!(
+                    "legacy marker for '{agent}': worktree Git linkage unverifiable: {e} — refusing"
+                ));
+                continue;
+            }
+        };
+        let source = match std::fs::canonicalize(&source) {
+            Ok(s) => s,
+            Err(e) => {
+                out.error = Some(format!(
+                    "legacy marker for '{agent}': linked source cannot be canonicalized: {e}"
+                ));
+                continue;
+            }
+        };
+        // When source_repo line is present and non-empty, it must match Git linkage.
+        if let Some(Some(ref recorded)) = id.source_repo {
+            match std::fs::canonicalize(recorded) {
+                Ok(rec) if rec != source => {
+                    out.error = Some(
+                        "marker source_repo does not match Git linkage — refusing".to_string(),
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    out.error = Some(format!(
+                        "marker source_repo cannot be canonicalized: {e} — refusing"
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+            }
+        }
+        match worktree_head_branch(&path) {
+            Ok(head) if head == mk_branch => {}
+            Ok(head) => {
+                out.error = Some(format!(
+                    "legacy marker branch '{mk_branch}' does not match checked-out branch '{head}' — refusing"
+                ));
+                continue;
+            }
+            Err(e) => {
+                out.error = Some(format!(
+                    "legacy marker for '{agent}': cannot resolve worktree HEAD: {e} — refusing"
+                ));
+                continue;
+            }
+        }
+
+        // Binding must still be absent (CAS-style re-read).
+        if crate::binding::read(home, agent).is_some() {
+            out.error = Some(format!(
+                "binding reappeared for '{agent}' during absent-binding release — refusing"
+            ));
+            continue;
+        }
+
+        if dry_run {
+            out.dry_run_preview = Some(format!(
+                "dry-run: would remove legacy managed worktree {} (absent binding, Git linkage ok)",
+                path.display()
+            ));
+            out.released = true;
+            continue;
+        }
+
+        match remove_worktree(agent, &path, &source) {
+            WorktreeRemoval::Removed | WorktreeRemoval::AlreadyAbsent => {
+                any_removed = true;
+                out.worktree_removed = true;
+            }
+            WorktreeRemoval::Unmanaged(err) | WorktreeRemoval::Failed(err) => {
+                out.error = Some(err);
+            }
+        }
+    }
+
+    if !any_found {
+        out.released = true;
+        out.already_released = true;
+        return out;
+    }
+    if out.error.is_none() {
+        out.released = true;
+    }
+    if any_removed {
+        crate::event_log::log(
+            home,
+            "worktree_released_absent_binding_legacy",
+            agent,
+            &format!(
+                "wt_removed={} error={}",
+                out.worktree_removed,
+                out.error.as_deref().unwrap_or("")
+            ),
+        );
+    }
+    out
+}
+
 pub fn release_full(home: &Path, agent: &str, dry_run: bool) -> ReleaseOutcome {
     let mut out = ReleaseOutcome::default();
 
     let Some(binding) = crate::binding::read(home, agent) else {
-        // #1465: release is idempotent. "No binding" means the release
-        // target state is already reached → report a success no-op rather
-        // than an error, so automated dispatch/release can treat release as
-        // a safe always-succeeds operation. (A genuine cleanup failure WITH
-        // a binding present still returns `released:false` + `error` below —
-        // idempotent success applies ONLY to this nothing-to-do path.)
-        out.released = true;
-        out.already_released = true;
-        return out;
+        // #1465 + arch14 (#2862): binding absent is usually a success no-op,
+        // BUT a leftover managed marker (ghost binding residue) can still
+        // block re-bind / trip dispatch-stuck. Clean those via verified Git
+        // linkage when present.
+        return release_absent_binding_legacy(home, agent, dry_run);
     };
 
     let wt_path_str = binding["worktree"].as_str().unwrap_or("");

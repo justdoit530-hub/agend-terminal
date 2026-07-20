@@ -87,6 +87,21 @@ pub fn create(
     if !is_git_repo(repo_dir) {
         return None;
     }
+    // arch14 (#2860): snapshot CANONICAL source identity at entry, before any
+    // side effect. Symlink-alias callers get one stable identity for marker /
+    // WorktreeInfo / rollback targets.
+    let repo_dir_buf = match std::fs::canonicalize(repo_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                repo = %repo_dir.display(),
+                error = %e,
+                "arch14: source_repo canonicalize failed — refusing worktree create"
+            );
+            return None;
+        }
+    };
+    let repo_dir: &Path = &repo_dir_buf;
 
     // Defense-in-depth (xcut-concurrency F4): validate the AGENT segment too, not
     // just the branch. `worktree_path` joins `instance_name` into the pool path,
@@ -257,15 +272,36 @@ pub fn create(
                 branch = %branch,
                 "created worktree"
             );
-            // #1137: write .agend-managed marker immediately after successful
-            // checkout to prevent orphan dirs if process dies before caller writes it.
-            let _ = std::fs::write(
-                wt_dir.join(".agend-managed"),
+            // #1137 + arch14 (#2860): first write carries canonical four-field
+            // identity; write/sync failure rolls back the fresh worktree (fail-loud).
+            let marker_path = wt_dir.join(".agend-managed");
+            let marker_write = std::fs::write(
+                &marker_path,
                 format!(
-                    "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                    repo_dir.display(),
                     chrono::Utc::now().to_rfc3339()
                 ),
-            );
+            )
+            .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+            if let Err(e) = marker_write {
+                tracing::warn!(
+                    instance = instance_name,
+                    path = %wt_dir.display(),
+                    error = %e,
+                    "managed-marker write/sync failed — rolling back fresh worktree (fail-loud)"
+                );
+                let _ = git_cmd(
+                    repo_dir,
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        &wt_dir.display().to_string(),
+                    ],
+                );
+                return None;
+            }
             Some(WorktreeInfo {
                 path: wt_dir,
                 source_repo: repo_dir.to_path_buf(),
@@ -296,14 +332,35 @@ pub fn create(
                         %branch,
                         "created worktree on existing branch"
                     );
-                    // #1137: write marker immediately (same as primary path above).
-                    let _ = std::fs::write(
-                        wt_dir.join(".agend-managed"),
+                    // #1137 + arch14 (#2860): same fail-loud four-field identity as primary arm.
+                    let marker_path = wt_dir.join(".agend-managed");
+                    let marker_write = std::fs::write(
+                        &marker_path,
                         format!(
-                            "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                            "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                            repo_dir.display(),
                             chrono::Utc::now().to_rfc3339()
                         ),
-                    );
+                    )
+                    .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path));
+                    if let Err(e) = marker_write {
+                        tracing::warn!(
+                            instance = instance_name,
+                            path = %wt_dir.display(),
+                            error = %e,
+                            "managed-marker write/sync failed — rolling back fresh worktree (fail-loud)"
+                        );
+                        let _ = git_cmd(
+                            repo_dir,
+                            &[
+                                "worktree",
+                                "remove",
+                                "--force",
+                                &wt_dir.display().to_string(),
+                            ],
+                        );
+                        return None;
+                    }
                     Some(WorktreeInfo {
                         path: wt_dir,
                         source_repo: repo_dir.to_path_buf(),
@@ -755,7 +812,12 @@ mod tests {
         let info = info.expect("worktree created");
         assert!(info.path.exists());
         assert_eq!(info.branch, "agend/agent1");
-        assert_eq!(info.source_repo, repo);
+        // arch14 (#2860): create returns entry-snapshotted CANONICAL source.
+        let canonical_repo = std::fs::canonicalize(&repo).expect("canonicalize fixture repo");
+        assert_eq!(
+            info.source_repo, canonical_repo,
+            "source_repo must be the canonical path (macOS /var → /private/var etc.)"
+        );
         // Sprint 57 Wave 4 (#546 Item 4): worktree must live under
         // `<home>/worktrees/<agent>/<branch>/`, NOT `<repo>/.worktrees/`.
         let expected = home.join("worktrees").join("agent1").join("agend/agent1");

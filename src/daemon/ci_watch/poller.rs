@@ -1290,6 +1290,9 @@ struct NotifyOutcome {
     // #1991: anchor run's own conclusion at notify time.
     new_notified_run_conclusion: Option<String>,
     new_stale_emitted_sha: Option<String>,
+    // arch14 (#2861): true when terminal notify had eligible recipients but ZERO
+    // durable successes — hold cursors so next poll retries.
+    delivery_failed: bool,
 }
 
 /// Fetch latest CI run and notify ALL subscribed agents on any
@@ -1431,7 +1434,7 @@ async fn ci_check_repo(
     );
     let outcome =
         fan_out_notifications(&ctx, &state, &pr, &deduped, &tracking, registry, provider).await;
-    persist_watch_state(&ctx, &pr, &outcome, &mut state);
+    let _settled = persist_watch_state(&ctx, &pr, &outcome, &mut state);
     if state != snapshot {
         flush_watch_state(watch_path, &state);
     }
@@ -1667,6 +1670,8 @@ async fn fan_out_notifications(
     let mut new_notified_run_attempt = tracking.last_notified_run_attempt;
     let mut new_notified_run_conclusion = tracking.last_notified_run_conclusion.map(String::from);
     let mut new_stale_emitted_sha = tracking.last_stale_emitted_sha.map(String::from);
+    // arch14 (#2861): event-level delivery acknowledgement.
+    let mut delivery_failed = false;
 
     for (idx, run_id, sha) in deduped {
         let run = &pr.runs[*idx];
@@ -1765,11 +1770,10 @@ async fn fan_out_notifications(
             };
             let fleet_cfg =
                 crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(ctx.home)).ok();
-            // #event-bus (ci_watch, Option A): ONE skip-aware loop over subscribers.
-            // The skips (action_target_on_success + #931 zombie-subscriber) are
-            // applied ONCE. Per recipient: success/failure → emit Ci{Ready,Fail}
-            // (the subscriber delivers via the shared `deliver_ci_watch`); a
-            // non-pair "[ci-ended]" conclusion has no event kind → direct deliver.
+            // #event-bus + arch14 (#2861): delivery-acknowledged fan-out.
+            let mut eligible_attempts = 0usize;
+            let mut durable_successes = 0usize;
+            let mut failed_subs: Vec<&str> = Vec::new();
             for sub in ctx.subscribers {
                 if action_target_on_success == Some(sub.as_str()) {
                     continue;
@@ -1790,10 +1794,9 @@ async fn fan_out_notifications(
                     );
                     continue;
                 }
-                // #event-bus Step 2 (legacy-zero): the success/failure pair emits
-                // (the subscriber delivers via deliver_ci_watch). A non-pair
-                // "[ci-ended]" conclusion has no event kind → direct deliver.
-                let emitted = match conclusion {
+                eligible_attempts += 1;
+                // emit handled-count is delivery acknowledgement.
+                let delivered = match conclusion {
                     Some("failure") => {
                         crate::daemon::event_bus::global().emit(
                             ctx.home,
@@ -1803,8 +1806,7 @@ async fn fan_out_notifications(
                                 correlation_id: repo_branch_key.clone(),
                                 supersede_token: supersede_token.clone(),
                             },
-                        );
-                        true
+                        ) > 0
                     }
                     Some("success") => {
                         crate::daemon::event_bus::global().emit(
@@ -1815,14 +1817,36 @@ async fn fan_out_notifications(
                                 correlation_id: repo_branch_key.clone(),
                                 supersede_token: supersede_token.clone(),
                             },
-                        );
-                        true
+                        ) > 0
                     }
-                    _ => false,
+                    _ => deliver_ci_watch(ctx.home, sub, &body, &repo_branch_key, &supersede_token),
                 };
-                if !emitted {
-                    deliver_ci_watch(ctx.home, sub, &body, &repo_branch_key, &supersede_token);
+                if delivered {
+                    durable_successes += 1;
+                } else {
+                    failed_subs.push(sub.as_str());
                 }
+            }
+            if eligible_attempts > 0 && durable_successes == 0 {
+                delivery_failed = true;
+                tracing::warn!(
+                    repo = %ctx.repo,
+                    branch = %ctx.branch,
+                    sha = %sha,
+                    eligible = eligible_attempts,
+                    "arch14: terminal CI notification had ZERO durable deliveries — holding cursors for retry"
+                );
+                continue;
+            }
+            if !failed_subs.is_empty() {
+                tracing::warn!(
+                    repo = %ctx.repo,
+                    branch = %ctx.branch,
+                    sha = %sha,
+                    failed = ?failed_subs,
+                    delivered = durable_successes,
+                    "arch14: terminal CI notification settled with FAILED peer deliveries"
+                );
             }
         }
         new_notified_sha = Some(sha.to_string());
@@ -1841,36 +1865,37 @@ async fn fan_out_notifications(
         new_notified_run_attempt,
         new_notified_run_conclusion,
         new_stale_emitted_sha,
+        delivery_failed,
     }
 }
 
-/// #event-bus (ci_watch): shared deliver for one subscriber's CI notify — supersede
-/// prior ci-watch msgs for this (sub, repo@branch), then enqueue the RENDERED body
-/// to the subscriber's inbox (with the idle-hint wake). Called by BOTH the legacy
-/// direct path AND the event-bus subscriber, so the inbox enqueue is byte-identical
-/// by construction; the idle-hint PTY wake is covered by the same invariant.
-/// Must NOT run under the registry lock (#1492 self-IPC-under-lock) — both callers
-/// invoke it lock-free (the legacy loop's registry lock is a dropped temporary; the
-/// subscriber fires from `emit`, outside any lock).
+/// arch14 (#2861): returns whether the durable inbox enqueue SUCCEEDED.
 fn deliver_ci_watch(
     home: &std::path::Path,
     sub: &str,
     body: &str,
     repo_branch_key: &str,
     supersede_token: &str,
-) {
+) -> bool {
     crate::inbox::mark_ci_watch_superseded(home, sub, repo_branch_key, supersede_token);
-    persist_or_log!(
-        crate::inbox::enqueue_with_idle_hint(
-            home,
-            sub,
-            crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.to_string())
-                .with_correlation_id(repo_branch_key.to_string()),
-        ),
-        "ci_watch_notify",
-        sub
-    );
+    match crate::inbox::enqueue_with_idle_hint(
+        home,
+        sub,
+        crate::inbox::InboxMessage::new_system("system:ci", "ci-watch", body.to_string())
+            .with_correlation_id(repo_branch_key.to_string()),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                sub = %sub,
+                error = %e,
+                "ci_watch_notify: durable inbox enqueue FAILED — notification not delivered"
+            );
+            false
+        }
+    }
 }
+
 
 /// #event-bus (ci_watch) subscriber: re-deliver a `CiReady`/`CiFail` event via the
 /// shared `deliver_ci_watch`. Both kinds deliver identically (the body already
@@ -1884,9 +1909,11 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
             supersede_token,
             ..
         } => {
-            deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token);
-            crate::reflexion::auto_correct_on_ci_pass(&event.home, target, None);
-            true
+            let ok = deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token);
+            if ok {
+                crate::reflexion::auto_correct_on_ci_pass(&event.home, target, None);
+            }
+            ok
         }
         crate::daemon::event_bus::EventKind::CiFail {
             target,
@@ -1895,8 +1922,7 @@ fn handle_event(event: &crate::daemon::event_bus::Event) -> bool {
             supersede_token,
             ..
         } => {
-            deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token);
-            true
+            deliver_ci_watch(&event.home, target, body, correlation_id, supersede_token)
         }
         _ => false,
     }
@@ -1908,12 +1934,21 @@ pub(crate) fn register_subscriber() {
     crate::daemon::event_bus::global().subscribe(handle_event);
 }
 
+/// arch14 (#2861): returns SETTLEMENT SUCCESS.
 fn persist_watch_state(
     ctx: &CiCheckCtx<'_>,
     pr: &PollResult,
     outcome: &NotifyOutcome,
     state: &mut WatchState,
-) {
+) -> bool {
+    if outcome.delivery_failed {
+        tracing::warn!(
+            repo = ctx.repo,
+            branch = ctx.branch,
+            "arch14: holding CI watch cursors — terminal notification delivery failed"
+        );
+        return false;
+    }
     if outcome.new_notified_sha.is_some() {
         // t-ci-ready-robust-fallback-design (PR-1, option C): the actionable
         // `[ci-ready-for-action]` is a CHAIN signal — it routes to `next_after_ci`
@@ -2046,6 +2081,7 @@ fn persist_watch_state(
         state.last_stale_emitted_sha = Some(s.clone());
     }
     state.last_terminal_seen_at = Some(chrono::Utc::now().to_rfc3339());
+    true
 }
 
 /// Refresh `expires_at` to now + 72h after a successful poll (#1267).

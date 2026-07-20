@@ -218,18 +218,32 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         Ok(o) if o.status.success() => {
             let mut resp =
                 json!({"path": worktree_path_str, "source": source_path, "branch": branch});
-            // #1275: write .agend-managed unconditionally so
-            // release_worktree and GC can always clean up.
-            let mut warnings: Vec<String> = Vec::new();
+            // #1275 + arch14 (#2860): write `.agend-managed` FAIL-CLOSED with
+            // canonical four-field identity (bind_full's source_canonical).
             let marker_path = worktree_dir.join(crate::worktree_pool::MANAGED_MARKER);
             if let Err(e) = std::fs::write(
                 &marker_path,
                 format!(
-                    "agent={instance_name}\nbranch={branch}\nleased_at={}\n",
+                    "agent={instance_name}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+                    source_canonical.display(),
                     chrono::Utc::now().to_rfc3339()
                 ),
-            ) {
-                warnings.push(format!("marker: {e}"));
+            )
+            .and_then(|()| crate::worktree_pool::sync_marker_contents(&marker_path))
+            {
+                tracing::warn!(
+                    %branch, path = %worktree_dir.display(), error = %e,
+                    "managed-marker write/sync failed — rolling back worktree (fail-closed)"
+                );
+                let _ = crate::git_helpers::git_bypass(
+                    Path::new(&source_path),
+                    &["worktree", "remove", "--force", &worktree_path_str],
+                );
+                return json!({
+                    "error": format!("managed-marker write failed, worktree rolled back: {e}"),
+                    "code": "marker_write_failed",
+                    "branch": branch,
+                });
             }
             if bind {
                 if let Err(e) = crate::binding::bind_full(
@@ -272,9 +286,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
                 resp["fetch_attempted"] = json!(fetch_attempted);
-            }
-            if !warnings.is_empty() {
-                resp["warnings"] = json!(warnings);
             }
             resp
         }

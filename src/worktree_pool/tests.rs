@@ -3410,3 +3410,173 @@ fn target_sweep_skips_when_bind_lock_contended() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ---------------------------------------------------------------------------
+// arch14 (#2860/#2862): managed-marker source parity + absent-binding release
+// ---------------------------------------------------------------------------
+
+#[test]
+fn arch14_lease_marker_writes_canonical_source_repo() {
+    let home = tmp_home("arch14-lease-src");
+    let repo = tmp_repo("arch14-lease-src-repo");
+    let lease = super::lease(&home, &repo, "dev-a", "feat/arch14-src")
+        .expect("lease must succeed");
+    let marker = std::fs::read_to_string(lease.path.join(MANAGED_MARKER)).expect("marker");
+    assert!(
+        marker.contains("agent=dev-a\n"),
+        "marker must record agent: {marker}"
+    );
+    assert!(
+        marker.contains("branch=feat/arch14-src\n"),
+        "marker must record branch: {marker}"
+    );
+    let canonical = std::fs::canonicalize(&repo).expect("canonicalize");
+    assert!(
+        marker.contains(&format!("source_repo={}\n", canonical.display())),
+        "marker must record canonical source_repo; marker={marker}, expected source={}",
+        canonical.display()
+    );
+    let _ = super::release_full(&home, "dev-a", false);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn arch14_lease_marker_write_failure_fails_loud() {
+    let home = tmp_home("arch14-lease-fail");
+    let repo = tmp_repo("arch14-lease-fail-repo");
+    // First lease succeeds and creates the worktree.
+    let lease = super::lease(&home, &repo, "dev-b", "feat/arch14-fail")
+        .expect("first lease");
+    // Block the marker path with a directory so the re-write on re-lease fails.
+    let marker = lease.path.join(MANAGED_MARKER);
+    std::fs::remove_file(&marker).ok();
+    std::fs::create_dir_all(&marker).expect("block marker path with directory");
+    let err = super::lease(&home, &repo, "dev-b", "feat/arch14-fail")
+        .expect_err("re-lease must fail-loud when marker write is blocked");
+    assert!(
+        matches!(err, LeaseError::CreateFailed(_)),
+        "expected CreateFailed, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("managed-marker") || msg.contains("marker"),
+        "error should mention marker: {msg}"
+    );
+    // Cleanup: remove blocker, then force-remove the worktree.
+    std::fs::remove_dir_all(&marker).ok();
+    std::fs::write(
+        lease.path.join(MANAGED_MARKER),
+        format!(
+            "agent=dev-b\nbranch=feat/arch14-fail\nsource_repo={}\n",
+            std::fs::canonicalize(&repo).unwrap().display()
+        ),
+    )
+    .ok();
+    let _ = super::release_full(&home, "dev-b", false);
+    // lease does not write binding — release_full absent-binding arm needs marker
+    // under worktrees/<agent>/<branch>. Path is already there; force cleanup if still present.
+    if lease.path.exists() {
+        let _ = crate::git_helpers::git_bypass(
+            &repo,
+            &["worktree", "remove", "--force", &lease.path.display().to_string()],
+        );
+        let _ = std::fs::remove_dir_all(&lease.path);
+    }
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
+    let home = tmp_home("arch14-absent");
+    let repo = tmp_repo("arch14-absent-repo");
+    // Create a real managed worktree via lease, then drop the binding so only
+    // the marker remains (ghost residue).
+    let lease = super::lease(&home, &repo, "ghost-a", "feat/ghost")
+        .expect("lease");
+    // Rewrite marker to LEGACY three-line shape (no source_repo line).
+    std::fs::write(
+        lease.path.join(MANAGED_MARKER),
+        "agent=ghost-a\nbranch=feat/ghost\nleased_at=2026-01-01T00:00:00Z\n",
+    )
+    .unwrap();
+    // Ensure no binding.json for this agent.
+    assert!(
+        crate::binding::read(&home, "ghost-a").is_none(),
+        "lease does not write binding; precondition"
+    );
+    let path = lease.path.clone();
+    assert!(path.exists(), "worktree must exist before release");
+
+    let out = super::release_full(&home, "ghost-a", false);
+    assert!(
+        out.released,
+        "absent-binding legacy marker must release via Git linkage: {out:?}"
+    );
+    assert!(
+        out.worktree_removed || !path.exists(),
+        "worktree must be removed: exists={} out={out:?}",
+        path.exists()
+    );
+    assert!(!path.exists(), "worktree dir gone");
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn arch14_absent_binding_zero_byte_marker_still_refused() {
+    let home = tmp_home("arch14-zerobyte");
+    let repo = tmp_repo("arch14-zerobyte-repo");
+    let lease = super::lease(&home, &repo, "ghost-z", "feat/zerobyte").expect("lease");
+    std::fs::write(lease.path.join(MANAGED_MARKER), "").unwrap();
+    let path = lease.path.clone();
+
+    let out = super::release_full(&home, "ghost-z", false);
+    assert!(
+        !out.released || out.error.is_some(),
+        "zero-byte marker must not silently succeed: {out:?}"
+    );
+    assert!(
+        path.exists(),
+        "worktree must be preserved when identity unreadable"
+    );
+    // cleanup
+    std::fs::write(
+        path.join(MANAGED_MARKER),
+        format!(
+            "agent=ghost-z\nbranch=feat/zerobyte\nsource_repo={}\n",
+            std::fs::canonicalize(&repo).unwrap().display()
+        ),
+    )
+    .ok();
+    let _ = super::release_full(&home, "ghost-z", false);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn arch14_worktree_create_first_marker_writes_source_repo() {
+    let home = tmp_home("arch14-create-src");
+    let repo = tmp_repo("arch14-create-src-repo");
+    let info = crate::worktree::create(&home, &repo, "agent-c", Some("feat/create-src"))
+        .expect("create");
+    let marker = std::fs::read_to_string(info.path.join(MANAGED_MARKER)).expect("marker");
+    let canonical = std::fs::canonicalize(&repo).expect("canon");
+    assert!(
+        marker.contains(&format!("source_repo={}\n", canonical.display())),
+        "create's first marker must carry source_repo: {marker}"
+    );
+    if info.path.exists() {
+        let _ = crate::git_helpers::git_bypass(
+            &repo,
+            &["worktree", "remove", "--force", &info.path.display().to_string()],
+        );
+        let _ = std::fs::remove_dir_all(&info.path);
+    }
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
