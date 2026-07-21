@@ -15,6 +15,7 @@ mod instance_metadata;
 mod instance_queries;
 pub(crate) mod instance_state;
 mod restart;
+pub(crate) mod runtime_bridge;
 mod schedule;
 mod send_envelope;
 mod task;
@@ -93,6 +94,23 @@ use instance::resolve_team_layout;
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     handle_tool_with_runtime(tool, args, instance_name, None)
+}
+
+/// #2454 Slice 2: test helper — dispatch with a minimal in-process runtime
+/// so SEND/SPAWN paths use typed services instead of failing closed on
+/// `runtime=None`. Production MCP enters via `handle_tool_with_runtime`
+/// with the live daemon registries.
+#[cfg(test)]
+pub fn handle_tool_rt(tool: &str, args: &Value, instance_name: &str) -> Value {
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let runtime = dispatch::RuntimeContext {
+        registry: Arc::new(Mutex::new(HashMap::new())),
+        configs: Arc::new(Mutex::new(HashMap::new())),
+        externals: Arc::new(Mutex::new(HashMap::new())),
+    };
+    handle_tool_with_runtime(tool, args, instance_name, Some(runtime))
 }
 
 /// #2454: tool dispatch with optional live RuntimeContext.

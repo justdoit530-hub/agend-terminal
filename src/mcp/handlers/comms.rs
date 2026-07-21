@@ -1,4 +1,4 @@
-use crate::agent_ops::{list_agents, send_to};
+use crate::agent_ops::list_agents;
 use crate::channel::sink_registry::registry as ux_sink_registry;
 use crate::channel::ux_event::{FleetEvent, UxEvent};
 use crate::identity::Sender;
@@ -11,7 +11,12 @@ use super::{comms_gates::enforce_send_invariants, err_needs_identity, is_ok_resu
 /// Sprint 30: unified `send` handler. Routes to existing handlers based on
 /// `request_kind` or infers from args (targets/team → broadcast, task field
 /// → delegate, summary → report, question → query, default → send_to).
-pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(super) fn handle_unified_send(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let mut args = args.clone();
     if let Some(err) = enforce_send_invariants(home, &args, sender) {
         return err;
@@ -37,29 +42,29 @@ pub(super) fn handle_unified_send(home: &Path, args: &Value, sender: &Option<Sen
                 obj.remove("tags");
             }
             lift_message(&mut args, "task");
-            return handle_delegate_task(home, &args, sender);
+            return handle_delegate_task(home, &args, sender, runtime);
         }
     }
 
     // Broadcast mode: targets/team/tags present
     if args.get("instances").is_some() || args.get("team").is_some() || args.get("tags").is_some() {
-        return handle_broadcast(home, &args, sender);
+        return handle_broadcast(home, &args, sender, runtime);
     }
 
     match args["request_kind"].as_str().unwrap_or("") {
         "task" => {
             lift_message(&mut args, "task");
-            handle_delegate_task(home, &args, sender)
+            handle_delegate_task(home, &args, sender, runtime)
         }
         "report" => {
             lift_message(&mut args, "summary");
-            handle_report_result(home, &args, sender)
+            handle_report_result(home, &args, sender, runtime)
         }
         "query" => {
             lift_message(&mut args, "question");
-            handle_request_information(home, &args, sender)
+            handle_request_information(home, &args, sender, runtime)
         }
-        _ => handle_send_to_instance(home, &args, "send", sender),
+        _ => handle_send_to_instance(home, &args, "send", sender, runtime),
     }
 }
 
@@ -68,6 +73,7 @@ pub(super) fn handle_send_to_instance(
     args: &Value,
     tool: &str,
     sender: &Option<Sender>,
+    runtime: Option<&super::dispatch::RuntimeContext>,
 ) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity(tool);
@@ -108,42 +114,9 @@ pub(super) fn handle_send_to_instance(
         parent_id: parent_id.map(String::from),
         ..SendEnvelope::directives_from_args(args)
     };
-    let result = match crate::api::call(
-        home,
-        &json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "method": crate::api::method::SEND,
-            "params": env.to_send_params(),
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            let dm = resp["delivery_mode"].as_str().unwrap_or("pty");
-            json!({"target": target, "delivery_mode": dm})
-        }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-        Err(e) => {
-            // Centralised fallback (Sprint 40 T-7 B4). #1024/#1833 fix: the
-            // fallback now carries the SAME directive set as `params` (shared
-            // SendEnvelope projection) — it previously dropped reviewed_head +
-            // sequencing/eta/cadence/worktree_binding, a latent verdict-correlation
-            // gap when a verdict send hit the API-down path.
-            let mut resolved_thread = thread_id.map(String::from);
-            let resolved_parent = parent_id.map(String::from);
-            if resolved_thread.is_none() {
-                if let Some(ref pid) = resolved_parent {
-                    if let Some(parent_msg) = crate::inbox::find_message(home, pid) {
-                        resolved_thread = parent_msg.thread_id.or_else(|| parent_msg.id.clone());
-                    }
-                }
-            }
-            let mut fb = env.clone();
-            fb.thread_id = resolved_thread;
-            fb.parent_id = resolved_parent;
-            let msg = fb.to_inbox_message();
-            crate::agent_ops::fallback_deliver(home, sender.as_str(), target, text, msg, &e)
-        }
-    };
-    let mut result = result;
+    // #2454 Slice 2: in-process SEND via shared API messaging owner (no socket).
+    let mut result =
+        super::runtime_bridge::send_in_process(home, runtime, &env.to_send_params(), target);
     if kind == Some("report") && parent_id.is_none() {
         attach_report_parent_warning(&mut result);
     }
@@ -164,7 +137,12 @@ fn attach_report_parent_warning(result: &mut Value) {
     }
 }
 
-pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(super) fn handle_delegate_task(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("delegate_task");
     };
@@ -344,24 +322,9 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
         branch: args["branch"].as_str().map(String::from),
         ..SendEnvelope::directives_from_args(args)
     };
-    let result = match crate::api::call(
-        home,
-        &json!({
-            "request_id": uuid::Uuid::new_v4().to_string(),
-            "method": crate::api::method::SEND,
-            "params": env.to_send_params(),
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-        Err(e) => {
-            // Centralised fallback (Sprint 40 T-7 B4). HIGH-1/#1833: the directive
-            // set is carried by the SAME envelope projected to the inbox message,
-            // so it can't drift from `params`.
-            let inbox_msg = env.to_inbox_message();
-            crate::agent_ops::fallback_deliver(home, sender.as_str(), target, &msg, inbox_msg, &e)
-        }
-    };
+    // #2454 Slice 2: in-process SEND (no socket loopback / inbox_fallback).
+    let result =
+        super::runtime_bridge::send_in_process(home, runtime, &env.to_send_params(), target);
     if is_ok_result(&result) {
         let task_id = task_id_str.map(str::to_string);
         // #2099: a fire-and-forget dispatch (`no_report_expected`) is recorded
@@ -419,7 +382,12 @@ pub(super) fn handle_delegate_task(home: &Path, args: &Value, sender: &Option<Se
     result
 }
 
-pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(super) fn handle_report_result(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("report_result");
     };
@@ -526,8 +494,16 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
                     |instance, message| {
                         // Fire-and-forget skill-write request (no task board id).
                         // `update` avoids kind=task's required task_id contract.
-                        let result =
-                            send_to(home, sender, instance, message, "update", None);
+                        // #2454: in-process SEND when runtime is available.
+                        let params = json!({
+                            "from": sender.as_str(),
+                            "target": instance,
+                            "text": message,
+                            "kind": "update",
+                        });
+                        let result = super::runtime_bridge::send_in_process(
+                            home, runtime, &params, instance,
+                        );
                         match result.get("error").and_then(|e| e.as_str()) {
                             Some(err) => Err(err.to_string()),
                             None => Ok(()),
@@ -560,30 +536,8 @@ pub(super) fn handle_report_result(home: &Path, args: &Value, sender: &Option<Se
             parent_id: args["parent_id"].as_str().map(String::from),
             ..SendEnvelope::directives_from_args(args)
         };
-        match crate::api::call(
-            home,
-            &json!({
-                "request_id": uuid::Uuid::new_v4().to_string(),
-                "method": crate::api::method::SEND,
-                "params": env.to_send_params(),
-            }),
-        ) {
-            Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"target": target}),
-            Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("send failed")}),
-            Err(e) => {
-                // Centralised fallback (Sprint 40 T-7 B4) — shared SendEnvelope
-                // projection keeps the fallback aligned with params.
-                let inbox_msg = env.to_inbox_message();
-                crate::agent_ops::fallback_deliver(
-                    home,
-                    sender.as_str(),
-                    target,
-                    &msg,
-                    inbox_msg,
-                    &e,
-                )
-            }
-        }
+        // #2454 Slice 2: in-process SEND (no socket loopback / inbox_fallback).
+        super::runtime_bridge::send_in_process(home, runtime, &env.to_send_params(), target)
     };
     // Add warning for report kind without parent_id
     let mut result = result;
@@ -634,6 +588,7 @@ pub(super) fn handle_request_information(
     home: &Path,
     args: &Value,
     sender: &Option<Sender>,
+    runtime: Option<&super::dispatch::RuntimeContext>,
 ) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("request_information");
@@ -651,10 +606,22 @@ pub(super) fn handle_request_information(
     if let Some(ctx) = args["context"].as_str() {
         msg.push_str(&format!("\n\nContext: {ctx}"));
     }
-    send_to(home, sender, target, &msg, "query", None)
+    let params = json!({
+        "from": sender.as_str(),
+        "target": target,
+        "text": msg,
+        "kind": "query",
+    });
+    // #2454 Slice 2: in-process SEND
+    super::runtime_bridge::send_in_process(home, runtime, &params, target)
 }
 
-pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender>) -> Value {
+pub(super) fn handle_broadcast(
+    home: &Path,
+    args: &Value,
+    sender: &Option<Sender>,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let Some(sender) = sender.as_ref() else {
         return err_needs_identity("broadcast");
     };
@@ -685,7 +652,17 @@ pub(super) fn handle_broadcast(home: &Path, args: &Value, sender: &Option<Sender
     let mut sent = Vec::new();
     let mut failed: Vec<Value> = Vec::new();
     for target in &targets {
-        let result = send_to(home, sender, target, message, kind, Some(&broadcast_ctx));
+        let mut params = json!({
+            "from": sender.as_str(),
+            "target": target,
+            "text": message,
+            "kind": kind,
+        });
+        if let Ok(bc) = serde_json::to_value(&broadcast_ctx) {
+            params["broadcast_context"] = bc;
+        }
+        // #2454 Slice 2: in-process SEND per target
+        let result = super::runtime_bridge::send_in_process(home, runtime, &params, target);
         if result.get("error").is_some() {
             failed.push(json!({"target": target, "error": result["error"]}));
         } else {

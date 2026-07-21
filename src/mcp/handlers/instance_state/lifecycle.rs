@@ -66,7 +66,11 @@ fn remove_empty_dir_tree(dir: &Path) {
 /// state for `auto_start_fleet` to resurrect on next reconcile. `detail`
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
-pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
+pub(crate) fn full_delete_instance(
+    home: &Path,
+    name: &str,
+    runtime: Option<&crate::mcp::handlers::dispatch::RuntimeContext>,
+) -> Result<(), String> {
     // #1915: mark this instance "deleting" for the ENTIRE teardown — the guard is
     // held until this fn returns (after workspace cleanup + the residual audit
     // below), so any concurrent spawn (boot-stagger / crash-respawn worker /
@@ -96,10 +100,25 @@ pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
-    let _ = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
-    );
+    // #2454 Slice 2: prefer in-process DELETE (MCP RuntimeContext or the
+    // process-global pending registry). Socket loopback only when neither is
+    // available (cross-process TUI → standalone daemon).
+    if let Some(runtime) = runtime {
+        let _ = crate::mcp::handlers::runtime_bridge::delete_in_process(
+            home,
+            Some(runtime),
+            name,
+            false,
+        );
+    } else if let Some(reg) = crate::agent::get_pending_registry() {
+        crate::daemon::lifecycle::delete_transaction(home, name, &reg, None, false);
+        crate::daemon::poll_reminder::remove_agent(name);
+    } else {
+        let _ = crate::api::call(
+            home,
+            &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
+        );
+    }
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");

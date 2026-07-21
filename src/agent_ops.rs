@@ -23,6 +23,11 @@ use std::sync::Arc;
 /// Centralised daemon-unavailable fallback: validate target in fleet.yaml,
 /// enqueue inbox message, notify agent. Returns fallback JSON response.
 /// Extracted from 3 duplicated sites in comms.rs (Sprint 40 T-7 B4).
+///
+/// #2454 Slice 2: production SEND paths no longer call this (in-process
+/// service fails closed when runtime is absent). Kept for unit tests + any
+/// non-MCP callers until a follow-up retirement.
+#[allow(dead_code)]
 pub fn fallback_deliver(
     home: &Path,
     from: &str,
@@ -55,14 +60,9 @@ pub fn fallback_deliver(
 /// Send a message to a target instance via API, falling back to direct
 /// inbox delivery when the daemon is unreachable.
 ///
-/// `from: &Sender` guarantees a non-empty originator; callers cannot
-/// accidentally stamp messages with `[from:]` (see `src/identity.rs`).
-///
-/// Sprint 54 layer-5: `broadcast_context` is `Some` only when the call
-/// originates from `handle_broadcast` per-target loop — it surfaces in the
-/// recipient's `[AGEND-MSG]` header (`broadcast=N team=NAME`) and inbox
-/// JSON metadata so broadcast is distinguishable from unicast at agent
-/// vantage. Routing behavior is unaffected.
+/// #2454 Slice 2: MCP SEND routes through `runtime_bridge::send_in_process`
+/// instead. Retained for tests / transitional callers.
+#[allow(dead_code)]
 pub fn send_to(
     home: &Path,
     from: &Sender,
@@ -556,6 +556,7 @@ pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, V
 // ---------------------------------------------------------------------------
 
 /// Look up submit_key for a target instance from fleet config.
+#[allow(dead_code)] // still used by unit tests + send_to body
 pub fn get_submit_key(home: &Path, target: &str) -> String {
     let fleet_path = crate::fleet::fleet_yaml_path(home);
     if let Ok(config) = crate::fleet::FleetConfig::load(&fleet_path) {

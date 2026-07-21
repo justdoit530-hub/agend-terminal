@@ -12,18 +12,50 @@ use crate::agent_ops::validate_branch;
 use serde_json::{json, Value};
 use std::path::Path;
 
-pub(super) fn spawn_single_instance(home: &Path, instance_name: &str, args: &Value) -> Value {
-    spawn_single_instance_impl(home, instance_name, args, &crate::api::call)
+pub(super) fn spawn_single_instance(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    runtime: Option<&crate::mcp::handlers::dispatch::RuntimeContext>,
+) -> Value {
+    // #2454 Slice 2: in-process SPAWN when runtime is available.
+    let spawn_fn: Box<dyn Fn(&Path, &Value) -> anyhow::Result<Value>> =
+        if let Some(rt) = runtime {
+            let reg = rt.registry.clone();
+            let configs = rt.configs.clone();
+            let externals = rt.externals.clone();
+            Box::new(move |home, req| {
+                let params = &req["params"];
+                let ctx = crate::api::handlers::HandlerCtx {
+                    registry: &reg,
+                    configs: &configs,
+                    externals: &externals,
+                    notifier: None,
+                    home,
+                };
+                Ok(crate::api::handlers::instance::handle_spawn(params, &ctx))
+            })
+        } else {
+            Box::new(|_home, _req| {
+                Err(anyhow::anyhow!(
+                    "runtime unavailable: spawn requires the in-process daemon runtime"
+                ))
+            })
+        };
+    spawn_single_instance_impl(home, instance_name, args, spawn_fn.as_ref(), runtime)
 }
 
 /// Inner impl of [`spawn_single_instance`] parameterized on the SPAWN RPC for
-/// `instance_964_tests`. Production passes [`crate::api::call`].
+/// `instance_964_tests`. Production passes an in-process SPAWN bridge.
 pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
     home: &Path,
     instance_name: &str,
     args: &Value,
     spawn_fn: &dyn Fn(&Path, &Value) -> anyhow::Result<Value>,
+    runtime: Option<&crate::mcp::handlers::dispatch::RuntimeContext>,
 ) -> Value {
+    // Capture registries for delayed task inject (if runtime present).
+    let inject_regs = runtime.map(|rt| (rt.registry.clone(), rt.externals.clone()));
     let raw_name = match args["name"].as_str() {
         Some(n) => n,
         None => return json!({"error": "missing 'name'"}),
@@ -215,28 +247,36 @@ pub(in crate::mcp::handlers) fn spawn_single_instance_impl(
             if let Some(task_text) = task {
                 let h = home.to_path_buf();
                 let n = name.to_string();
+                let regs = inject_regs.clone();
                 // fire-and-forget: single-agent task injection (M5 §10.5).
                 std::thread::Builder::new()
                     .name("task_inject".into())
                     .spawn(move || {
                         std::thread::sleep(std::time::Duration::from_secs(3));
-                        // #2004: a swallowed INJECT failure left a slow-starting
-                        // member idle with ZERO task context, invisibly. Pure
-                        // surfacing — the spawn itself already succeeded, so a
-                        // failed inject stays non-fatal (operator re-injects).
-                        let resp = crate::api::call(
-                            &h,
-                            &json!({"method": crate::api::method::INJECT, "params": {"name": n, "data": task_text}}),
-                        );
-                        let failed = match &resp {
-                            Ok(v) => v["ok"].as_bool() != Some(true),
-                            Err(_) => true,
+                        // #2454 Slice 2: in-process inject via captured runtime
+                        // registries (or pending registry fallback).
+                        let inject_err = if let Some((reg, ext)) = regs {
+                            crate::agent_ops::inject_input(
+                                &reg, &ext, &h, &n, &task_text, false,
+                            )
+                            .err()
+                            .map(|e| e.message())
+                        } else if let Some(reg) = crate::agent::get_pending_registry() {
+                            let ext = std::sync::Arc::new(parking_lot::Mutex::new(
+                                std::collections::HashMap::new(),
+                            ));
+                            crate::agent_ops::inject_input(
+                                &reg, &ext, &h, &n, &task_text, false,
+                            )
+                            .err()
+                            .map(|e| e.message())
+                        } else {
+                            Some(
+                                "runtime unavailable: inject requires in-process daemon runtime"
+                                    .to_string(),
+                            )
                         };
-                        if failed {
-                            let detail = match resp {
-                                Ok(v) => v.to_string(),
-                                Err(e) => e.to_string(),
-                            };
+                        if let Some(detail) = inject_err {
                             tracing::warn!(
                                 agent = %n,
                                 error = %detail,

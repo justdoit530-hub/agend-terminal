@@ -90,7 +90,11 @@ pub(super) fn handle_restart_daemon(home: &Path) -> Value {
     }
     crate::daemon::RESTART_PENDING.store(true, std::sync::atomic::Ordering::Release);
     std::fs::write(home.join("restart-requested"), "").ok();
-    let _ = crate::api::call(home, &json!({"method": crate::api::method::SHUTDOWN}));
+    // #2454 Slice 2: do NOT loopback SHUTDOWN over the API socket. The api
+    // session loop already bridges `RESTART_PENDING` → `shutdown.store(true)`
+    // (see `api::handle_session`), so flipping the static is sufficient for
+    // supervised exit(42). Record the taxonomy reason for the shutdown sequence.
+    crate::daemon::record_shutdown_reason(crate::daemon::ShutdownReason::ApiShutdown);
     json!({"ok": true, "restart": "pending", "note": "daemon will exit(42) after graceful shutdown; supervisor restarts"})
 }
 

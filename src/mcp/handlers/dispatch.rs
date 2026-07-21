@@ -204,11 +204,10 @@ macro_rules! action_adapter {
 pub(crate) fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_list_instances(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
 }
-adapter!(
-    dispatch_create_instance,
-    hai,
-    instance::handle_create_instance
-);
+/// #2454 Slice 2: create/start/replace/delete/restart need RuntimeContext.
+pub(crate) fn dispatch_create_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_create_instance(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
+}
 adapter!(
     dispatch_set_description,
     hai,
@@ -218,22 +217,18 @@ pub(crate) fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_interrupt(ctx.home, ctx.args, ctx.runtime)
 }
 adapter!(dispatch_tokens, ha, crate::token_cost::handle_tokens);
-adapter!(
-    dispatch_delete_instance,
-    ha,
-    instance::handle_delete_instance
-);
-adapter!(dispatch_start_instance, ha, instance::handle_start_instance);
-adapter!(
-    dispatch_replace_instance,
-    ha,
-    instance::handle_replace_instance
-);
-adapter!(
-    dispatch_restart_instance,
-    ha,
-    instance::handle_restart_instance
-);
+pub(crate) fn dispatch_delete_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_delete_instance(ctx.home, ctx.args, ctx.runtime)
+}
+pub(crate) fn dispatch_start_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_start_instance(ctx.home, ctx.args, ctx.runtime)
+}
+pub(crate) fn dispatch_replace_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_replace_instance(ctx.home, ctx.args, ctx.runtime)
+}
+pub(crate) fn dispatch_restart_instance(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_restart_instance(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(
     dispatch_agy_quota,
     ha,
@@ -245,7 +240,10 @@ adapter!(
     hais,
     instance::handle_set_waiting_on
 );
-adapter!(dispatch_send, has, comms::handle_unified_send);
+/// #2454 Slice 2: send needs RuntimeContext for in-process delivery.
+pub(crate) fn dispatch_send(ctx: &HandlerCtx<'_>) -> Value {
+    comms::handle_unified_send(ctx.home, ctx.args, ctx.sender, ctx.runtime)
+}
 adapter!(dispatch_bind_self, has, worktree::handle_bind_self);
 adapter!(
     dispatch_binding_state,

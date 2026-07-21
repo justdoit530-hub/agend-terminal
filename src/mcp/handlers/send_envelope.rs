@@ -122,6 +122,9 @@ impl SendEnvelope {
     /// (`expect_reply_within_secs` / `no_report_expected` / `provenance` /
     /// `branch` — daemon SEND-path-only, and the fallback bypasses that path)
     /// are explicitly dropped.
+    ///
+    /// #2454: production SEND no longer uses the fallback; tests still pin it.
+    #[allow(dead_code)]
     pub(super) fn to_inbox_message(&self) -> crate::inbox::InboxMessage {
         let SendEnvelope {
             from,

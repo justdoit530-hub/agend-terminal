@@ -452,7 +452,7 @@ pub(super) fn handle_key(
                         for name in &names {
                             if let Err(detail) =
                                 crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(
-                                    &home, name,
+                                    &home, name, None,
                                 )
                             {
                                 tracing::warn!(name, detail = %detail,

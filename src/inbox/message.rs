@@ -7,6 +7,9 @@ pub enum NotifySource<'a> {
     /// Message from a channel user (Telegram, Discord, etc.).
     Channel(&'a str, crate::channel::ChannelKind),
     /// Message from another agent instance (e.g., "dev").
+    /// #2454: production SEND no longer constructs this via fallback_deliver;
+    /// still used by unit tests + notify formatting.
+    #[allow(dead_code)]
     Agent(&'a str),
     /// System message (e.g., "replace", "ci").
     System(&'a str),
