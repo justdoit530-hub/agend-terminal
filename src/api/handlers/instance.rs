@@ -834,7 +834,6 @@ mod tests {
         std::fs::remove_dir_all(home.as_ref()).ok();
     }
 
->>>>>>> 6312e512 (fix: preserve declared backend through wrapper commands (#2834))
     /// t-90 (direction-b common case): a name already held by an EXTERNAL agent
     /// must NOT be spawnable as a managed agent — `handle_spawn` rejects it at
     /// the external check (Option B) BEFORE any registry lock or spawn.
