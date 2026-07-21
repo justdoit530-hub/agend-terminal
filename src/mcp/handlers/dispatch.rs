@@ -43,6 +43,21 @@ pub(crate) struct HandlerCtx<'a> {
     pub args: &'a Value,
     pub instance_name: &'a str,
     pub sender: &'a Option<Sender>,
+    /// #2454: live daemon runtime when entered via in-process mcp_tool.
+    /// Standalone bridge / tests leave this `None`.
+    pub runtime: Option<&'a RuntimeContext>,
+}
+
+/// Optional daemon runtime state available only when MCP tools are executed
+/// through the in-process API `mcp_tool` path. Standalone bridge calls leave it
+/// absent and keep legacy socket/fallback behavior where still present.
+#[derive(Clone)]
+pub(crate) struct RuntimeContext {
+    pub registry: crate::agent::AgentRegistry,
+    /// Reserved for later #2454 slices (delete/spawn share configs).
+    #[allow(dead_code)]
+    pub configs: crate::api::ConfigRegistry,
+    pub externals: crate::agent::ExternalRegistry,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -186,11 +201,9 @@ macro_rules! action_adapter {
 // Flat adapters — one per simple (non-action-based) tool.
 // ---------------------------------------------------------------------
 
-adapter!(
-    dispatch_list_instances,
-    hai,
-    instance::handle_list_instances
-);
+pub(crate) fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_list_instances(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
+}
 adapter!(
     dispatch_create_instance,
     hai,
@@ -201,7 +214,9 @@ adapter!(
     hai,
     instance::handle_set_description
 );
-adapter!(dispatch_interrupt, ha, instance::handle_interrupt);
+pub(crate) fn dispatch_interrupt(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_interrupt(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(dispatch_tokens, ha, crate::token_cost::handle_tokens);
 adapter!(
     dispatch_delete_instance,
@@ -259,7 +274,9 @@ adapter!(
     hai,
     instance::handle_set_display_name
 );
-adapter!(dispatch_pane_snapshot, ha, instance::handle_pane_snapshot);
+pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_pane_snapshot(ctx.home, ctx.args, ctx.runtime)
+}
 pub(crate) fn dispatch_list_rules(ctx: &HandlerCtx<'_>) -> Value {
     let agent_name = match ctx.args.get("agent_name").and_then(|v| v.as_str()) {
         Some(name) => name,
@@ -750,10 +767,20 @@ action_adapter!(dispatch_ephemeral, "ephemeral", [
     "reap"  => ephemeral::handle_reap,  ha;
 ]);
 
-action_adapter!(dispatch_health, "health", [
-    "report" => instance::handle_report_health,         hais;
-    "clear"  => instance::handle_clear_blocked_reason,  ha;
-]);
+/// #2454: custom (not `action_adapter!`) — health writes need RuntimeContext.
+pub(crate) fn dispatch_health(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "report" => instance::handle_report_health(
+            ctx.home,
+            ctx.args,
+            ctx.instance_name,
+            ctx.sender,
+            ctx.runtime,
+        ),
+        "clear" => instance::handle_clear_blocked_reason(ctx.home, ctx.args, ctx.runtime),
+        other => json!({"error": format!("unknown health action: {other}")}),
+    }
+}
 
 action_adapter!(dispatch_repo, "repo", [
     "checkout"                => ci::handle_checkout_repo,              hai;
@@ -1176,6 +1203,7 @@ mod tests {
             args,
             instance_name: instance,
             sender: &EMPTY_SENDER,
+            runtime: None,
         }
     }
 

@@ -118,6 +118,258 @@ pub fn send_to(
 }
 
 // ---------------------------------------------------------------------------
+// Blocked-reason / pane / list / inject — #2454 in-process MCP→API services
+// ---------------------------------------------------------------------------
+
+/// Successful [`set_blocked_reason`] outcome.
+#[derive(Debug)]
+pub struct BlockedReasonSet {
+    pub current_state: String,
+}
+
+/// Successful [`clear_blocked_reason`] outcome.
+#[derive(Debug)]
+pub struct BlockedReasonCleared {
+    pub was: Option<crate::health::BlockedReason>,
+}
+
+/// [`clear_blocked_reason`] failure variants (exhaustive mapping at transports).
+#[derive(Debug)]
+pub enum ClearBlockedError {
+    NotFound,
+    FilterMismatch {
+        current: Option<crate::health::BlockedReason>,
+    },
+}
+
+/// #2454: set blocked reason IN-PROCESS against the live registry.
+pub fn set_blocked_reason(
+    registry: &AgentRegistry,
+    home: &Path,
+    name: &str,
+    reason: crate::health::BlockedReason,
+    note: Option<&str>,
+) -> Option<BlockedReasonSet> {
+    let reg = agent::lock_registry(registry);
+    let handle = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))?;
+    let mut core = handle.core.lock();
+    let current_state = core.state.get_state().display_name().to_string();
+    core.health.set_blocked_reason(reason);
+    core.health
+        .set_blocked_note(note.filter(|n| !n.is_empty()).map(str::to_string));
+    Some(BlockedReasonSet { current_state })
+}
+
+/// #2454: clear blocked reason IN-PROCESS. `filter_kind` is a reason-KIND token.
+pub fn clear_blocked_reason(
+    registry: &AgentRegistry,
+    home: &Path,
+    name: &str,
+    filter_kind: Option<&str>,
+) -> Result<BlockedReasonCleared, ClearBlockedError> {
+    let reg = agent::lock_registry(registry);
+    let handle = crate::fleet::resolve_uuid(home, name)
+        .and_then(|id| reg.get(&id))
+        .ok_or(ClearBlockedError::NotFound)?;
+    let mut core = handle.core.lock();
+    let was = core.health.current_reason.clone();
+    let rate_limit_self_cleared = matches!(
+        was,
+        Some(
+            crate::health::BlockedReason::RateLimit { .. }
+                | crate::health::BlockedReason::QuotaExceeded
+        )
+    );
+    if let Some(filter) = filter_kind {
+        let matches = was.as_ref().is_some_and(|r| r.kind_str() == filter);
+        if !matches {
+            return Err(ClearBlockedError::FilterMismatch { current: was });
+        }
+    }
+    core.health.clear_blocked_reason();
+    // #2232: latch ground-truth recovery so supervisor drops ServerRateLimit track.
+    if rate_limit_self_cleared {
+        core.health.rate_limit_self_cleared = true;
+    }
+    Ok(BlockedReasonCleared { was })
+}
+
+/// #2454: read PTY scrollback IN-PROCESS. `None` = not registered.
+pub fn pane_scrollback(
+    registry: &AgentRegistry,
+    home: &Path,
+    name: &str,
+    lines: usize,
+) -> Option<String> {
+    let reg = agent::lock_registry(registry);
+    let handle = crate::fleet::resolve_uuid(home, name).and_then(|id| reg.get(&id))?;
+    let core = handle.core.lock();
+    Some(core.vterm.read_scrollback(lines))
+}
+
+/// #2454 S3: neutral list-snapshot service (lock-drop before disk I/O).
+pub(crate) fn list_snapshot(
+    home: &Path,
+    registry: &AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+) -> Value {
+    let reg = agent::lock_registry(registry);
+    let snapshot: Vec<(String, Value)> = reg
+        .values()
+        .map(|handle| {
+            let name = handle.name.to_string();
+            let (
+                agent_state,
+                health_state,
+                blocked_reason,
+                blocked_note,
+                context,
+                context_provider,
+                api_in_flight,
+                last_api_activity_at,
+                observed_status,
+            ) = {
+                let c = handle.core.lock();
+                (
+                    c.state.get_state().display_name().to_string(),
+                    c.health.state.display_name().to_string(),
+                    c.health.current_reason.as_ref().map(|r| r.to_string()),
+                    c.health.current_note.clone(),
+                    c.state.resolved_context(Some(home)),
+                    c.state.context_provider(),
+                    c.api_activity.in_flight,
+                    c.api_activity.last_active_epoch_ms,
+                    c.observed_status.clone(),
+                )
+            };
+            let entry = json!({
+                "name": name.as_str(),
+                "backend": handle.backend_command,
+                "submit_key": handle.submit_key,
+                "inject_prefix": handle.inject_prefix,
+                "agent_state": agent_state,
+                "health_state": health_state,
+                "blocked_reason": blocked_reason,
+                "blocked_note": blocked_note,
+                "context_pct": context.map(|(pct, _)| pct),
+                "context_source": context.map(|(_, source)| source.source_name()),
+                "context_provider": context_provider.source_name(),
+                "api_in_flight": api_in_flight,
+                "last_api_activity_at": last_api_activity_at,
+                "observed_status": observed_status,
+                "kind": "managed",
+            });
+            (name, entry)
+        })
+        .collect();
+    drop(reg);
+
+    let mut agents: Vec<Value> = Vec::with_capacity(snapshot.len());
+    for (name, mut entry) in snapshot {
+        let (dispatched_waiting_for, pending_response_to) =
+            crate::daemon::dispatch_idle::pending_for_instance(home, &name);
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert(
+                "dispatched_waiting_for".into(),
+                json!(dispatched_waiting_for),
+            );
+            obj.insert("pending_response_to".into(), json!(pending_response_to));
+        }
+        agents.push(entry);
+    }
+    let ext = agent::lock_external(externals);
+    for (name, handle) in ext.iter() {
+        let (dispatched_waiting_for, pending_response_to) =
+            crate::daemon::dispatch_idle::pending_for_instance(home, name);
+        agents.push(json!({
+            "name": name,
+            "backend": handle.backend_command,
+            "agent_state": "external",
+            "health_state": "connected",
+            "kind": "external",
+            "pid": handle.pid,
+            "dispatched_waiting_for": dispatched_waiting_for,
+            "pending_response_to": pending_response_to,
+        }));
+    }
+    json!({"ok": true, "result": {"protocol_version": crate::framing::PROTOCOL_VERSION, "agents": agents}})
+}
+
+/// #2454 S4: typed inject-input service errors.
+#[derive(Debug)]
+pub enum InjectError {
+    InvalidName(String),
+    NotFound(String),
+    External(String),
+    Restarting(String),
+    Write(String),
+}
+
+impl InjectError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::InvalidName(e) => e.clone(),
+            Self::NotFound(n) => format!("agent '{n}' not found"),
+            Self::External(n) => format!("agent '{n}' is external — use send instead of inject"),
+            Self::Restarting(n) => format!("agent '{n}' is restarting, retry later"),
+            Self::Write(e) => e.clone(),
+        }
+    }
+}
+
+/// #2454 S4: inject bytes into a managed agent PTY IN-PROCESS.
+pub fn inject_input(
+    registry: &AgentRegistry,
+    externals: &crate::agent::ExternalRegistry,
+    home: &Path,
+    name: &str,
+    data: &str,
+    raw: bool,
+) -> Result<usize, InjectError> {
+    if let Err(e) = agent::validate_name(name) {
+        return Err(InjectError::InvalidName(e));
+    }
+    let snap = {
+        let reg = agent::lock_registry(registry);
+        crate::fleet::resolve_uuid(home, name)
+            .and_then(|id| reg.get(&id))
+            .map(|handle| {
+                let is_restarting = {
+                    let core = handle.core.lock();
+                    crate::daemon::shadow::operated_state(
+                        core.state.current,
+                        core.observed_status.as_ref(),
+                    )
+                    .is_unavailable()
+                };
+                (agent::InjectTarget::from_handle(handle), is_restarting)
+            })
+    };
+    match snap {
+        Some((_tgt, true)) => Err(InjectError::Restarting(name.to_string())),
+        Some((tgt, false)) => {
+            let result = if raw {
+                agent::write_to_pty(&tgt.pty_writer, data.as_bytes())
+            } else {
+                agent::inject_with_target_gated(&tgt, name, data.as_bytes(), true, None)
+            };
+            match result {
+                Ok(()) => Ok(data.len()),
+                Err(e) => Err(InjectError::Write(format!("{e}"))),
+            }
+        }
+        None => {
+            let ext = agent::lock_external(externals);
+            if ext.contains_key(name) {
+                Err(InjectError::External(name.to_string()))
+            } else {
+                Err(InjectError::NotFound(name.to_string()))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
 

@@ -75,7 +75,10 @@ fn require_instance(args: &Value) -> Result<&str, Value> {
 
 /// Build the INJECT API params for an interrupt ESC byte injection.
 /// Extracted for testability — unit tests verify the exact params
-/// without needing a running daemon.
+/// without needing a running daemon. Production interrupt now uses
+/// `agent_ops::inject_input` in-process (#2454); this helper remains for
+/// characterization tests and any residual socket callers.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn interrupt_esc_params(target: &str) -> Value {
     json!({
         "method": crate::api::method::INJECT,
@@ -87,7 +90,18 @@ pub fn interrupt_esc_params(target: &str) -> Value {
 #[cfg(test)]
 use instance::resolve_team_layout;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
+    handle_tool_with_runtime(tool, args, instance_name, None)
+}
+
+/// #2454: tool dispatch with optional live RuntimeContext.
+pub fn handle_tool_with_runtime(
+    tool: &str,
+    args: &Value,
+    instance_name: &str,
+    runtime: Option<dispatch::RuntimeContext>,
+) -> Value {
     let home = crate::home_dir();
     // arch F5 (t-…47102): a read-only tool (pure query, no state change) skips the
     // two per-call DISK side-effects below — the usage append and the heartbeat RMW
@@ -159,6 +173,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
         args,
         instance_name,
         sender: &sender,
+        runtime: runtime.as_ref(),
     };
     if let Some(value) = dispatch::try_dispatch(tool, &dispatch_ctx) {
         value

@@ -3,6 +3,7 @@ use crate::identity::Sender;
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::dispatch::RuntimeContext;
 use super::err_needs_identity;
 
 /// #2050 simplify PR-B (⑩): shared body for the `set_display_name` /
@@ -41,35 +42,44 @@ pub(super) fn handle_set_description(home: &Path, args: &Value, instance_name: &
     set_string_attr(home, instance_name, desc, "description", 1024)
 }
 
-pub(super) fn handle_interrupt(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_interrupt(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let target = match super::require_instance(args) {
         Ok(t) => t,
         Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
-    match crate::api::call(home, &super::interrupt_esc_params(target)) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+    // #2454 S4: in-process ESC inject via agent_ops::inject_input.
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: interrupt requires the in-process daemon runtime"});
+    };
+    match crate::agent_ops::inject_input(
+        &runtime.registry,
+        &runtime.externals,
+        home,
+        target,
+        "\x1b",
+        true,
+    ) {
+        Ok(_) => {
             if let Some(reason) = args["reason"].as_str() {
                 let header = crate::inbox::format_event_header("interrupt", &[("reason", reason)]);
                 crate::inbox::compose_aware_inject(home, target, &header);
             }
             let mut result = json!({"ok": true, "target": target});
             if args["snapshot"].as_bool() == Some(true) {
-                if let Ok(snap) = crate::api::call(
-                    home,
-                    &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": 40}}),
-                ) {
-                    if snap["ok"].as_bool() == Some(true) {
-                        result["snapshot"] = snap["text"].clone();
-                    }
+                if let Some(text) =
+                    crate::agent_ops::pane_scrollback(&runtime.registry, home, target, 40)
+                {
+                    result["snapshot"] = json!(text);
                 }
             }
             result
         }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("inject failed")}),
-        Err(e) => {
-            json!({"error": format!("interrupt failed — agent '{target}' not reachable (API unavailable: {e})")})
-        }
+        Err(e) => json!({"error": e.message()}),
     }
 }
 
@@ -135,38 +145,33 @@ pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
     }
 }
 
-pub(super) fn handle_pane_snapshot(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_pane_snapshot(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let target = match super::require_instance(args) {
         Ok(t) => t,
         Err(e) => return e,
     };
     crate::validate_name_or_err!(target);
     let lines_u64 = args["lines"].as_u64().unwrap_or(100);
-    // M1: explicit bounds check before u64→usize cast (32-bit safety)
     if lines_u64 > 10000 {
         return json!({"error": "lines must be <= 10000 (scrolling_history limit)"});
     }
     let lines = lines_u64 as usize;
-    match crate::api::call(
-        home,
-        &json!({"method": crate::api::method::PANE_SNAPSHOT, "params": {"name": target, "lines": lines}}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            // #2478: diagnostic-capture "summary, not context-flood" mode. A raw
-            // pane dump (hundreds of scrollback lines for a render investigation)
-            // is heavy context that lingers for the whole session. When
-            // `to_file:true`, write the full snapshot to a capture file and return
-            // only a compact summary (counts + head/tail preview + the path) so the
-            // agent can hexdump / inspect the file in scratch WITHOUT the full dump
-            // entering its context.
-            let full = resp["text"].as_str().unwrap_or("");
+    // #2454: in-process scrollback via agent_ops::pane_scrollback.
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: pane_snapshot requires the in-process daemon runtime"});
+    };
+    match crate::agent_ops::pane_scrollback(&runtime.registry, home, target, lines) {
+        Some(full) => {
             if args["to_file"].as_bool().unwrap_or(false) {
-                return pane_snapshot_to_file(home, target, full, args);
+                return pane_snapshot_to_file(home, target, &full, args);
             }
-            json!({"ok": true, "text": resp["text"]})
+            json!({"ok": true, "text": full})
         }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("pane_snapshot failed")}),
-        Err(e) => json!({"error": format!("pane_snapshot: {e}")}),
+        None => json!({"error": format!("instance '{target}' not found")}),
     }
 }
 
@@ -238,74 +243,68 @@ pub(super) fn handle_report_health(
     args: &Value,
     instance_name: &str,
     sender: &Option<Sender>,
+    runtime: Option<&RuntimeContext>,
 ) -> Value {
     let Some(_) = sender.as_ref() else {
         return err_needs_identity("report_health");
     };
-    let reason = match args["reason"].as_str() {
+    let reason_str = match args["reason"].as_str() {
         Some(r) => r,
         None => return json!({"error": "missing 'reason'"}),
     };
-    match crate::api::call(
+    // #2454: write IN-PROCESS via forwarded live registry — no api::call.
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: health write requires the in-process daemon runtime"});
+    };
+    let Some(reason) = crate::health::BlockedReason::parse_kind(reason_str, args) else {
+        return json!({"error": format!("unknown reason: {reason_str}")});
+    };
+    let note = args["note"].as_str();
+    match crate::agent_ops::set_blocked_reason(
+        &runtime.registry,
         home,
-        &json!({
-            "method": crate::api::method::SET_BLOCKED_REASON,
-            "params": {
-                "name": instance_name,
-                "reason": reason,
-                "retry_after_secs": args.get("retry_after_secs"),
-                // #1933: forward the operator-readable note (was dropped here — the
-                // schema advertised it but no mechanism consumed it).
-                "note": args.get("note")
-            }
-        }),
+        instance_name,
+        reason,
+        note,
     ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({
-                "status": "reason_set",
-                "reason": reason,
-                "current_state": resp["current_state"]
-            })
-        }
-        Ok(resp) => {
-            json!({"error": resp["error"].as_str().unwrap_or("set_blocked_reason failed")})
-        }
-        Err(e) => json!({"error": format!("{e}")}),
+        Some(out) => json!({
+            "status": "reason_set",
+            "reason": reason_str,
+            "current_state": out.current_state
+        }),
+        None => json!({"error": format!("instance '{instance_name}' not found")}),
     }
 }
 
-pub(super) fn handle_clear_blocked_reason(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_clear_blocked_reason(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let instance = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
     };
-    // CR-2026-06-14: validate the instance name at the MCP boundary before the
-    // CLEAR_BLOCKED_REASON RPC, mirroring the sibling handlers in this file
-    // (handle_interrupt / handle_pane_snapshot). Without it a malformed name
-    // (`../evil`) was forwarded straight to the daemon.
     crate::validate_name_or_err!(instance);
-    let mut params = json!({"name": instance});
-    if let Some(r) = args["reason"].as_str() {
-        params["reason"] = json!(r);
-    }
-    match crate::api::call(
-        home,
-        &json!({
-            "method": crate::api::method::CLEAR_BLOCKED_REASON,
-            "params": params
-        }),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({
-                "status": "cleared",
-                "instance": instance,
-                "was": resp["was"]
-            })
+    // #2454: in-process clear via forwarded live registry.
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: health write requires the in-process daemon runtime"});
+    };
+    let filter = args["reason"].as_str();
+    match crate::agent_ops::clear_blocked_reason(&runtime.registry, home, instance, filter) {
+        Ok(out) => {
+            let was = out
+                .was
+                .as_ref()
+                .map(|r| serde_json::to_value(r).unwrap_or_default());
+            json!({"status": "cleared", "instance": instance, "was": was})
         }
-        Ok(resp) => {
-            json!({"error": resp["error"].as_str().unwrap_or("clear_blocked_reason failed")})
+        Err(crate::agent_ops::ClearBlockedError::FilterMismatch { .. }) => {
+            json!({"error": "reason mismatch"})
         }
-        Err(e) => json!({"error": format!("{e}")}),
+        Err(crate::agent_ops::ClearBlockedError::NotFound) => {
+            json!({"error": format!("instance '{instance}' not found")})
+        }
     }
 }
 
