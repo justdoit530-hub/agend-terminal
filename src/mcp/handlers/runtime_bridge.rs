@@ -80,14 +80,25 @@ pub(super) fn delete_in_process(
     name: &str,
     no_wait: bool,
 ) -> Result<Value, String> {
-    let Some(runtime) = runtime else {
-        return Err(
-            "runtime unavailable: delete requires the in-process daemon runtime".to_string(),
-        );
-    };
-    let ctx = api_ctx(home, runtime);
-    let params = json!({"name": name, "no_wait": no_wait});
-    Ok(handlers::instance::handle_delete(&params, &ctx))
+    if let Some(runtime) = runtime {
+        let ctx = api_ctx(home, runtime);
+        let params = json!({"name": name, "no_wait": no_wait});
+        return Ok(handlers::instance::handle_delete(&params, &ctx));
+    }
+    if let Some(reg) = crate::agent::get_pending_registry() {
+        let configs = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let ctx = HandlerCtx {
+            registry: &reg,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home,
+        };
+        let params = json!({"name": name, "no_wait": no_wait});
+        return Ok(handlers::instance::handle_delete(&params, &ctx));
+    }
+    Err("runtime unavailable: delete requires the in-process daemon runtime or registry".to_string())
 }
 
 /// #2454: CREATE_TEAM in-process.

@@ -100,20 +100,11 @@ pub(crate) fn full_delete_instance(
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
-    // #2454 Slice 2: prefer in-process DELETE (MCP RuntimeContext or the
-    // process-global pending registry). Socket loopback only when neither is
-    // available (cross-process TUI → standalone daemon).
-    if let Some(runtime) = runtime {
-        let _ = crate::mcp::handlers::runtime_bridge::delete_in_process(
-            home,
-            Some(runtime),
-            name,
-            false,
-        );
-    } else if let Some(reg) = crate::agent::get_pending_registry() {
-        crate::daemon::lifecycle::delete_transaction(home, name, &reg, None, false);
-        crate::daemon::poll_reminder::remove_agent(name);
-    } else {
+    // #2454 Slice 4: eliminate self-IPC crate::api::call in lifecycle.rs.
+    // Prefer in-process DELETE via runtime_bridge::delete_in_process
+    // (RuntimeContext or pending registry). Socket loopback only when neither
+    // is available (cross-process TUI -> standalone daemon).
+    if crate::mcp::handlers::runtime_bridge::delete_in_process(home, runtime, name, false).is_err() {
         let _ = crate::api::call(
             home,
             &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),
