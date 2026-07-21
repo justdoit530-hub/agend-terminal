@@ -58,6 +58,7 @@ pub(crate) struct RuntimeContext {
     #[allow(dead_code)]
     pub configs: crate::api::ConfigRegistry,
     pub externals: crate::agent::ExternalRegistry,
+    pub notifier: Option<std::sync::Arc<dyn crate::api::ApiNotifier>>,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so

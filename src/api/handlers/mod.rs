@@ -119,5 +119,6 @@ pub(crate) struct HandlerCtx<'a> {
     pub configs: &'a ConfigRegistry,
     pub externals: &'a ExternalRegistry,
     pub notifier: Option<&'a dyn ApiNotifier>,
+    pub notifier_arc: Option<std::sync::Arc<dyn ApiNotifier>>,
     pub home: &'a Path,
 }

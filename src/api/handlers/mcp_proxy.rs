@@ -129,6 +129,7 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
         registry: ctx.registry.clone(),
         configs: ctx.configs.clone(),
         externals: ctx.externals.clone(),
+        notifier: ctx.notifier_arc.clone(),
     };
     handle_mcp_tool_inner(
         tool,

@@ -368,7 +368,7 @@ pub fn serve(
                     &shutdown,
                     &cfgs,
                     &ext,
-                    ntf.as_deref(),
+                    ntf.clone(),
                     session_cookie,
                 );
             })
@@ -502,7 +502,7 @@ fn handle_session(
     shutdown: &Arc<AtomicBool>,
     configs: &ConfigRegistry,
     externals: &ExternalRegistry,
-    notifier: Option<&dyn ApiNotifier>,
+    notifier: Option<Arc<dyn ApiNotifier>>,
     cookie: crate::auth_cookie::Cookie,
 ) {
     let cloned = match stream.try_clone() {
@@ -597,7 +597,8 @@ fn handle_session(
             registry,
             configs,
             externals,
-            notifier,
+            notifier: notifier.as_deref(),
+            notifier_arc: notifier.clone(),
             home,
         };
 

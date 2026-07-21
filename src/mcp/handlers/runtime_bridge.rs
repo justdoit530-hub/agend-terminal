@@ -13,7 +13,8 @@ pub(super) fn api_ctx<'a>(home: &'a Path, runtime: &'a RuntimeContext) -> Handle
         registry: &runtime.registry,
         configs: &runtime.configs,
         externals: &runtime.externals,
-        notifier: None,
+        notifier: runtime.notifier.as_deref(),
+        notifier_arc: runtime.notifier.clone(),
         home,
     }
 }
