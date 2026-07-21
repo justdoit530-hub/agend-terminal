@@ -407,7 +407,7 @@ fn delegate_task_main_branch_rejects_without_delivering() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
 
     assert!(
         result.get("error").is_some(),
@@ -466,7 +466,7 @@ fn delegate_task_lease_conflict_rejects_without_delivering() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
 
     assert!(
         result.get("error").is_some(),
@@ -583,7 +583,7 @@ fn delegate_task_same_agent_different_branch_without_delivering() {
         "branch": "feat/B",
     });
     let sender = Some(Sender::new("lead").expect("sender"));
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
 
     assert!(
         result.get("error").is_some(),
@@ -803,7 +803,7 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     });
     let sender = Some(Sender::new("lead").expect("sender"));
 
-    let result = super::super::comms::handle_delegate_task(&home, &args, &sender);
+    let result = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
 
     // Dispatch should NOT carry the lease-rejection error path.
     if let Some(err) = result.get("error").and_then(|v| v.as_str()) {
@@ -874,7 +874,7 @@ teams:
     let sender = Some(Sender::new("devA").expect("sender"));
     // `api::call(SEND)` errors in-test (no daemon) but only AFTER the auto-create
     // commit — we assert which board the task was BORN on, not the send result.
-    let _ = super::super::comms::handle_delegate_task(&home, &args, &sender);
+    let _ = super::super::comms::handle_delegate_task(&home, &args, &sender, None);
 
     // Query each board via the P1 `_at` reader (avoids the task_events anti-bypass
     // invariant on the literal log path). The auto-created task must be on the

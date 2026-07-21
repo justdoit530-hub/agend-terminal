@@ -140,7 +140,7 @@ fn full_delete_removes_escalation_store_no_stale_rehydrate_1923_g12() {
         "precondition: escalation store seeded for victim"
     );
 
-    let _ = super::full_delete_instance(&home, "victim");
+    let _ = super::full_delete_instance(&home, "victim", None);
 
     assert!(
         crate::daemon::escalation_persist::load_for(&home, "victim").is_none(),
@@ -204,7 +204,7 @@ fn full_delete_instance_removes_uuid_inbox_1902() {
         uuid_inbox.exists(),
         "pre: uuid inbox must exist at {uuid_inbox:?}"
     );
-    let result = super::full_delete_instance(&home, "doomed");
+    let result = super::full_delete_instance(&home, "doomed", None);
     assert!(result.is_ok(), "delete must return Ok, got {result:?}");
     assert!(
         !uuid_inbox.exists(),
@@ -265,7 +265,7 @@ fn full_delete_instance_removes_usage_limit_notify_1906() {
         crate::daemon::supervisor::usage_limit_notify_has(&home, "doomed"),
         "pre: usage_limit_notify entry must exist"
     );
-    let result = super::full_delete_instance(&home, "doomed");
+    let result = super::full_delete_instance(&home, "doomed", None);
     assert!(result.is_ok(), "delete must return Ok, got {result:?}");
     assert!(
         !crate::daemon::supervisor::usage_limit_notify_has(&home, "doomed"),
@@ -296,7 +296,7 @@ fn full_delete_instance_releases_worktree_1906() {
     .unwrap();
     assert!(wt.exists(), "pre: managed worktree must exist");
 
-    let result = super::full_delete_instance(&home, "doomed");
+    let result = super::full_delete_instance(&home, "doomed", None);
     assert!(result.is_ok(), "delete must return Ok, got {result:?}");
     assert!(
         !wt.exists(),
@@ -375,7 +375,7 @@ fn full_delete_instance_returns_err_when_residual_remains_post_cleanup() {
     let home = tmp_home("full_residual");
     std::fs::create_dir_all(home.join("notification-queue")).unwrap();
     std::fs::write(home.join("notification-queue").join("zombie.jsonl"), "").unwrap();
-    let result = super::full_delete_instance(&home, "zombie");
+    let result = super::full_delete_instance(&home, "zombie", None);
     let err = result.expect_err(
         "notification-queue residual after cleanup must surface as Err — silent-drop class blocked",
     );
@@ -393,7 +393,7 @@ fn full_delete_instance_returns_ok_when_no_residual() {
     // `api::call` failure during DELETE is harmless because there's
     // nothing to clean and the audit returns empty.
     let home = tmp_home("full_clean");
-    let result = super::full_delete_instance(&home, "ghost");
+    let result = super::full_delete_instance(&home, "ghost", None);
     assert!(
         result.is_ok(),
         "clean home + clean post-audit must return Ok, got: {result:?}"
@@ -433,7 +433,7 @@ fn full_delete_instance_orphans_owned_tasks() {
     // Run the full teardown. `api::call` is unreachable in test
     // context (harmless) and there's no fleet.yaml / metadata so
     // the residual audit returns clean.
-    let result = super::full_delete_instance(&home, "doomed");
+    let result = super::full_delete_instance(&home, "doomed", None);
     assert!(
         result.is_ok(),
         "delete on clean home must return Ok, got: {result:?}"
@@ -467,7 +467,7 @@ fn full_delete_instance_removes_activity_sidecar() {
     crate::daemon::idle_watchdog::touch_agent_activity(&home, "doomed");
     let activity_file = home.join("agent-activity").join("doomed.json");
     assert!(activity_file.exists(), "pre-delete sanity: sidecar exists");
-    let _ = super::full_delete_instance(&home, "doomed");
+    let _ = super::full_delete_instance(&home, "doomed", None);
     assert!(
         !activity_file.exists(),
         "activity sidecar must be removed after full_delete_instance"
@@ -519,7 +519,7 @@ fn full_delete_instance_cascades_bound_services() {
     )
     .unwrap();
 
-    let result = super::full_delete_instance(&home, "doomed");
+    let result = super::full_delete_instance(&home, "doomed", None);
     assert!(
         result.is_ok(),
         "clean cascade must return Ok, got {result:?}"
@@ -572,7 +572,7 @@ fn full_delete_clears_binding_and_succeeds_1879() {
         "pre: binding exists"
     );
 
-    let result = super::full_delete_instance(&home, "agent-b");
+    let result = super::full_delete_instance(&home, "agent-b", None);
 
     assert!(
         result.is_ok(),

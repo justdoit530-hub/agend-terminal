@@ -11,7 +11,12 @@ pub(super) mod spawn;
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
 
-pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &str) -> Value {
+pub(super) fn handle_create_instance(
+    home: &Path,
+    args: &Value,
+    instance_name: &str,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     // #2037 (6): name + team = spawn THIS name, then join the team — team-mode
     // used to silently rename to `<team>-N` (the fixup-1 incident). With
     // count>1/backends the names are generated, so an explicit name errors.
@@ -38,7 +43,7 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
             obj.remove("team");
             obj.remove("count");
         }
-        let mut spawned = handle_create_instance(home, &single, instance_name);
+        let mut spawned = handle_create_instance(home, &single, instance_name, runtime);
         if spawned.get("error").is_some() {
             return spawned;
         }
@@ -96,17 +101,17 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
             )});
         }
         let task = args.get("task").and_then(|v| v.as_str()).map(String::from);
-        match crate::api::call(
-            home,
-            &json!({"method": crate::api::method::CREATE_TEAM, "params": {
-                "name": team_name,
-                "backends": per_member_backends,
-                "description": args.get("description"),
-            }}),
-        ) {
+        // #2454 Slice 2: CREATE_TEAM in-process (no socket loopback).
+        let params = json!({
+            "name": team_name,
+            "backends": per_member_backends,
+            "description": args.get("description"),
+        });
+        match super::runtime_bridge::create_team_in_process(home, runtime, &params) {
             Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                let spawned: Vec<String> = resp["spawned"]
+                let spawned: Vec<String> = resp["result"]["spawned"]
                     .as_array()
+                    .or_else(|| resp["spawned"].as_array())
                     .map(|a| {
                         a.iter()
                             .filter_map(|v| v.as_str().map(String::from))
@@ -117,6 +122,8 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
                 if let Some(task_text) = task {
                     let home = home.to_path_buf();
                     let names = spawned.clone();
+                    let registry = runtime.map(|r| r.registry.clone());
+                    let externals = runtime.map(|r| r.externals.clone());
                     // fire-and-forget: team task injection waits 3s for agents to
                     // initialize, then injects task text. No JoinHandle needed —
                     // losing the injection on shutdown is acceptable (M5 §10.5).
@@ -125,10 +132,24 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
                         .spawn(move || {
                             std::thread::sleep(std::time::Duration::from_secs(3));
                             for inst_name in &names {
-                                let _ = crate::api::call(
-                                    &home,
-                                    &json!({"method": crate::api::method::INJECT, "params": {"name": inst_name, "data": task_text}}),
-                                );
+                                // #2454: prefer in-process inject_input when runtime
+                                // registries were captured; otherwise skip (no socket).
+                                if let (Some(reg), Some(ext)) = (&registry, &externals) {
+                                    if let Err(e) = crate::agent_ops::inject_input(
+                                        reg,
+                                        ext,
+                                        &home,
+                                        inst_name,
+                                        &task_text,
+                                        false,
+                                    ) {
+                                        tracing::warn!(
+                                            agent = %inst_name,
+                                            error = %e.message(),
+                                            "team-spawn task inject failed"
+                                        );
+                                    }
+                                }
                             }
                         })
                         .ok();
@@ -138,7 +159,11 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
                     "spawned": spawned,
                     "backends": per_member_backends,
                 });
-                if let Some(failed) = resp.get("failed") {
+                let failed = resp
+                    .get("result")
+                    .and_then(|r| r.get("failed"))
+                    .or_else(|| resp.get("failed"));
+                if let Some(failed) = failed {
                     result["failed"] = failed.clone();
                 }
                 result
@@ -146,14 +171,18 @@ pub(super) fn handle_create_instance(home: &Path, args: &Value, instance_name: &
             Ok(resp) => {
                 json!({"error": resp["error"].as_str().unwrap_or("team creation failed")})
             }
-            Err(e) => json!({"error": format!("API unavailable: {e}")}),
+            Err(e) => json!({"error": e}),
         }
     } else {
-        spawn::spawn_single_instance(home, instance_name, args)
+        spawn::spawn_single_instance(home, instance_name, args, runtime)
     }
 }
 
-pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_delete_instance(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
@@ -169,8 +198,9 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
         }
     }
     // Full multi-store teardown lives in the `lifecycle` submodule of this
-    // `instance_state` concept (Sprint 54 P1-B Bug 1).
-    match lifecycle::full_delete_instance(home, name) {
+    // `instance_state` concept (Sprint 54 P1-B Bug 1). #2454: pass runtime
+    // so the daemon DELETE step is in-process.
+    match lifecycle::full_delete_instance(home, name, runtime) {
         Ok(()) => json!({"name": name}),
         Err(detail) => json!({
             "name": name,
@@ -181,7 +211,11 @@ pub(super) fn handle_delete_instance(home: &Path, args: &Value) -> Value {
     }
 }
 
-pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_start_instance(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
@@ -207,27 +241,30 @@ pub(super) fn handle_start_instance(home: &Path, args: &Value) -> Value {
             // fallback in handle_spawn, which keeps this RPC the
             // single-source-of-truth for the instance start.
             let env_json = serde_json::to_value(&resolved.env).unwrap_or(serde_json::Value::Null);
-            match crate::api::call(
-                home,
-                &json!({"method": crate::api::method::SPAWN, "params": {
-                    "name": name, "backend": resolved.backend_command, "args": cmd_args,
-                    "mode": "resume",
-                    "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
-                    "env": env_json,
-                }}),
-            ) {
+            let params = json!({
+                "name": name, "backend": resolved.backend_command, "args": cmd_args,
+                "mode": "resume",
+                "working_directory": resolved.working_directory.map(|p| p.display().to_string()),
+                "env": env_json,
+            });
+            // #2454 Slice 2: SPAWN in-process.
+            match super::runtime_bridge::spawn_in_process(home, runtime, &params) {
                 Ok(resp) if resp["ok"].as_bool() == Some(true) => json!({"name": name}),
                 Ok(resp) => {
                     json!({"error": resp["error"].as_str().unwrap_or("spawn failed")})
                 }
-                Err(e) => json!({"error": format!("API unavailable: {e}")}),
+                Err(e) => json!({"error": e}),
             }
         }
         None => json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
     }
 }
 
-pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_replace_instance(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
@@ -245,7 +282,8 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
         .ok()
         .and_then(|f| f.resolve_instance(name));
 
-    let list_resp = crate::api::call(home, &json!({"method": crate::api::method::LIST}));
+    // #2454 Slice 2: list snapshot in-process (no LIST socket loopback).
+    let list_resp = super::runtime_bridge::list_agents_in_process(home, runtime);
     let (backend, handover) = {
         let fleet_backend = fleet_resolved.as_ref().map(|r| r.backend_command.clone());
         let list_info = list_resp.ok().and_then(|resp| {
@@ -291,10 +329,8 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     // registry entry without blocking up to 5 s for child exit. The OS
     // reaps the old process asynchronously; the new spawn gets its own
     // PID / PTY / port with no resource collision.
-    let _ = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name, "no_wait": true}}),
-    );
+    // #2454 Slice 2: in-process DELETE (no socket loopback).
+    let _ = super::runtime_bridge::delete_in_process(home, runtime, name, true);
 
     // Enqueue handover context for the new instance.
     persist_or_log!(
@@ -344,10 +380,9 @@ pub(super) fn handle_replace_instance(home: &Path, args: &Value) -> Value {
     if let Some(wd) = &working_dir {
         spawn_params["working_directory"] = json!(wd);
     }
-    let spawn_result = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
-    );
+    // #2454 Slice 2: SPAWN in-process.
+    let spawn_result =
+        super::runtime_bridge::spawn_in_process(home, runtime, &spawn_params);
 
     let spawned = spawn_result
         .as_ref()
@@ -457,7 +492,11 @@ fn await_unsent_draft_or_grace(home: &Path, name: &str, force: bool) {
     );
 }
 
-pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_restart_instance(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&super::dispatch::RuntimeContext>,
+) -> Value {
     let name = match super::require_instance(args) {
         Ok(n) => n,
         Err(e) => return e,
@@ -522,10 +561,8 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         crate::inbox::settle_delivering_for_session_reset(home, name);
     }
 
-    let _ = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::DELETE, "params": {"name": name, "no_wait": true}}),
-    );
+    // #2454 Slice 2: DELETE + SPAWN in-process (no socket loopback).
+    let _ = super::runtime_bridge::delete_in_process(home, runtime, name, true);
 
     let spawn_params = restart_spawn_params(
         name,
@@ -536,10 +573,8 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
         mode,
     );
 
-    let spawn_result = crate::api::call(
-        home,
-        &json!({"method": crate::api::method::SPAWN, "params": spawn_params}),
-    );
+    let spawn_result =
+        super::runtime_bridge::spawn_in_process(home, runtime, &spawn_params);
     let spawned = spawn_result
         .as_ref()
         .map(|r| r["ok"].as_bool() == Some(true))
@@ -566,8 +601,7 @@ pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
 pub(crate) fn restart_instance_autonomic(home: &Path, name: &str, reason: &str) -> bool {
     let result = handle_restart_instance(
         home,
-        &json!({"name": name, "mode": "fresh", "reason": reason}),
-    );
+        &json!({"name": name, "mode": "fresh", "reason": reason}), None);
     result
         .get("spawned")
         .and_then(serde_json::Value::as_bool)
@@ -666,8 +700,7 @@ mod tests {
         // fresh + dirty + no force → refused at the guard (before any spawn).
         let refused = handle_restart_instance(
             &home,
-            &serde_json::json!({"instance": "dev", "mode": "fresh"}),
-        );
+            &serde_json::json!({"instance": "dev", "mode": "fresh"}), None);
         assert_eq!(
             refused["code"], "uncommitted_work_at_risk",
             "got: {refused}"
@@ -676,8 +709,7 @@ mod tests {
         // force bypasses the guard (proceeds past it — a later error is NOT the guard).
         let forced = handle_restart_instance(
             &home,
-            &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
-        );
+            &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}), None);
         assert_ne!(
             forced["code"], "uncommitted_work_at_risk",
             "force must bypass: {forced}"
@@ -686,8 +718,7 @@ mod tests {
         // resume keeps context → never guarded.
         let resumed = handle_restart_instance(
             &home,
-            &serde_json::json!({"instance": "dev", "mode": "resume"}),
-        );
+            &serde_json::json!({"instance": "dev", "mode": "resume"}), None);
         assert_ne!(
             resumed["code"], "uncommitted_work_at_risk",
             "resume must not guard: {resumed}"

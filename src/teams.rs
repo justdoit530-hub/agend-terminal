@@ -344,7 +344,7 @@ pub fn delete(home: &Path, args: &Value) -> Value {
             );
         }
         if let Err(e) =
-            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(home, member)
+            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(home, member, None)
         {
             cascade_warnings.push(format!("{member}: {e}"));
             tracing::warn!(
