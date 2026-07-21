@@ -34,13 +34,13 @@ use crate::layout::{Layout, Pane};
 use crate::notification_queue;
 use crate::render;
 use frame_timing::{
-    should_draw, should_sync_notifications, trace_tty_size, BOOT_FRAME_TIME_CAP, FRAME_INTERVAL,
-    MAX_BOOT_CATCHUP, NOTIF_SYNC_INTERVAL,
+    should_draw, trace_tty_size, BOOT_FRAME_TIME_CAP, FRAME_INTERVAL, MAX_BOOT_CATCHUP,
+    NOTIF_SYNC_INTERVAL,
 };
-use overlay::{CloseTarget, Overlay, OverlayCtx};
+use overlay::{CloseTarget, Overlay};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event};
 use parking_lot::Mutex;
 use ratatui::DefaultTerminal;
 use std::collections::HashMap;
@@ -400,7 +400,7 @@ fn build_app_maintenance(
 ) -> (
     crate::agent::ExternalRegistry,
     crate::api::ConfigRegistry,
-    Vec<Box<dyn crate::daemon::per_tick::TickHandler>>,
+    Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>>,
 ) {
     let app_externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
     let app_configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -463,6 +463,7 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         wakeup_tx: &wakeup_tx,
         daemon_binary_stale: &daemon_binary_stale,
         telegram_status,
+        telegram_state: &telegram_state,
         attached_run_dir: &attached_run_dir,
         attached_mode,
         size_debug,
@@ -1181,6 +1182,11 @@ fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
     alive
 }
 
+// Keep after production code so app_prod_region's first `#[cfg(test)]` cutoff
+// still captures `fn run_app` and the rest of the production region.
+#[cfg(test)]
+mod appstate_2453_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1627,10 +1633,13 @@ mod tests {
             .expect("source file must be readable from test cwd");
         let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
         assert!(
-            prod.contains("crate::daemon::shadow::start(&home)"),
+            // Accept either `start(&home)` or `start(home)` — both bind the
+            // hook-event socket; the helper path may pass `&Path` directly.
+            prod.contains("crate::daemon::shadow::start(&home)")
+                || prod.contains("crate::daemon::shadow::start(home)"),
             "run_app must start the Shadow Observer hook-socket server in the PRODUCTION \
              region (#2413 live-fix) — gating it to run_core left the whole plane dead in \
-             the app-mode live daemon. No 'crate::daemon::shadow::start(&home)' before the \
+             the app-mode live daemon. No 'crate::daemon::shadow::start(...)' before the \
              #[cfg(test)] cutoff"
         );
     }

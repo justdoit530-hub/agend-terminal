@@ -121,23 +121,24 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
             team: None,
             extra_instructions: extra_instructions.as_deref(),
         };
-        let behavior_command = resolved.backend.command_string();
-        if let Err(e) =
-            crate::instructions::generate_with_context(dir, &behavior_command, Some(&ctx))
-        {
-            tracing::error!(instance = name, error = %e, "provisioning refused; skipping instance boot");
-            return None;
-        }
+        let behavior_command = resolved.backend_command.clone();
+        // Fork: generate_with_context returns () (no fail-closed Result yet).
+        crate::instructions::generate_with_context(dir, &behavior_command, Some(&ctx));
     }
 
     let mut args = resolved.args;
 
     if let Some(ref model) = resolved.model {
-        let model_val = backend::Backend::from_command(&resolved.backend_command)
-            .map(|b| b.format_model_arg(model))
-            .unwrap_or_else(|| model.clone());
-        args.push("--model".to_string());
-        args.push(model_val);
+        if !matches!(
+            resolved.backend,
+            backend::Backend::Shell | backend::Backend::Raw(_)
+        ) {
+            backend::Backend::push_model_arg(
+                &mut args,
+                &resolved.backend.command_string(),
+                model,
+            );
+        }
     }
 
     Some((
@@ -147,7 +148,7 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
         Some(resolved.env),
         resolved.working_directory,
         resolved.submit_key,
-        Some(resolved.backend),
+        Some(resolved.backend.clone()),
     ))
 }
 
@@ -458,6 +459,7 @@ mod tests {
          -> crate::fleet::ResolvedInstance {
             crate::fleet::ResolvedInstance {
                 name: "t".into(),
+                backend: crate::backend::Backend::ClaudeCode,
                 backend_command: "claude".into(),
                 args: vec![],
                 env: HashMap::new(),

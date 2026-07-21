@@ -150,11 +150,13 @@ impl ContextAlertHandler {
     /// §3c: the two handlers' latch/hysteresis state must stay independent
     /// after the merge).
     #[cfg(test)]
+    #[allow(dead_code)] // test/introspection helper
     pub(crate) fn is_armed(&self, name: &str) -> Option<bool> {
         self.states.lock().get(name).map(|s| s.armed)
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // test/introspection helper
     pub(crate) fn invalid_warning_count(&self) -> usize {
         self.invalid_override_warnings.lock().len()
     }

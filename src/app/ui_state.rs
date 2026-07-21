@@ -9,8 +9,8 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use super::*;
 use crate::agent::AgentRegistry;
 use crate::layout::Layout;
-use crate::mouse;
-use crate::overlay::{self, Overlay, OverlayCtx};
+use super::mouse;
+use super::overlay::{self, Overlay, OverlayCtx};
 
 pub(super) struct UiState {
     pub(super) layout: Layout,
@@ -26,6 +26,7 @@ pub(super) struct UiDeps<'a> {
     pub(super) home: &'a Path,
     pub(super) fleet_path: &'a Path,
     pub(super) wakeup_tx: &'a crossbeam_channel::Sender<usize>,
+    pub(super) telegram_state: &'a Option<std::sync::Arc<dyn crate::channel::Channel>>,
 }
 
 #[derive(Default)]
@@ -45,6 +46,7 @@ impl UiState {
                 fleet_path: deps.fleet_path,
                 wakeup_tx: deps.wakeup_tx,
                 name_counter: &mut self.name_counter,
+                telegram_state: deps.telegram_state,
             };
             let outcome = overlay::handle_key(&mut self.overlay, key, &mut octx);
             out.needs_resize = outcome.needs_resize;
@@ -105,11 +107,13 @@ mod tests {
         std::fs::create_dir_all(&home).ok();
         let fleet_path = home.join("fleet.yaml");
         let (wakeup_tx, _rx) = crossbeam_channel::unbounded::<usize>();
+        let telegram_state: Option<std::sync::Arc<dyn crate::channel::Channel>> = None;
         let deps = UiDeps {
             registry: &registry,
             home: &home,
             fleet_path: &fleet_path,
             wakeup_tx: &wakeup_tx,
+            telegram_state: &telegram_state,
         };
         let mut ui = UiState {
             layout: Layout::new(),

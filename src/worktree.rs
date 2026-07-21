@@ -1317,6 +1317,7 @@ mod tests {
     ) -> crate::fleet::ResolvedInstance {
         crate::fleet::ResolvedInstance {
             name: "agent".into(),
+            backend: crate::backend::Backend::ClaudeCode,
             backend_command: "claude".into(),
             args: vec![],
             env: std::collections::HashMap::new(),

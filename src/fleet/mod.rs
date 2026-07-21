@@ -788,6 +788,10 @@ impl FleetConfig {
 #[allow(dead_code)]
 pub struct ResolvedInstance {
     pub name: String,
+    /// Declared backend identity (#2801 / #2834). Independent of
+    /// `backend_command`, which may be a wrapper script while this field
+    /// retains the operator-declared Claude/Codex/… preset.
+    pub backend: crate::backend::Backend,
     pub backend_command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,

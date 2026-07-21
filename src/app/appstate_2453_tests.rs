@@ -1,6 +1,6 @@
 //! #2453: Structural tests for root `AppState` and thin `run_app` loop orchestration.
 
-use super::*;
+// structural tests read sources from disk; no super imports needed
 
 /// Durable loop owners: all 16 fields that move from loose locals in `run_app` into AppState.
 const DURABLE_LOOP_OWNERS_2453: [&str; 16] = [
@@ -23,17 +23,21 @@ const DURABLE_LOOP_OWNERS_2453: [&str; 16] = [
 ];
 
 fn app_prod_region() -> String {
+    // Cut mod.rs at its first #[cfg(test)] so test helpers do not pollute the
+    // production region, then append app_state.rs (which holds AppState/impl).
+    // Order matters: appending before the cutoff would drop AppState entirely.
     let mut prod = std::fs::read_to_string("src/app/mod.rs")
         .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
         .expect("src/app/mod.rs must be readable from test cwd");
+    let cutoff = prod.find("#[cfg(test)]").unwrap_or(prod.len());
+    prod.truncate(cutoff);
     if let Ok(app_state) = std::fs::read_to_string("src/app/app_state.rs")
         .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/app_state.rs"))
     {
         prod.push('\n');
         prod.push_str(&app_state);
     }
-    let cutoff = prod.find("#[cfg(test)]").unwrap_or(prod.len());
-    prod[..cutoff].to_string()
+    prod
 }
 
 fn struct_body<'a>(source: &'a str, name: &str) -> &'a str {
@@ -109,10 +113,12 @@ fn restart_state_typed_owner_bounded_2453() {
 
 #[test]
 fn run_app_no_loose_durable_owner_locals_2453() {
-    let prod = app_prod_region();
+    // Only scan `run_app` itself — AppState methods may use short local names
+    // like `let needs_resize = outcome...` without re-owning the durable field.
+    let region = run_app_region();
     let mut loose: Vec<String> = Vec::new();
     for owner in DURABLE_LOOP_OWNERS_2453 {
-        if owner == &"restart" {
+        if owner == "restart" {
             continue;
         }
         for needle in [
@@ -121,7 +127,7 @@ fn run_app_no_loose_durable_owner_locals_2453() {
             format!("let {owner} ="),
             format!("let {owner}:"),
         ] {
-            if prod.contains(&needle) {
+            if region.contains(&needle) {
                 loose.push(needle);
             }
         }
@@ -129,7 +135,7 @@ fn run_app_no_loose_durable_owner_locals_2453() {
     assert!(
         loose.is_empty(),
         "#2453: durable loop owners must live in AppState, not as loose \
-         production locals; found: {loose:?}"
+         run_app locals; found: {loose:?}"
     );
 }
 
@@ -191,11 +197,9 @@ fn loop_logic_lives_in_app_state_methods_2453s2() {
              region — the loop logic has not been extracted into methods"
         )
     });
-    let impl_end = prod[impl_start..]
-        .find("\n}")
-        .map(|offset| impl_start + offset)
-        .expect("unterminated impl AppState body");
-    let body = &prod[impl_start..impl_end];
+    // Scan from `impl AppState` to EOF of the production region (do NOT stop
+    // at the first nested `}` — that would only cover UiState inside `new()`).
+    let body = &prod[impl_start..];
     for witness in LOOP_LOGIC_WITNESSES_2453S2 {
         assert!(
             body.contains(witness),

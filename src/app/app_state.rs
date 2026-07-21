@@ -8,13 +8,16 @@ use ratatui::DefaultTerminal;
 
 use super::*;
 use crate::agent::AgentRegistry;
-use crate::app::dispatch::write_to_focused;
-use crate::app::frame_timing::trace_tty_size;
-use crate::app::notification_queue::{flush_idle_notifications, sync_notification_state};
-use crate::app::pane_factory::kill_agent;
-use crate::overlay::Overlay;
+use super::frame_timing::trace_tty_size;
+use super::overlay::Overlay;
+use super::{
+    flush_idle_notifications, kill_agent, sync_notification_state, write_to_focused,
+};
 
+/// #2453: typed restart sub-owner. Fields are retained for the structural
+/// contract even when this fork has no live restart machinery wired yet.
 #[derive(Default)]
+#[allow(dead_code)]
 pub(super) struct RestartState {
     pub(super) restart_outcome: (),
     pub(super) restart_probe: Option<()>,
@@ -32,11 +35,16 @@ pub(super) struct AppState {
     pub(super) last_draw: Option<std::time::Instant>,
     pub(super) dirty: bool,
     pub(super) last_notif_sync: Option<std::time::Instant>,
+    /// Reserved durable owner (#2453); decision-badge path not yet ported.
+    #[allow(dead_code)]
     pub(super) last_decision_sync: Option<std::time::Instant>,
+    /// Reserved durable owner (#2453); decision-badge path not yet ported.
+    #[allow(dead_code)]
     pub(super) pending_decisions_total: usize,
     pub(super) booting: bool,
     pub(super) boot_start: std::time::Instant,
     pub(super) attaches_expected: usize,
+    #[allow(dead_code)]
     pub(super) restart: RestartState,
 }
 
@@ -60,6 +68,7 @@ pub(super) struct AppDeps<'a> {
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub daemon_binary_stale: &'a crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
     pub telegram_status: TelegramStatus,
+    pub telegram_state: &'a Option<std::sync::Arc<dyn crate::channel::Channel>>,
     pub attached_run_dir: &'a Option<std::path::PathBuf>,
     pub attached_mode: bool,
     pub size_debug: bool,
@@ -107,6 +116,7 @@ impl AppState {
             attached_run_dir,
             attached_mode,
             size_debug,
+            ..
         } = *deps;
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
         let pane_rows = rows.saturating_sub(4);
@@ -274,7 +284,11 @@ impl AppState {
     pub(super) fn sync_badges(&mut self, deps: &AppDeps<'_>) {
         let AppDeps { home, .. } = *deps;
         let notif_now = std::time::Instant::now();
-        if should_sync_notifications(self.last_notif_sync, notif_now, NOTIF_SYNC_INTERVAL) {
+        if super::frame_timing::should_sync_notifications(
+            self.last_notif_sync,
+            notif_now,
+            NOTIF_SYNC_INTERVAL,
+        ) {
             self.last_notif_sync = Some(notif_now);
             sync_notification_state(home, &mut self.ui.layout);
         }
@@ -413,6 +427,7 @@ impl AppState {
             fleet_path,
             registry,
             wakeup_tx,
+            telegram_state,
             ..
         } = *deps;
         self.dirty = true;
@@ -428,6 +443,7 @@ impl AppState {
                     home,
                     fleet_path,
                     wakeup_tx,
+                    telegram_state,
                 };
                 let outcome = self.ui.handle_key_event(key, &ui_deps);
                 if outcome.needs_resize {
@@ -446,6 +462,7 @@ impl AppState {
                     home,
                     fleet_path,
                     wakeup_tx,
+                    telegram_state,
                 };
                 let needs_resize = self.ui.handle_mouse_event(mouse_evt, &ui_deps);
                 if needs_resize {
@@ -655,16 +672,5 @@ impl AppState {
             }
             self.last_remote_sync = std::time::Instant::now();
         }
-    }
-}
-
-fn should_sync_notifications(
-    last_sync: Option<std::time::Instant>,
-    now: std::time::Instant,
-    interval: std::time::Duration,
-) -> bool {
-    match last_sync {
-        Some(t) => now.duration_since(t) >= interval,
-        None => true,
     }
 }

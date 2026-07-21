@@ -195,7 +195,16 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             // #2744: DECLARED identity — the resolved fleet entry's backend
             // (Phase 1 wrote it); fallback parses the declared member NAME,
             // never a command string.
-            crate::backend::Backend::push_model_arg(&mut member_args, &declared_backend, model);
+            if !matches!(
+                declared_backend,
+                crate::backend::Backend::Shell | crate::backend::Backend::Raw(_)
+            ) {
+                crate::backend::Backend::push_model_arg(
+                    &mut member_args,
+                    &declared_backend.command_string(),
+                    model,
+                );
+            }
         }
         match crate::agent_ops::spawn_one(
             ctx.home,

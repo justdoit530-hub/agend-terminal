@@ -222,6 +222,7 @@ impl ContextHandoffHandler {
     /// touches this handler's OWN episode state, and vice versa
     /// (P2-2549-SPIKE.md §3c).
     #[cfg(test)]
+    #[allow(dead_code)] // test/introspection helper
     pub(crate) fn phase_of(&self, name: &str) -> Option<Phase> {
         self.states.lock().get(name).map(|s| s.phase)
     }
