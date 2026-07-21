@@ -118,6 +118,6 @@ pub(crate) struct HandlerCtx<'a> {
     pub registry: &'a AgentRegistry,
     pub configs: &'a ConfigRegistry,
     pub externals: &'a ExternalRegistry,
-    pub notifier: Option<&'a dyn ApiNotifier>,
+    pub notifier: Option<std::sync::Arc<dyn ApiNotifier>>,
     pub home: &'a Path,
 }

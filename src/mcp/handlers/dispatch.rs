@@ -58,6 +58,7 @@ pub(crate) struct RuntimeContext {
     #[allow(dead_code)]
     pub configs: crate::api::ConfigRegistry,
     pub externals: crate::agent::ExternalRegistry,
+    pub notifier: Option<std::sync::Arc<dyn crate::api::ApiNotifier>>,
 }
 
 /// One MCP tool's dispatcher. Function pointer (not `Box<dyn …>`) so
@@ -178,6 +179,9 @@ macro_rules! adapter {
     (@call $ctx:ident, has, $handler:expr) => {
         $handler($ctx.home, $ctx.args, $ctx.sender)
     };
+    (@call $ctx:ident, har, $handler:expr) => {
+        $handler($ctx.home, $ctx.args, $ctx.runtime)
+    };
     (@call $ctx:ident, h, $handler:expr) => {
         $handler($ctx.home)
     };
@@ -234,7 +238,9 @@ adapter!(
     ha,
     crate::api::handlers::agy_quota::handle_agy_quota
 );
-adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
+pub(crate) fn dispatch_move_pane(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_move_pane(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(
     dispatch_set_waiting_on,
     hais,
@@ -796,10 +802,10 @@ action_adapter!(dispatch_schedule, "schedule", [
 ]);
 
 action_adapter!(dispatch_team, "team", [
-    "create" => task::handle_create_team,  ha;
+    "create" => task::handle_create_team,  har;
     "delete" => task::handle_delete_team,  ha;
     "list"   => task::handle_list_teams,   h;
-    "update" => task::handle_update_team,  ha;
+    "update" => task::handle_update_team,  har;
 ]);
 
 // `inbox` — branch on `args["action"]` then arg presence:
@@ -839,6 +845,13 @@ pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
 }
 
 pub(crate) fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
+    if let Some(rt) = ctx.runtime {
+        let api_ctx = crate::mcp::handlers::runtime_bridge::api_ctx(ctx.home, rt);
+        let resp = crate::api::handlers::instance::handle_tui_screenshot(&api_ctx);
+        if resp["ok"].as_bool() == Some(true) {
+            return serde_json::json!({"svg": resp["svg"]});
+        }
+    }
     match crate::api::call(
         ctx.home,
         &serde_json::json!({"method": crate::api::method::TUI_SCREENSHOT, "params": {}}),

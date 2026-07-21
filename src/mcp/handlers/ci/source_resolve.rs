@@ -36,16 +36,17 @@ pub(super) fn resolve_checkout_source_path(
         // Non-absolute → MUST be a known agent name. A miss is fail-closed (#2158):
         // never fall back to resolving `source` as a relative path against the
         // daemon cwd.
-        match crate::api::call(home, &json!({"method": crate::api::method::LIST}))
+        let working_dir = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
             .ok()
-            .and_then(|r| {
-                r["result"]["agents"]
-                    .as_array()?
-                    .iter()
-                    .find(|a| a["name"].as_str() == Some(source))
-                    .and_then(|a| a["working_directory"].as_str().map(String::from))
-            }) {
-            Some(working_dir) => working_dir,
+            .and_then(|f| {
+                f.instances.get(source).map(|inst| {
+                    inst.working_directory.clone().unwrap_or_else(|| {
+                        crate::paths::workspace_dir(home).join(source).display().to_string()
+                    })
+                })
+            });
+        match working_dir {
+            Some(dir) => dir,
             None => {
                 return Err(json!({
                     "error": format!(

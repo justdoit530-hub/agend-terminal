@@ -13,7 +13,7 @@ pub(super) fn api_ctx<'a>(home: &'a Path, runtime: &'a RuntimeContext) -> Handle
         registry: &runtime.registry,
         configs: &runtime.configs,
         externals: &runtime.externals,
-        notifier: None,
+        notifier: runtime.notifier.clone(),
         home,
     }
 }
@@ -103,6 +103,21 @@ pub(super) fn create_team_in_process(
     };
     let ctx = api_ctx(home, runtime);
     Ok(handlers::team::handle_create_team(params, &ctx))
+}
+
+/// #2454: UPDATE_TEAM in-process.
+pub(super) fn update_team_in_process(
+    home: &Path,
+    runtime: Option<&RuntimeContext>,
+    params: &Value,
+) -> Result<Value, String> {
+    let Some(runtime) = runtime else {
+        return Err(
+            "runtime unavailable: update_team requires the in-process daemon runtime".to_string(),
+        );
+    };
+    let ctx = api_ctx(home, runtime);
+    Ok(handlers::team::handle_update_team(params, &ctx))
 }
 
 /// #2454: INJECT in-process via shared `agent_ops::inject_input`.

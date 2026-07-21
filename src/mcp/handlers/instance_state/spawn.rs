@@ -30,7 +30,7 @@ pub(super) fn spawn_single_instance(
                     registry: &reg,
                     configs: &configs,
                     externals: &externals,
-                    notifier: None,
+                    notifier: rt.notifier.clone(),
                     home,
                 };
                 Ok(crate::api::handlers::instance::handle_spawn(params, &ctx))

@@ -125,14 +125,21 @@ pub(super) fn handle_set_waiting_on(
     }
 }
 
-pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
-    // MCP arg is `instance`; the daemon RPC contract names the field `agent`.
+pub(super) fn handle_move_pane(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let instance = args["instance"].as_str().unwrap_or("");
     let params = json!({
         "agent": instance,
         "target_tab": args["target_tab"],
         "split_dir": args["split_dir"],
     });
+    if let Some(rt) = runtime {
+        let ctx = crate::mcp::handlers::runtime_bridge::api_ctx(home, rt);
+        return crate::api::handlers::instance::handle_move_pane(&params, &ctx);
+    }
     match crate::api::call(
         home,
         &json!({"method": crate::api::method::MOVE_PANE, "params": params}),
