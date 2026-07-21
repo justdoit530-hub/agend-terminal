@@ -2101,6 +2101,7 @@ fn handle_stage2_restart(
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let spawn_result = agent::spawn_agent(
         &agent::SpawnConfig {
+            backend: None,
             name,
             backend_command: &config.backend_command,
             args: &config.args,

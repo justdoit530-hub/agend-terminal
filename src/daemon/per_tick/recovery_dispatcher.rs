@@ -1181,15 +1181,14 @@ mod tests {
             core: std::sync::Arc::clone(&core),
             pty_writer,
         };
-        let _logs = capture_all_logs(|| {
-            fire_stage1_alive_stuck(
-                "wedged-esc-target",
-                &target,
-                true, // gate_active
-                Duration::from_secs(200),
-                Duration::from_secs(200),
-            );
-        });
+        // Fork: capture_all_logs is not shared from state::tests; fire directly.
+        fire_stage1_alive_stuck(
+            "wedged-esc-target",
+            &target,
+            true, // gate_active
+            Duration::from_secs(200),
+            Duration::from_secs(200),
+        );
     }
 
     /// #1694(a): the three-way Stage2 decision — the seam that makes

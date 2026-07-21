@@ -51,16 +51,17 @@ fn agent_is_alive_doc_drops_parking_lot_poison_claim_app_tui() {
 /// the deferral nor the clear.
 #[test]
 fn terminal_resize_arm_performs_ghost_clear_app_tui() {
-    let src = include_str!("mod.rs");
+    // #2453: Resize handling lives on AppState::handle_crossterm_event.
+    let src = include_str!("app_state.rs");
 
     let start = src
         .find("Event::Resize(cols, rows) => {")
         .expect("Event::Resize arm must exist in the TUI event loop");
-    // The unique `recv(wakeup_rx)` crossbeam select branch sits just after the
-    // event-match block and cleanly bounds the Resize arm body.
+    // Bound the arm by the next match arm or end of the match block.
     let rel_end = src[start..]
-        .find("recv(wakeup_rx)")
-        .expect("recv(wakeup_rx) branch must follow and bound the Resize arm");
+        .find("\n            _ =>")
+        .or_else(|| src[start..].find("\n        }"))
+        .expect("Resize arm must be bounded by next match arm or match close");
     let arm = &src[start..start + rel_end];
 
     // Sanity: the buggy arm still calls resize_panes inline; if not, drift.

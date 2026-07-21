@@ -353,15 +353,27 @@ fn spawn_and_subscribe(
         .as_ref()
         .is_some_and(|backend| !matches!(backend, Backend::Shell | Backend::Raw(_)))
     {
+        // Fork note: upstream uses generate_for_owner (Result + identity guard).
+        // Our instructions API only exposes generate / generate_with_context (() return).
         match identity {
             SpawnIdentity::Managed => {
-                crate::instructions::generate_for_owner(work_dir, &behavior_command, name)
+                let ctx = crate::instructions::AgentContext {
+                    name,
+                    role: None,
+                    fleet_peers: &[],
+                    team: None,
+                    extra_instructions: None,
+                };
+                crate::instructions::generate_with_context(
+                    work_dir,
+                    &behavior_command,
+                    Some(&ctx),
+                );
             }
             SpawnIdentity::UnmanagedLocalShell => {
-                crate::instructions::generate(work_dir, &behavior_command)
+                crate::instructions::generate(work_dir, &behavior_command);
             }
         }
-        .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
     }
 
     // #1083: install skills for TUI-spawned panes (app mode).
@@ -862,11 +874,17 @@ pub(super) fn run_attach(
             }
             let mut args = resolved.args.clone();
             if let Some(ref model) = resolved.model {
-                let model_val = Backend::from_command(&resolved.backend_command)
-                    .map(|b| b.format_model_arg(model))
-                    .unwrap_or_else(|| model.clone());
-                args.push("--model".to_string());
-                args.push(model_val);
+                // #2744 / #2801: declared identity drives model format + shell withhold.
+                if !matches!(
+                    resolved.backend,
+                    Backend::Shell | Backend::Raw(_)
+                ) {
+                    Backend::push_model_arg(
+                        &mut args,
+                        &resolved.backend.command_string(),
+                        model,
+                    );
+                }
             }
             let command = resolved.backend_command.clone();
             let work_dir = working_dir
@@ -904,19 +922,13 @@ pub(super) fn run_attach(
                         team: team_ctx.as_ref(),
                         extra_instructions: extra_instructions.as_deref(),
                     };
-                    let behavior_command = resolved.backend.command_string();
-                    if let Err(e) = crate::instructions::generate_with_context(
+                    let behavior_command = resolved.backend_command.clone();
+                    // Fork: generate_with_context returns () (no fail-closed Result).
+                    crate::instructions::generate_with_context(
                         &work_dir,
                         &behavior_command,
                         Some(&ctx),
-                    ) {
-                        tracing::error!(agent = %deduped_name, error = %e, "provisioning refused; not attaching");
-                        return AttachOutcome::Failed {
-                            pane_id,
-                            name: deduped_name,
-                            err: format!("provisioning refused: {e}"),
-                        };
-                    }
+                    );
                     finish_attach(
                         registry,
                         pane_id,
@@ -1170,11 +1182,10 @@ pub(super) fn create_pane_from_resolved(
 
     let mut args = resolved.args.clone();
     if let Some(ref model) = resolved.model {
-        let model_val = Backend::from_command(&resolved.backend_command)
-            .map(|b| b.format_model_arg(model))
-            .unwrap_or_else(|| model.clone());
-        args.push("--model".to_string());
-        args.push(model_val);
+        // #2744 / #2801: declared identity drives model format + shell withhold.
+        if !matches!(resolved.backend, Backend::Shell | Backend::Raw(_)) {
+            Backend::push_model_arg(&mut args, &resolved.backend.command_string(), model);
+        }
     }
 
     let mut pane = create_pane_with_backend(
@@ -1198,9 +1209,9 @@ pub(super) fn create_pane_from_resolved(
 
     // Overwrite basic instructions with fleet-aware version
     if let Some(ref wd) = pane.working_dir {
-        let behavior_command = resolved.backend.command_string();
-        crate::instructions::generate_with_context(wd, &behavior_command, Some(&ctx))
-            .map_err(|e| anyhow::anyhow!("provisioning refused: {e}"))?;
+        let behavior_command = resolved.backend_command.clone();
+        // Fork: generate_with_context returns () (no fail-closed Result).
+        crate::instructions::generate_with_context(wd, &behavior_command, Some(&ctx));
     }
     pane.fleet_instance_name = Some(fleet_name.to_string());
     Ok(pane)

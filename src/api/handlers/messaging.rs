@@ -759,6 +759,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "active-agent",
             backend_command: crate::default_shell(),
             args: &[],
@@ -1342,6 +1343,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "codex-agent",
             backend_command: crate::default_shell(),
             args: &[],
@@ -1418,6 +1420,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "codex-agent",
             backend_command: crate::default_shell(),
             args: &[],
@@ -1487,6 +1490,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "codex-agent",
             backend_command: crate::default_shell(),
             args: &[],
@@ -1551,6 +1555,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "codex-agent",
             backend_command: crate::default_shell(),
             args: &[],
@@ -1616,6 +1621,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "codex-agent",
             backend_command: crate::default_shell(),
             args: &[],
@@ -2103,6 +2109,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: codex_agent,
             backend_command: crate::default_shell(),
             args: &[],
@@ -2358,6 +2365,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "claude-agent",
             backend_command: crate::default_shell(),
             args: &[],
@@ -2554,6 +2562,7 @@ mod tests {
         let registry: &'static agent::AgentRegistry =
             Box::leak(Box::new(Arc::new(Mutex::new(HashMap::new()))));
         let spawn_cfg = crate::agent::SpawnConfig {
+            backend: None,
             name: "codex-rev",
             backend_command: crate::default_shell(),
             args: &[],

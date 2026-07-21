@@ -509,6 +509,7 @@ pub fn spawn_and_track(home: &Path, spec: SpawnSpec) -> Result<EphemeralWorker, 
         crate::backend::Backend::push_model_arg(&mut spawn_args, backend_command, model);
     }
     let config = crate::agent::SpawnConfig {
+        backend: None,
         name: &worker_id,
         backend_command, // canonical (allowlist-resolved) — never the raw input
         args: &spawn_args,
@@ -1009,6 +1010,7 @@ mod tests {
 
         let (program, args) = long_lived_cmd();
         let config = crate::agent::SpawnConfig {
+            backend: None,
             name: &worker_id,
             backend_command: &program,
             args: &args,
@@ -1149,6 +1151,7 @@ mod tests {
         let (program, args) = long_lived_cmd();
         let worker_id = format!("eph-direct-{}", std::process::id());
         let config = crate::agent::SpawnConfig {
+            backend: None,
             name: &worker_id,
             backend_command: &program,
             args: &args,
@@ -1425,6 +1428,7 @@ mod tests {
         );
 
         let config = crate::agent::SpawnConfig {
+            backend: None,
             name: &worker_id,
             backend_command: &program,
             args: &args,
@@ -1510,6 +1514,7 @@ mod tests {
         // process WERE spawned it would be a `cmd` we'd have to reap; the early
         // return guarantees none is, so there is nothing to clean up.
         let config = crate::agent::SpawnConfig {
+            backend: None,
             name: &worker_id,
             backend_command: "cmd",
             args: &[],
@@ -1580,6 +1585,7 @@ mod tests {
 
         let (program, args) = long_lived_cmd();
         let config = crate::agent::SpawnConfig {
+            backend: None,
             name: &worker_id,
             backend_command: &program,
             args: &args,
@@ -1652,6 +1658,7 @@ mod tests {
         let worker_id = format!("eph-guard-{}", std::process::id());
         let (program, args) = long_lived_cmd(); // /bin/sleep 30 — a real long-lived child
         let config = crate::agent::SpawnConfig {
+            backend: None,
             name: &worker_id,
             backend_command: &program,
             args: &args,
@@ -1696,6 +1703,7 @@ mod tests {
         let worker_id = format!("eph-guard-ok-{}", std::process::id());
         let (program, args) = long_lived_cmd();
         let config = crate::agent::SpawnConfig {
+            backend: None,
             name: &worker_id,
             backend_command: &program,
             args: &args,
