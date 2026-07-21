@@ -115,7 +115,7 @@ fn timeout_response(tool: &str, timeout: Duration, content_key: u64) -> Value {
 /// Handle `mcp_tool` API method: proxy a tool call through the daemon
 /// where process-global state (ACTIVE_CHANNEL, heartbeat_pair, etc.)
 /// is available. Applies per-tool timeout.
-pub(crate) fn handle_mcp_tool(params: &Value, _ctx: &HandlerCtx) -> Value {
+pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
     let tool = match params["tool"].as_str() {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"ok": false, "error": "missing 'tool' parameter"}),
@@ -123,7 +123,22 @@ pub(crate) fn handle_mcp_tool(params: &Value, _ctx: &HandlerCtx) -> Value {
     let args = params["arguments"].clone();
     let instance = params["instance"].as_str().unwrap_or("").to_string();
     let timeout = tool_timeout(tool);
-    handle_mcp_tool_inner(tool, args, instance, timeout, crate::mcp::execute_tool)
+    // #2454: forward live registries so MCP handlers can call typed services
+    // in-process instead of looping back over the API socket.
+    let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
+        registry: ctx.registry.clone(),
+        configs: ctx.configs.clone(),
+        externals: ctx.externals.clone(),
+    };
+    handle_mcp_tool_inner(
+        tool,
+        args,
+        instance,
+        timeout,
+        move |tool, args, instance| {
+            crate::mcp::execute_tool_with_runtime(tool, args, instance, runtime)
+        },
+    )
 }
 
 /// Inner proxy with an injectable executor + explicit timeout — the §3.9 test

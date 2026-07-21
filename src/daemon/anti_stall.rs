@@ -892,30 +892,43 @@ mod tests {
         let home = tmp_home("stalled-mcp");
         let now = chrono::Utc::now();
         let dispatched = (now - chrono::Duration::seconds(500)).to_rfc3339();
+        // Unique name avoids collisions when PENDING_REGISTRY is process-shared.
+        let agent_name = format!(
+            "mcp-agent-{}",
+            crate::types::InstanceId::new().to_string().replace('-', "")
+        );
         let mut task = make_task("t-mcp", "in_progress", Some(100), Some(&dispatched));
-        task.routed_to = Some("mcp-agent".to_string());
+        task.routed_to = Some(agent_name.clone());
 
-        let registry: crate::agent::AgentRegistry =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        // PENDING_REGISTRY is OnceLock (first publisher wins). Under parallel
+        // cargo test, always mutate the *live* registry check_stalled reads.
+        let registry = if let Some(existing) = crate::agent::get_pending_registry() {
+            existing
+        } else {
+            let fresh: crate::agent::AgentRegistry =
+                std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+            crate::agent::set_pending_registry(fresh.clone());
+            crate::agent::get_pending_registry().unwrap_or(fresh)
+        };
+
         let inst_id = crate::types::InstanceId::new();
-        let handle = crate::agent::mk_test_handle("mcp-agent", inst_id);
+        let handle = crate::agent::mk_test_handle(&agent_name, inst_id);
         registry.lock().insert(inst_id, handle);
-
-        crate::agent::set_pending_registry(registry.clone());
 
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let last_mcp = now_ms - 10_000;
-        let reg_guard = crate::agent::lock_registry(&registry);
-        let agent_handle = reg_guard
-            .values()
-            .find(|h| h.name.as_str() == "mcp-agent")
-            .unwrap();
-        agent_handle
-            .core
-            .lock()
-            .health
-            .last_mcp_activity_at_epoch_ms = Some(last_mcp);
-        drop(reg_guard);
+        {
+            let reg_guard = crate::agent::lock_registry(&registry);
+            let agent_handle = reg_guard
+                .values()
+                .find(|h| h.name.as_str() == agent_name)
+                .expect("test agent inserted");
+            agent_handle
+                .core
+                .lock()
+                .health
+                .last_mcp_activity_at_epoch_ms = Some(last_mcp);
+        }
 
         let result = check_stalled(&home, &task, now);
         assert!(
@@ -924,17 +937,18 @@ mod tests {
         );
 
         let stale_mcp = now_ms - 500_000;
-        let reg_guard = crate::agent::lock_registry(&registry);
-        let agent_handle = reg_guard
-            .values()
-            .find(|h| h.name.as_str() == "mcp-agent")
-            .unwrap();
-        agent_handle
-            .core
-            .lock()
-            .health
-            .last_mcp_activity_at_epoch_ms = Some(stale_mcp);
-        drop(reg_guard);
+        {
+            let reg_guard = crate::agent::lock_registry(&registry);
+            let agent_handle = reg_guard
+                .values()
+                .find(|h| h.name.as_str() == agent_name)
+                .expect("test agent still present");
+            agent_handle
+                .core
+                .lock()
+                .health
+                .last_mcp_activity_at_epoch_ms = Some(stale_mcp);
+        }
 
         let result = check_stalled(&home, &task, now);
         assert!(
@@ -942,6 +956,7 @@ mod tests {
             "must detect stall when MCP activity is stale"
         );
 
+        registry.lock().remove(&inst_id);
         std::fs::remove_dir_all(&home).ok();
     }
 }

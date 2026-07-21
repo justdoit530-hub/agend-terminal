@@ -7,65 +7,12 @@ use serde_json::{json, Value};
 
 pub(crate) fn handle_inject(params: &Value, ctx: &HandlerCtx) -> Value {
     let name = params["name"].as_str().unwrap_or("");
-    if let Err(e) = agent::validate_name(name) {
-        return json!({"ok": false, "error": e});
-    }
     let data = params["data"].as_str().unwrap_or("");
     let raw = params["raw"].as_bool().unwrap_or(false);
-    // #1530/F1: snapshot the inject target (+ the restarting check) under the
-    // registry lock, then RELEASE it before the (up to 5s + payload-scaled)
-    // blocking PTY write — never hold the registry across write/inject.
-    // #1441: registry is UUID-keyed; resolve name via fleet.yaml.
-    let snap = {
-        let reg = agent::lock_registry(ctx.registry);
-        crate::fleet::resolve_uuid(ctx.home, name)
-            .and_then(|id| reg.get(&id))
-            .map(|handle| {
-                // #2465: routed through operated_state for single-source consistency with the
-                // other decision consumers (#1493) — NOT a behavioral change here today.
-                // `is_unavailable` = Crashed|Restarting; the gate keeps Crashed raw (non-decisive
-                // screen) and only overrides on a COARSE disagreement (rule d), so a fresh Active
-                // hook AGREES with Restarting's Working baseline and does NOT flip is_unavailable.
-                // This diverges from raw only for a cross-coarse Hook/Stream correction (e.g.
-                // raw=Restarting + Hook=WaitingForUser/RateLimited — more relevant after #2466).
-                // Lock scoped + dropped before `from_handle` to preserve the single-acquisition order.
-                let is_restarting = {
-                    let core = handle.core.lock();
-                    crate::daemon::shadow::operated_state(
-                        core.state.current,
-                        core.observed_status.as_ref(),
-                    )
-                    .is_unavailable()
-                };
-                (agent::InjectTarget::from_handle(handle), is_restarting)
-            })
-    };
-    match snap {
-        Some((tgt, is_restarting)) => {
-            if is_restarting {
-                json!({"ok": false, "error": format!("agent '{name}' is restarting, retry later")})
-            } else {
-                let result = if raw {
-                    agent::write_to_pty(&tgt.pty_writer, data.as_bytes())
-                } else {
-                    // #1769: the api INJECT path carries operator/relay data (and
-                    // its own headers) — not a daemon auto-nudge → no marker.
-                    agent::inject_with_target_gated(&tgt, name, data.as_bytes(), true, None)
-                };
-                match result {
-                    Ok(()) => json!({"ok": true, "result": {"bytes": data.len()}}),
-                    Err(e) => json!({"ok": false, "error": format!("{e}")}),
-                }
-            }
-        }
-        None => {
-            let ext = agent::lock_external(ctx.externals);
-            if ext.contains_key(name) {
-                json!({"ok": false, "error": format!("agent '{name}' is external — use send instead of inject")})
-            } else {
-                json!({"ok": false, "error": format!("agent '{name}' not found")})
-            }
-        }
+    // #2454 S4: thin adapter over agent_ops::inject_input (shared with MCP interrupt).
+    match crate::agent_ops::inject_input(ctx.registry, ctx.externals, ctx.home, name, data, raw) {
+        Ok(bytes) => json!({"ok": true, "result": {"bytes": bytes}}),
+        Err(e) => json!({"ok": false, "error": e.message()}),
     }
 }
 
@@ -489,22 +436,15 @@ pub(crate) fn handle_set_blocked_reason(params: &Value, ctx: &HandlerCtx) -> Val
         Some(r) => r,
         None => return json!({"ok": false, "error": format!("unknown reason: {reason_str}")}),
     };
-    let reg = agent::lock_registry(ctx.registry);
-    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
-        Some(handle) => {
-            let mut core = handle.core.lock();
-            let state = core.state.get_state().display_name().to_string();
-            core.health.set_blocked_reason(reason);
-            // #1933: attach the optional operator-readable note (set_blocked_reason
-            // above reset it). Empty/absent → no annotation.
-            core.health.set_blocked_note(
-                params["note"]
-                    .as_str()
-                    .filter(|n| !n.is_empty())
-                    .map(str::to_string),
-            );
-            json!({"ok": true, "status": "reason_set", "reason": reason_str, "current_state": state})
-        }
+    let note = params["note"].as_str();
+    // #2454: thin adapter over agent_ops::set_blocked_reason.
+    match crate::agent_ops::set_blocked_reason(ctx.registry, ctx.home, name, reason, note) {
+        Some(out) => json!({
+            "ok": true,
+            "status": "reason_set",
+            "reason": reason_str,
+            "current_state": out.current_state
+        }),
         None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
     }
 }
@@ -515,49 +455,24 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
         None => return json!({"ok": false, "error": "missing 'name'"}),
     };
     let filter_reason = params["reason"].as_str();
-    let reg = agent::lock_registry(ctx.registry);
-    match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
-        Some(handle) => {
-            let mut core = handle.core.lock();
-            let was = core
-                .health
-                .current_reason
+    // #2454: thin adapter over agent_ops::clear_blocked_reason (keeps #2232 latch).
+    match crate::agent_ops::clear_blocked_reason(ctx.registry, ctx.home, name, filter_reason) {
+        Ok(out) => {
+            let was = out
+                .was
                 .as_ref()
                 .map(|r| serde_json::to_value(r).unwrap_or_default());
-            // #2232: was the agent clearing a rate-limit / quota block? Captured
-            // BEFORE the clear below. An AGENT-initiated clear of such a block is
-            // ground-truth that it is awake and acted on the retry inject (the
-            // watchdog's heuristic auto-clear goes through `clear_blocked_reason`
-            // directly, NOT this MCP path, so it never trips the latch).
-            let was_rate_limit_block = matches!(
-                core.health.current_reason,
-                Some(
-                    crate::health::BlockedReason::RateLimit { .. }
-                        | crate::health::BlockedReason::QuotaExceeded
-                )
-            );
-            // If a reason filter is specified, only clear if it matches
-            if let Some(filter) = filter_reason {
-                let matches = core
-                    .health
-                    .current_reason
-                    .as_ref()
-                    .is_some_and(|r| r.kind_str() == filter);
-                if !matches {
-                    return json!({"ok": false, "error": "reason mismatch", "current": was});
-                }
-            }
-            core.health.clear_blocked_reason();
-            // #2232: latch the ground-truth recovery so the supervisor's next
-            // process_error_recovery tick drops the ServerRateLimit retry track —
-            // closing the gap where a pure-text fast reply never stamped
-            // `last_productive_output` so the `recovered_within` heuristic missed.
-            if was_rate_limit_block {
-                core.health.rate_limit_self_cleared = true;
-            }
             json!({"ok": true, "status": "cleared", "instance": name, "was": was})
         }
-        None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
+        Err(crate::agent_ops::ClearBlockedError::FilterMismatch { current }) => {
+            let was = current
+                .as_ref()
+                .map(|r| serde_json::to_value(r).unwrap_or_default());
+            json!({"ok": false, "error": "reason mismatch", "current": was})
+        }
+        Err(crate::agent_ops::ClearBlockedError::NotFound) => {
+            json!({"ok": false, "error": format!("instance '{name}' not found")})
+        }
     }
 }
 
@@ -582,16 +497,11 @@ pub(crate) fn handle_pane_snapshot(params: &Value, ctx: &HandlerCtx) -> Value {
         None => return json!({"ok": false, "error": "missing 'name'"}),
     };
     let lines = (params["lines"].as_u64().unwrap_or(100) as usize).min(10_000);
-    let reg = agent::lock_registry(ctx.registry);
-    let handle = match crate::fleet::resolve_uuid(ctx.home, name).and_then(|id| reg.get(&id)) {
-        Some(h) => h,
-        None => return json!({"ok": false, "error": format!("instance '{name}' not found")}),
-    };
-    let core = handle.core.lock();
-    let text = core.vterm.read_scrollback(lines);
-    drop(core);
-    drop(reg);
-    json!({"ok": true, "text": text})
+    // #2454: thin adapter over agent_ops::pane_scrollback.
+    match crate::agent_ops::pane_scrollback(ctx.registry, ctx.home, name, lines) {
+        Some(text) => json!({"ok": true, "text": text}),
+        None => json!({"ok": false, "error": format!("instance '{name}' not found")}),
+    }
 }
 
 #[cfg(test)]

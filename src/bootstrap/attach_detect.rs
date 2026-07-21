@@ -186,9 +186,10 @@ mod tests {
             3,
             "exhausts max_attempts before returning None"
         );
-        // 2 inter-attempt sleeps × 10ms = ~20ms; allow 200ms slack for CI scheduling.
+        // 2 inter-attempt sleeps × 10ms = ~20ms; allow 1s slack for loaded hosts
+        // (200ms was flaky under parallel suite pressure).
         assert!(
-            elapsed < Duration::from_millis(200),
+            elapsed < Duration::from_millis(1000),
             "bounded budget — must not loop indefinitely; got elapsed={elapsed:?}"
         );
     }

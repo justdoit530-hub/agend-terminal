@@ -1,47 +1,53 @@
+use super::dispatch::RuntimeContext;
 use crate::agent_ops::{list_agents, merge_metadata};
 use serde_json::{json, Value};
 use std::path::Path;
 
-pub(super) fn handle_list_instances(home: &Path, args: &Value, instance_name: &str) -> Value {
-    // If `instance` param is provided, return detailed info for that instance (replaces describe_instance)
+pub(super) fn handle_list_instances(
+    home: &Path,
+    args: &Value,
+    instance_name: &str,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
+    // If `instance` param is provided, return detailed info for that instance.
     if let Some(target) = args["instance"].as_str().filter(|s| !s.is_empty()) {
-        return handle_describe_instance(home, &json!({"name": target}));
+        return handle_describe_instance(home, &json!({"name": target}), runtime);
     }
-    // #2475: compact-by-default for routine polling. The API LIST response still
-    // carries full `observed_status.evidence` for dashboards / describe paths;
-    // the MCP `list_instances` read tool strips that evidence unless explicitly
-    // requested, because agents poll this often and the evidence array is noisy
-    // context ballast. Set `verbose:true` or `include_evidence:true` for detail.
     let include_evidence = args["verbose"].as_bool().unwrap_or(false)
         || args["include_evidence"].as_bool().unwrap_or(false);
-    match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
-        Ok(resp) => {
-            if let Some(agents) = resp["result"]["agents"].as_array() {
-                let instances: Vec<Value> = agents
-                    .iter()
-                    .filter(|a| {
-                        let backend = a["backend"].as_str().unwrap_or("");
-                        crate::backend::Backend::from_command(backend).is_some()
-                    })
-                    .map(|a| {
-                        let mut info = a.clone();
-                        let name = a["name"].as_str().unwrap_or("");
-                        merge_metadata(home, name, &mut info);
-                        if name == instance_name {
-                            info["is_self"] = json!(true);
-                        }
-                        if !include_evidence {
-                            strip_observed_evidence(&mut info);
-                        }
-                        info
-                    })
-                    .collect();
-                json!({"instances": instances, "compact": !include_evidence})
-            } else {
-                json!({"instances": list_agents(), "compact": true})
-            }
-        }
-        Err(_) => json!({"instances": list_agents(), "compact": true}),
+
+    // #2454 S3: prefer in-process list_snapshot when runtime is present.
+    let agents_val = if let Some(runtime) = runtime {
+        let snap = crate::agent_ops::list_snapshot(home, &runtime.registry, &runtime.externals);
+        snap["result"]["agents"].clone()
+    } else {
+        // Standalone/bridge without runtime: best-effort name list fallback.
+        return json!({"instances": list_agents(), "compact": true});
+    };
+
+    if let Some(agents) = agents_val.as_array() {
+        let instances: Vec<Value> = agents
+            .iter()
+            .filter(|a| {
+                let backend = a["backend"].as_str().unwrap_or("");
+                crate::backend::Backend::from_command(backend).is_some()
+            })
+            .map(|a| {
+                let mut info = a.clone();
+                let name = a["name"].as_str().unwrap_or("");
+                merge_metadata(home, name, &mut info);
+                if name == instance_name {
+                    info["is_self"] = json!(true);
+                }
+                if !include_evidence {
+                    strip_observed_evidence(&mut info);
+                }
+                info
+            })
+            .collect();
+        json!({"instances": instances, "compact": !include_evidence})
+    } else {
+        json!({"instances": list_agents(), "compact": true})
     }
 }
 
@@ -54,41 +60,43 @@ fn strip_observed_evidence(info: &mut Value) {
     }
 }
 
-pub(super) fn handle_describe_instance(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_describe_instance(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let name = args["name"].as_str().unwrap_or("");
     crate::validate_name_or_err!(name);
-    match crate::api::call(home, &json!({"method": crate::api::method::LIST})) {
-        Ok(resp) => {
-            match resp["result"]["agents"]
-                .as_array()
-                .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name)))
-            {
-                Some(agent) => {
-                    let mut info = agent.clone();
-                    merge_metadata(home, name, &mut info);
-                    // Surface topic_id from topics.json + topic_binding_mode from fleet.yaml.
-                    if info.get("topic_id").is_none() {
-                        if let Some(tid) =
-                            crate::channel::telegram::lookup_topic_for_instance(home, name)
-                        {
-                            info["topic_id"] = json!(tid);
-                        }
-                    }
-                    if let Some(inst) =
-                        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                            .ok()
-                            .and_then(|c| c.instances.get(name).cloned())
-                    {
-                        if let Some(ref mode) = inst.topic_binding_mode {
-                            info["topic_binding_mode"] = json!(mode);
-                        }
-                    }
-                    json!({"instance": info})
+    let Some(runtime) = runtime else {
+        return json!({"error": "runtime unavailable: describe requires the in-process daemon runtime"});
+    };
+    let snap = crate::agent_ops::list_snapshot(home, &runtime.registry, &runtime.externals);
+    match snap["result"]["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(name)))
+    {
+        Some(agent) => {
+            let mut info = agent.clone();
+            merge_metadata(home, name, &mut info);
+            if info.get("topic_id").is_none() {
+                if let Some(tid) =
+                    crate::channel::telegram::lookup_topic_for_instance(home, name)
+                {
+                    info["topic_id"] = json!(tid);
                 }
-                None => json!({"error": format!("Instance '{name}' not found")}),
             }
+            if let Some(inst) =
+                crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                    .ok()
+                    .and_then(|c| c.instances.get(name).cloned())
+            {
+                if let Some(ref mode) = inst.topic_binding_mode {
+                    info["topic_binding_mode"] = json!(mode);
+                }
+            }
+            json!({"instance": info})
         }
-        Err(e) => json!({"error": format!("API unavailable: {e}")}),
+        None => json!({"error": format!("Instance '{name}' not found")}),
     }
 }
 

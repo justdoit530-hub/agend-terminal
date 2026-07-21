@@ -168,6 +168,7 @@ fn clear_blocked_reason_validates_instance_name_mcp_core_surface() {
     let result = super::instance::handle_clear_blocked_reason(
         &home,
         &json!({ "instance": "../evil-mcp-core-surface" }),
+        None,
     );
 
     let err = error_str(&result).to_lowercase();

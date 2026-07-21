@@ -2137,12 +2137,15 @@ fn test_interrupt_handler_validates_target() {
     let r = handle_tool("interrupt", &json!({"instance": "../escape"}), "caller");
     assert!(r.get("error").is_some());
 
-    // Valid target but no daemon → reaches inject path
+    // Valid target via handle_tool (no RuntimeContext) → explicit runtime-unavailable
+    // error; never falls back to api::call self-IPC (#2454).
     let r = handle_tool("interrupt", &json!({"instance": "valid-agent"}), "caller");
     let err = r["error"].as_str().unwrap_or("");
     assert!(
-        err.contains("not reachable") || err.contains("API unavailable"),
-        "valid target must reach inject path: {err}"
+        err.contains("runtime unavailable")
+            || err.contains("not reachable")
+            || err.contains("API unavailable"),
+        "valid target must reach interrupt handler: {err}"
     );
     std::env::remove_var("AGEND_HOME");
     std::fs::remove_dir_all(&home).ok();
