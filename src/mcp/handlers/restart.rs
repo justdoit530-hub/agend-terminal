@@ -228,6 +228,8 @@ fn phase1_gate(succ: &mut crate::bootstrap::daemon_spawn::SuccessorHandle) -> bo
             );
             return false;
         }
+        // #2454: Intentional external IPC check — polls the newly-spawned successor child process
+        // in its isolated `succ.run_dir` to confirm successor daemon is healthy before handoff.
         if control_ready.exists()
             && crate::api::call_at(
                 &succ.run_dir,
