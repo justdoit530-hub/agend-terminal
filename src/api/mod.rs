@@ -597,8 +597,7 @@ fn handle_session(
             registry,
             configs,
             externals,
-            notifier: notifier.as_deref(),
-            notifier_arc: notifier.clone(),
+            notifier: notifier.clone(),
             home,
         };
 

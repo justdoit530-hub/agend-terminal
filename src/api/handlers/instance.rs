@@ -83,7 +83,7 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
     );
     // H3: clean up poll_reminder dedup state for deleted agent
     crate::daemon::poll_reminder::remove_agent(name);
-    if let Some(n) = ctx.notifier {
+    if let Some(n) = &ctx.notifier {
         tracing::info!(agent = name, "DELETE emitting InstanceDeleted");
         n.notify(ApiEvent::InstanceDeleted {
             name: name.to_string(),
@@ -343,7 +343,7 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
                     }
                 }
             };
-            if let Some(n) = ctx.notifier {
+            if let Some(n) = &ctx.notifier {
                 let layout_hint = LayoutHint::parse(params["layout"].as_str().unwrap_or("tab"));
                 let spawner = params["spawner"]
                     .as_str()
@@ -407,7 +407,7 @@ pub(crate) fn handle_move_pane(params: &Value, ctx: &HandlerCtx) -> Value {
     };
     let split_dir = PaneMoveSplitDir::parse(params["split_dir"].as_str().unwrap_or("horizontal"));
 
-    if let Some(n) = ctx.notifier {
+    if let Some(n) = &ctx.notifier {
         n.notify(ApiEvent::PaneMoved {
             agent: agent_name.to_string(),
             target_tab: target_tab.to_string(),
@@ -479,7 +479,7 @@ pub(crate) fn handle_clear_blocked_reason(params: &Value, ctx: &HandlerCtx) -> V
 /// #1257: TUI screenshot — sends ScreenshotRequest to app event loop,
 /// waits for SVG response. Only works in TUI mode.
 pub(crate) fn handle_tui_screenshot(ctx: &HandlerCtx) -> Value {
-    let Some(notifier) = ctx.notifier else {
+    let Some(notifier) = &ctx.notifier else {
         return json!({"ok": false, "error": "tui_screenshot requires TUI mode (daemon-only mode not supported)"});
     };
     let (tx, rx) = tokio::sync::oneshot::channel();

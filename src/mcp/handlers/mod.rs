@@ -109,6 +109,7 @@ pub fn handle_tool_rt(tool: &str, args: &Value, instance_name: &str) -> Value {
         registry: Arc::new(Mutex::new(HashMap::new())),
         configs: Arc::new(Mutex::new(HashMap::new())),
         externals: Arc::new(Mutex::new(HashMap::new())),
+        notifier: None,
     };
     handle_tool_with_runtime(tool, args, instance_name, Some(runtime))
 }

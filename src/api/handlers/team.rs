@@ -28,7 +28,7 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         .cloned()
         .collect();
     let diff_nonempty = !added.is_empty() || !removed.is_empty();
-    if let Some(n) = ctx.notifier {
+    if let Some(n) = &ctx.notifier {
         if diff_nonempty {
             tracing::info!(team = %team_name, added = ?added, removed = ?removed, "UPDATE_TEAM emitting TeamMembersChanged");
             n.notify(ApiEvent::TeamMembersChanged {
@@ -340,7 +340,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
         });
     }
 
-    if let Some(n) = ctx.notifier {
+    if let Some(n) = &ctx.notifier {
         if team_already_exists {
             if !spawned_names.is_empty() {
                 tracing::info!(team = team_name, added = ?spawned_names, "CREATE_TEAM emitting TeamMembersChanged (extend)");
