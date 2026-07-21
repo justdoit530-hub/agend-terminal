@@ -83,7 +83,16 @@ pub(super) fn handle_task_sweep_config(home: &Path, args: &Value) -> Value {
     crate::daemon::task_sweep::handle_task_sweep_config(home, args)
 }
 
-pub(super) fn handle_create_team(home: &Path, args: &Value) -> Value {
+use super::dispatch::RuntimeContext;
+
+pub(super) fn handle_create_team(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
+    if let Ok(val) = crate::mcp::handlers::runtime_bridge::create_team_in_process(home, runtime, args) {
+        return val;
+    }
     crate::teams::create(home, args)
 }
 
@@ -95,6 +104,13 @@ pub(super) fn handle_list_teams(home: &Path) -> Value {
     crate::teams::list(home)
 }
 
-pub(super) fn handle_update_team(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_update_team(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
+    if let Ok(val) = crate::mcp::handlers::runtime_bridge::update_team_in_process(home, runtime, args) {
+        return val;
+    }
     crate::teams::update(home, args)
 }

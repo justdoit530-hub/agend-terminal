@@ -131,39 +131,25 @@ pub(super) fn handle_move_pane(
     runtime: Option<&RuntimeContext>,
 ) -> Value {
     let instance = args["instance"].as_str().unwrap_or("");
-    if instance.is_empty() {
-        return json!({"error": "move_pane: missing required parameter 'instance'"});
-    }
-    if let Err(e) = crate::agent::validate_name(instance) {
-        return json!({"error": format!("move_pane: {e}")});
-    }
-    let target_tab = match args["target_tab"].as_str() {
-        Some(t) if !t.is_empty() => t,
-        _ => return json!({"error": "move_pane: missing target_tab"}),
-    };
-    let split_dir = crate::api::PaneMoveSplitDir::parse(
-        args["split_dir"].as_str().unwrap_or("horizontal"),
-    );
-
+    let params = json!({
+        "agent": instance,
+        "target_tab": args["target_tab"],
+        "split_dir": args["split_dir"],
+    });
     if let Some(rt) = runtime {
-        let reg = crate::agent::lock_registry(&rt.registry);
-        if !reg.values().any(|h| h.name.as_str() == instance) {
-            let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                .ok()
-                .map(|c| c.instances.contains_key(instance))
-                .unwrap_or(false);
-            if !in_fleet {
-                return json!({"error": format!("instance '{instance}' not found")});
-            }
-        }
+        let ctx = crate::mcp::handlers::runtime_bridge::api_ctx(home, rt);
+        return crate::api::handlers::instance::handle_move_pane(&params, &ctx);
     }
-    crate::event_log::log(
+    match crate::api::call(
         home,
-        "move_pane",
-        instance,
-        &format!("target_tab={target_tab} split={split_dir:?}"),
-    );
-    json!({"ok": true, "instance": instance, "target_tab": args["target_tab"]})
+        &json!({"method": crate::api::method::MOVE_PANE, "params": params}),
+    ) {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
+            json!({"ok": true, "instance": instance, "target_tab": args["target_tab"]})
+        }
+        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("move_pane failed")}),
+        Err(e) => json!({"error": format!("move_pane: {e}")}),
+    }
 }
 
 pub(super) fn handle_pane_snapshot(

@@ -178,6 +178,9 @@ macro_rules! adapter {
     (@call $ctx:ident, has, $handler:expr) => {
         $handler($ctx.home, $ctx.args, $ctx.sender)
     };
+    (@call $ctx:ident, har, $handler:expr) => {
+        $handler($ctx.home, $ctx.args, $ctx.runtime)
+    };
     (@call $ctx:ident, h, $handler:expr) => {
         $handler($ctx.home)
     };
@@ -798,10 +801,10 @@ action_adapter!(dispatch_schedule, "schedule", [
 ]);
 
 action_adapter!(dispatch_team, "team", [
-    "create" => task::handle_create_team,  ha;
+    "create" => task::handle_create_team,  har;
     "delete" => task::handle_delete_team,  ha;
     "list"   => task::handle_list_teams,   h;
-    "update" => task::handle_update_team,  ha;
+    "update" => task::handle_update_team,  har;
 ]);
 
 // `inbox` — branch on `args["action"]` then arg presence:
@@ -841,8 +844,12 @@ pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
 }
 
 pub(crate) fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
-    if ctx.runtime.is_some() {
-        return serde_json::json!({"error": "tui_screenshot requires TUI mode"});
+    if let Some(rt) = ctx.runtime {
+        let api_ctx = crate::mcp::handlers::runtime_bridge::api_ctx(ctx.home, rt);
+        let resp = crate::api::handlers::instance::handle_tui_screenshot(&api_ctx);
+        if resp["ok"].as_bool() == Some(true) {
+            return serde_json::json!({"svg": resp["svg"]});
+        }
     }
     match crate::api::call(
         ctx.home,

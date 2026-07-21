@@ -105,6 +105,21 @@ pub(super) fn create_team_in_process(
     Ok(handlers::team::handle_create_team(params, &ctx))
 }
 
+/// #2454: UPDATE_TEAM in-process.
+pub(super) fn update_team_in_process(
+    home: &Path,
+    runtime: Option<&RuntimeContext>,
+    params: &Value,
+) -> Result<Value, String> {
+    let Some(runtime) = runtime else {
+        return Err(
+            "runtime unavailable: update_team requires the in-process daemon runtime".to_string(),
+        );
+    };
+    let ctx = api_ctx(home, runtime);
+    Ok(handlers::team::handle_update_team(params, &ctx))
+}
+
 /// #2454: INJECT in-process via shared `agent_ops::inject_input`.
 #[allow(dead_code)] // available for future MCP inject tool paths
 pub(super) fn inject_in_process(
