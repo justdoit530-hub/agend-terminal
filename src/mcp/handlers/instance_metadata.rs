@@ -125,24 +125,45 @@ pub(super) fn handle_set_waiting_on(
     }
 }
 
-pub(super) fn handle_move_pane(home: &Path, args: &Value) -> Value {
-    // MCP arg is `instance`; the daemon RPC contract names the field `agent`.
+pub(super) fn handle_move_pane(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+) -> Value {
     let instance = args["instance"].as_str().unwrap_or("");
-    let params = json!({
-        "agent": instance,
-        "target_tab": args["target_tab"],
-        "split_dir": args["split_dir"],
-    });
-    match crate::api::call(
-        home,
-        &json!({"method": crate::api::method::MOVE_PANE, "params": params}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({"ok": true, "instance": instance, "target_tab": args["target_tab"]})
-        }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("move_pane failed")}),
-        Err(e) => json!({"error": format!("move_pane: {e}")}),
+    if instance.is_empty() {
+        return json!({"error": "move_pane: missing required parameter 'instance'"});
     }
+    if let Err(e) = crate::agent::validate_name(instance) {
+        return json!({"error": format!("move_pane: {e}")});
+    }
+    let target_tab = match args["target_tab"].as_str() {
+        Some(t) if !t.is_empty() => t,
+        _ => return json!({"error": "move_pane: missing target_tab"}),
+    };
+    let split_dir = crate::api::PaneMoveSplitDir::parse(
+        args["split_dir"].as_str().unwrap_or("horizontal"),
+    );
+
+    if let Some(rt) = runtime {
+        let reg = crate::agent::lock_registry(&rt.registry);
+        if !reg.values().any(|h| h.name.as_str() == instance) {
+            let in_fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+                .ok()
+                .map(|c| c.instances.contains_key(instance))
+                .unwrap_or(false);
+            if !in_fleet {
+                return json!({"error": format!("instance '{instance}' not found")});
+            }
+        }
+    }
+    crate::event_log::log(
+        home,
+        "move_pane",
+        instance,
+        &format!("target_tab={target_tab} split={split_dir:?}"),
+    );
+    json!({"ok": true, "instance": instance, "target_tab": args["target_tab"]})
 }
 
 pub(super) fn handle_pane_snapshot(

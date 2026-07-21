@@ -234,7 +234,9 @@ adapter!(
     ha,
     crate::api::handlers::agy_quota::handle_agy_quota
 );
-adapter!(dispatch_move_pane, ha, instance::handle_move_pane);
+pub(crate) fn dispatch_move_pane(ctx: &HandlerCtx<'_>) -> Value {
+    instance::handle_move_pane(ctx.home, ctx.args, ctx.runtime)
+}
 adapter!(
     dispatch_set_waiting_on,
     hais,
@@ -839,6 +841,9 @@ pub(crate) fn dispatch_inbox(ctx: &HandlerCtx<'_>) -> Value {
 }
 
 pub(crate) fn dispatch_tui_screenshot(ctx: &HandlerCtx<'_>) -> Value {
+    if ctx.runtime.is_some() {
+        return serde_json::json!({"error": "tui_screenshot requires TUI mode"});
+    }
     match crate::api::call(
         ctx.home,
         &serde_json::json!({"method": crate::api::method::TUI_SCREENSHOT, "params": {}}),
