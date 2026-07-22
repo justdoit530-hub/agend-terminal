@@ -5,6 +5,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar as _;
+use unicode_width::UnicodeWidthStr as _;
 
 pub(super) fn render_monitor_view(frame: &mut Frame, area: Rect) {
     let metrics = crate::instance_monitor::latest_metrics();
@@ -166,6 +168,31 @@ pub(super) fn render_fleet_view(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Truncate `s` so its display width is at most `max_w` columns.
+fn truncate_display(s: &str, max_w: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(1);
+        if w + cw > max_w {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
+/// Pad `s` with spaces so its display width equals exactly `col_w` columns.
+/// If `s` is already wider, return it as-is.
+fn pad_display(s: String, col_w: usize) -> String {
+    let used = s.as_str().width();
+    if used >= col_w {
+        return s;
+    }
+    format!("{}{}", s, " ".repeat(col_w - used))
+}
+
 fn build_agent_line<'a>(
     name: &str,
     metrics_map: &std::collections::HashMap<&str, &crate::instance_monitor::InstanceMetrics>,
@@ -193,16 +220,13 @@ fn build_agent_line<'a>(
 
     let task_str = agent_tasks
         .get(name)
-        .map(|t| {
-            let title: String = t.title.chars().take(28).collect();
-            title
-        })
-        .unwrap_or_else(|| "—".to_string());
+        .map(|t| pad_display(truncate_display(&t.title, 28), 30))
+        .unwrap_or_else(|| pad_display("—".to_string(), 30));
 
     let branch = crate::binding::read(home, name)
         .and_then(|v| v["branch"].as_str().map(String::from))
         .unwrap_or_else(|| "—".to_string());
-    let branch_short: String = branch.chars().take(18).collect();
+    let branch_short = pad_display(truncate_display(&branch, 18), 20);
 
     let symbol = if state == "stopped" { "○" } else { "●" };
     Line::from(vec![
@@ -216,14 +240,8 @@ fn build_agent_line<'a>(
         ),
         Span::styled(format!("{:<12}", state), Style::default().fg(health_color)),
         Span::styled(format!("{:<10}", health), Style::default().fg(health_color)),
-        Span::styled(
-            format!("{:<30}", task_str),
-            Style::default().fg(Color::White),
-        ),
-        Span::styled(
-            format!("{:<20}", branch_short),
-            Style::default().fg(Color::Blue),
-        ),
+        Span::styled(task_str, Style::default().fg(Color::White)),
+        Span::styled(branch_short, Style::default().fg(Color::Blue)),
     ])
 }
 
