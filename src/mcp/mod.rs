@@ -16,7 +16,7 @@ use serde_json::Value;
 /// Service boundary: single public entry point for MCP tool execution
 /// without a live RuntimeContext (tests / standalone bridge fallback).
 /// Production daemon path prefers [`execute_tool_with_runtime`].
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub fn execute_tool(tool_name: &str, args: &Value, instance_name: &str) -> Value {
     handlers::handle_tool(tool_name, args, instance_name)
 }
