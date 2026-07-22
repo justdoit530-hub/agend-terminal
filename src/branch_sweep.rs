@@ -151,6 +151,269 @@ fn enumerate_branches(repo: &Path) -> Result<Vec<BranchInfo>, String> {
     Ok(branches)
 }
 
+fn checked_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+    let output = crate::git_helpers::git_bypass_timeout(
+        repo,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        crate::git_helpers::LOCAL_GIT_TIMEOUT,
+    )
+    .map_err(|e| format!("git merge-base --is-ancestor {ancestor} {descendant}: {e}"))?;
+    if output.status.success() {
+        Ok(true)
+    } else if output.status.code() == Some(1) {
+        Ok(false)
+    } else {
+        Err(format!(
+            "git merge-base --is-ancestor {ancestor} {descendant}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn external_inventory(repo: &Path) -> ExternalInventory {
+    let local = match crate::git_helpers::git_cmd(
+        repo,
+        &["for-each-ref", "--format=%(objectname)", "refs/remotes/"],
+    ) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            return ExternalInventory::LookupFailed(format!(
+                "local remote-tracking ref enumeration failed: {e}"
+            ));
+        }
+    };
+
+    let remote = match crate::git_helpers::git_bypass_timeout(
+        repo,
+        &[
+            "ls-remote",
+            "--refs",
+            "origin",
+            "refs/heads/*",
+            "refs/pull/*/head",
+        ],
+        EXTERNAL_REF_PROBE_TIMEOUT,
+    ) {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+        Ok(output) => {
+            return ExternalInventory::LookupFailed(format!(
+                "origin refs/pull lookup failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Err(e) => {
+            return ExternalInventory::LookupFailed(format!(
+                "origin refs/pull lookup failed or timed out after {}s: {e}",
+                EXTERNAL_REF_PROBE_TIMEOUT.as_secs()
+            ));
+        }
+    };
+
+    let mut roots: Vec<String> = local
+        .lines()
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+        .map(String::from)
+        .chain(remote.lines().filter_map(|line| {
+            line.split_whitespace()
+                .next()
+                .filter(|sha| !sha.is_empty())
+                .map(String::from)
+        }))
+        .collect();
+    roots.sort();
+    roots.dedup();
+    ExternalInventory::Available(roots)
+}
+
+fn rev_list_count_excluding(
+    repo: &Path,
+    tip: &str,
+    exclusions: &[String],
+) -> Result<std::process::Output, String> {
+    let mut args = vec![
+        "rev-list".to_string(),
+        "--count".to_string(),
+        tip.to_string(),
+        "--not".to_string(),
+    ];
+    args.extend(exclusions.iter().cloned());
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::git_helpers::git_bypass_timeout(repo, &arg_refs, crate::git_helpers::LOCAL_GIT_TIMEOUT)
+        .map_err(|e| format!("git rev-list --count {tip}: {e}"))
+}
+
+fn parse_rev_list_count(output: &std::process::Output, context: &str) -> Result<usize, String> {
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-list {context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|e| format!("invalid rev-list count for {context}: {e}"))
+}
+
+fn unique_commit_count(
+    repo: &Path,
+    candidate: &BranchInfo,
+    base: &str,
+    branches: &[BranchInfo],
+    external_roots: &[String],
+) -> Result<usize, String> {
+    let mut exclusions: Vec<String> = vec![base.to_string()];
+    exclusions.extend(
+        branches
+            .iter()
+            .filter(|branch| branch.name != candidate.name)
+            .map(|branch| branch.tip_sha.clone()),
+    );
+    exclusions.extend(external_roots.iter().cloned());
+    exclusions.sort();
+    exclusions.dedup();
+
+    let output = rev_list_count_excluding(repo, &candidate.tip_sha, &exclusions)?;
+    parse_rev_list_count(&output, &format!("unique count for {}", candidate.name))
+}
+
+fn classify_preservation(
+    repo: &Path,
+    base: &str,
+    candidate: &BranchInfo,
+    branches: &[BranchInfo],
+    external: &ExternalInventory,
+) -> Result<PreservationEvidence, String> {
+    if checked_is_ancestor(repo, &candidate.tip_sha, base)? {
+        return Ok(PreservationEvidence {
+            classification: "MAIN_REACHABLE",
+            durable: false,
+            unique_commit_count: None,
+            note: format!(
+                "tip is currently reachable from {base}; current reachability is not durable preservation"
+            ),
+        });
+    }
+
+    let roots = match external {
+        ExternalInventory::LookupFailed(error) => {
+            return Ok(PreservationEvidence {
+                classification: "UNKNOWN_EXTERNAL_LOOKUP_FAILED",
+                durable: false,
+                unique_commit_count: None,
+                note: error.clone(),
+            });
+        }
+        ExternalInventory::Available(roots) => roots,
+    };
+
+    if roots.iter().any(|root| root == &candidate.tip_sha) {
+        return Ok(PreservationEvidence {
+            classification: "EXTERNALLY_REACHABLE_UNGUARANTEED",
+            durable: false,
+            unique_commit_count: None,
+            note: "candidate tip exactly matches a current external ref; external reachability is not durable preservation".to_string(),
+        });
+    }
+
+    if !roots.is_empty() {
+        // One graph walk answers whether the candidate tip is reachable from
+        // ANY external root. This keeps local work O(candidates), not
+        // O(candidates × refs), after the single cached remote probe.
+        let output = rev_list_count_excluding(repo, &candidate.tip_sha, roots)?;
+        if !output.status.success() {
+            return Ok(PreservationEvidence {
+                classification: "UNKNOWN_EXTERNAL_LOOKUP_FAILED",
+                durable: false,
+                unique_commit_count: None,
+                note: format!(
+                    "external ref ancestry could not be proven from local objects: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        if parse_rev_list_count(&output, "external reachability")? == 0 {
+            return Ok(PreservationEvidence {
+                classification: "EXTERNALLY_REACHABLE_UNGUARANTEED",
+                durable: false,
+                unique_commit_count: None,
+                note: "candidate tip is currently reachable from an external ref; external reachability is not durable preservation".to_string(),
+            });
+        }
+    }
+
+    let count = unique_commit_count(repo, candidate, base, branches, roots)?;
+    Ok(PreservationEvidence {
+        classification: "ORPHANED_UNIQUE",
+        durable: false,
+        unique_commit_count: Some(count),
+        note: "external inventory succeeded; count is current unique reachability, not deletion authorization"
+            .to_string(),
+    })
+}
+
+pub(crate) fn dry_run_observability(
+    repo: &Path,
+    base: &str,
+    categories: &Categories,
+) -> Result<(serde_json::Value, Vec<SpikeResidueAnnotation>), String> {
+    let branches = enumerate_branches(repo)?;
+    let by_name: std::collections::HashMap<&str, &BranchInfo> = branches
+        .iter()
+        .map(|branch| (branch.name.as_str(), branch))
+        .collect();
+    let spike_residue = branches
+        .iter()
+        .filter(|branch| branch.name.starts_with("spike/"))
+        .map(|branch| SpikeResidueAnnotation {
+            name: branch.name.clone(),
+            tip_sha: branch.tip_sha.clone(),
+            annotation: "SPIKE_RESIDUE",
+        })
+        .collect();
+
+    let mut needs_external = false;
+    for candidate in &categories.reviewer_checkout {
+        // A reviewer branch may have been deleted between scan() and this
+        // observability call (concurrent cleanup, worktree release, manual
+        // deletion). Skip absent branches instead of aborting the dry-run.
+        let Some(branch) = by_name.get(candidate.name.as_str()) else {
+            continue;
+        };
+        if !checked_is_ancestor(repo, &branch.tip_sha, base)? {
+            needs_external = true;
+            break;
+        }
+    }
+    let external = if needs_external {
+        external_inventory(repo)
+    } else {
+        ExternalInventory::Available(Vec::new())
+    };
+
+    let mut serialized = serde_json::to_value(categories)
+        .map_err(|e| format!("serialize branch sweep categories: {e}"))?;
+    let reviewer_candidates = serialized["reviewer_checkout"]
+        .as_array_mut()
+        .ok_or_else(|| "serialized reviewer_checkout was not an array".to_string())?;
+    for candidate in reviewer_candidates {
+        let name = candidate["name"]
+            .as_str()
+            .ok_or_else(|| "serialized reviewer candidate missing name".to_string())?;
+        // Same as above: skip absent reviewer branches instead of aborting.
+        let Some(branch) = by_name.get(name) else {
+            continue;
+        };
+        let evidence = classify_preservation(repo, base, branch, &branches, &external)?;
+        candidate["preservation"] = serde_json::to_value(evidence)
+            .map_err(|e| format!("serialize preservation evidence for {name}: {e}"))?;
+    }
+    Ok((serialized, spike_residue))
+}
+
 /// Returns true if `branch` is reachable from `base` via a merge
 /// commit (`git branch --merged base` includes it). Used to detect
 /// the `clean_merged` category.
@@ -645,12 +908,15 @@ pub(crate) fn emit_delete_batch_with_context(
             continue;
         };
         let is_reviewer = categories.reviewer_checkout.iter().any(|c| c.name == *name);
+        let is_stale_idle = categories.stale_idle.iter().any(|c| c.name == *name);
         let provenance = if is_reviewer {
             crate::worktree::disposition::BranchProvenance::ReviewerResidue
         } else if categories.clean_merged.iter().any(|c| c.name == *name) {
             crate::worktree::disposition::BranchProvenance::Merged
         } else if categories.squash_merged.iter().any(|c| c.name == *name) {
             crate::worktree::disposition::BranchProvenance::SquashMerged
+        } else if is_stale_idle {
+            crate::worktree::disposition::BranchProvenance::StaleIdle
         } else {
             // `active_unknown` has no terminal provenance and therefore
             // remains fail-closed in the shared classifier.
@@ -714,7 +980,7 @@ pub(crate) fn emit_delete_batch_with_context(
             skipped.push(serde_json::json!({"branch": name, "blocker": blocker}));
             continue;
         }
-        let recovery_ref = if is_reviewer {
+        let recovery_ref = if is_reviewer || is_stale_idle {
             Some(prepare_branch_recovery(
                 home,
                 repo,
