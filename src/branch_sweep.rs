@@ -26,6 +26,38 @@
 
 use std::path::Path;
 
+/// PR-A preservation classification is dry-run observability only. None of
+/// these values participate in `candidate_ids`, confirmation, or apply.
+#[allow(dead_code)]
+#[derive(Debug, serde::Serialize)]
+struct PreservationEvidence {
+    classification: &'static str,
+    durable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unique_commit_count: Option<usize>,
+    note: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct SpikeResidueAnnotation {
+    name: String,
+    tip_sha: String,
+    annotation: &'static str,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum ExternalInventory {
+    Available(Vec<String>),
+    LookupFailed(String),
+}
+
+/// Keep a network-backed dry-run probe below the MCP proxy budget. The result
+/// is computed once and reused for every reviewer candidate in the scan.
+#[allow(dead_code)]
+const EXTERNAL_REF_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Threshold for `stale_idle` category. Branches whose tip commit
 /// committer-date is older than this AND not merged AND not squash-
 /// merged land in `stale_idle`. Operator can override via
@@ -151,6 +183,7 @@ fn enumerate_branches(repo: &Path) -> Result<Vec<BranchInfo>, String> {
     Ok(branches)
 }
 
+#[allow(dead_code)]
 fn checked_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
     let output = crate::git_helpers::git_bypass_timeout(
         repo,
@@ -170,6 +203,7 @@ fn checked_is_ancestor(repo: &Path, ancestor: &str, descendant: &str) -> Result<
     }
 }
 
+#[allow(dead_code)]
 fn external_inventory(repo: &Path) -> ExternalInventory {
     let local = match crate::git_helpers::git_cmd(
         repo,
@@ -228,6 +262,7 @@ fn external_inventory(repo: &Path) -> ExternalInventory {
     ExternalInventory::Available(roots)
 }
 
+#[allow(dead_code)]
 fn rev_list_count_excluding(
     repo: &Path,
     tip: &str,
@@ -245,6 +280,7 @@ fn rev_list_count_excluding(
         .map_err(|e| format!("git rev-list --count {tip}: {e}"))
 }
 
+#[allow(dead_code)]
 fn parse_rev_list_count(output: &std::process::Output, context: &str) -> Result<usize, String> {
     if !output.status.success() {
         return Err(format!(
@@ -258,6 +294,7 @@ fn parse_rev_list_count(output: &std::process::Output, context: &str) -> Result<
         .map_err(|e| format!("invalid rev-list count for {context}: {e}"))
 }
 
+#[allow(dead_code)]
 fn unique_commit_count(
     repo: &Path,
     candidate: &BranchInfo,
@@ -280,6 +317,7 @@ fn unique_commit_count(
     parse_rev_list_count(&output, &format!("unique count for {}", candidate.name))
 }
 
+#[allow(dead_code)]
 fn classify_preservation(
     repo: &Path,
     base: &str,
@@ -355,6 +393,7 @@ fn classify_preservation(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn dry_run_observability(
     repo: &Path,
     base: &str,
@@ -1167,6 +1206,24 @@ pub(crate) fn prepare_branch_recovery(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn add_local_bare_origin(repo: &Path) -> PathBuf {
+        let origin = repo.parent().expect("repo parent").join("origin.git");
+        git_run(
+            repo,
+            &["init", "--bare", origin.to_str().expect("origin path")],
+        );
+        git_run(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().expect("origin path"),
+            ],
+        );
+        origin
+    }
 
     // ── #852 PR-C — reviewer_checkout pattern unit tests ──────────────
 
