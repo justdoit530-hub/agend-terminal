@@ -98,7 +98,7 @@ pub(crate) fn handle_force_release_worktree(
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
-    match rebase_clean_self(home, agent, branch) {
+    match rebase_clean_self(home, agent, branch, source_repo_hint.as_deref(), _sender.as_ref().map(Sender::as_str)) {
         Ok(o) => {
             // #826 L2 GC: when the binding-clear path short-circuited
             // on "no binding" (the post-disband state), the
@@ -143,13 +143,98 @@ pub(super) struct RebaseCleanOutcome {
 /// `agent::validate_name` + `agent_ops::validate_branch` respectively.
 /// This helper trusts its callers; the path-safety guard below is
 /// defense-in-depth, not the primary validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TargetState {
+    Absent,
+    Present,
+}
+
+pub(crate) fn classify_target(path: &Path) -> Result<TargetState, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => Ok(TargetState::Present),
+        Ok(_) => Err(format!(
+            "force release refused: opaque target metadata at {}",
+            path.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TargetState::Absent),
+        Err(e) => Err(format!(
+            "force release refused: opaque target metadata at {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn canonical_repo(path: &Path) -> Result<PathBuf, String> {
+    if !path.exists() {
+        return Err(format!(
+            "force release refused: owning repository '{}' is unreadable",
+            path.display()
+        ));
+    }
+    path.canonicalize().map_err(|e| {
+        format!(
+            "force release refused: canonicalize '{}': {e}",
+            path.display()
+        )
+    })
+}
+
+fn marker_field(worktree: &Path, field: &str) -> Option<String> {
+    std::fs::read_to_string(worktree.join(crate::worktree_pool::MANAGED_MARKER))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{field}=")))
+        .map(|s| s.trim().to_string())
+}
+
+fn unbound(home: &Path, agent: &str, branch: &str, repo: Option<&Path>) -> Result<PathBuf, String> {
+    let legacy = crate::worktree::worktree_path(home, agent, branch);
+    if matches!(classify_target(&legacy)?, TargetState::Present) {
+        return Ok(legacy);
+    }
+    let Some(repo) = repo else {
+        return Ok(legacy);
+    };
+    let repo = canonical_repo(repo)?;
+    let entries = match std::fs::read_dir(home.join("worktrees")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(legacy),
+        Err(error) => return Err(format!("force release refused: unreadable pool: {error}")),
+    };
+    let prefix = format!("{agent}-");
+    let mut found = None;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("force release refused: unreadable entry: {e}"))?;
+        let path = entry.path();
+        if !entry.file_name().to_string_lossy().starts_with(&prefix)
+            || marker_field(&path, "agent").as_deref() != Some(agent)
+            || marker_field(&path, "branch").as_deref() != Some(branch)
+        {
+            continue;
+        }
+        let marker_repo = marker_field(&path, "source_repo").ok_or("target missing source_repo")?;
+        if canonical_repo(Path::new(&marker_repo))? != repo {
+            continue;
+        }
+        if found.replace(path).is_some() {
+            return Err("force release refused: ambiguous exact managed targets".to_string());
+        }
+    }
+    Ok(found.unwrap_or(legacy))
+}
+
 pub(super) fn rebase_clean_self(
     home: &Path,
     agent: &str,
     branch: &str,
+    explicit_repo: Option<&Path>,
+    _sender: Option<&str>,
 ) -> Result<RebaseCleanOutcome, String> {
+    if branch.is_empty() {
+        return Err("refuses to clean path outside the daemon worktree pool".to_string());
+    }
     let worktrees_root = home.join("worktrees");
-    let target = worktrees_root.join(agent).join(branch);
+    let target = unbound(home, agent, branch, explicit_repo)?;
     let safe = target.starts_with(&worktrees_root)
         && target != worktrees_root
         && target != worktrees_root.join(agent);
@@ -203,7 +288,17 @@ pub(super) fn rebase_clean_self(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn git_bypassed(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    }
 
     fn tmp_home(suffix: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -474,7 +569,7 @@ mod tests {
         let home = tmp_home("rebase-clean-existing");
         let dir = seed_daemon_worktree(&home, "dev", "feat/rebase-x");
         assert!(dir.exists());
-        let outcome = rebase_clean_self(&home, "dev", "feat/rebase-x")
+        let outcome = rebase_clean_self(&home, "dev", "feat/rebase-x", None, None)
             .expect("clean state in pool must succeed");
         assert!(outcome.dir_existed);
         assert!(outcome.dir_removed);
@@ -491,7 +586,7 @@ mod tests {
         // No prior bind, no stale dir → helper still runs release_full
         // (idempotent) and reports dir_existed=false.
         let home = tmp_home("rebase-clean-idempotent");
-        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed")
+        let outcome = rebase_clean_self(&home, "dev", "feat/never-existed", None, None)
             .expect("helper must not error on clean state");
         assert!(!outcome.dir_existed);
         assert!(!outcome.dir_removed);
@@ -595,7 +690,7 @@ mod tests {
         let home = tmp_home("rebase-outside-pool");
         // An empty branch resolves to <home>/worktrees/dev (the
         // agent-level dir) which the safety check rejects.
-        let r = rebase_clean_self(&home, "dev", "");
+        let r = rebase_clean_self(&home, "dev", "", None, None);
         assert!(r.is_err(), "empty branch must reject as path-unsafe");
         // A branch with `..` would also escape the pool — but
         // agent_ops::validate_branch already rejects those before this
