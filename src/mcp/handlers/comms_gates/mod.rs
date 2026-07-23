@@ -12,7 +12,7 @@ mod evidence_gate;
 mod sha_gate;
 
 // Report-path gates (handle_report_result).
-pub(super) use evidence_gate::{check_evidence_gate, cross_check_and_log};
+pub(super) use evidence_gate::{check_evidence_gate, check_test_count_gate, cross_check_and_log};
 // #t-127: `detect_verdict` + `Verdict` are also consumed by the api-layer
 // dispatch tracker (the verdict→review-task bridge in `track_dispatch`), so they
 // are crate-visible, not just `pub(super)`.

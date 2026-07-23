@@ -276,6 +276,56 @@ pub(crate) fn ci_check_for_report(home: &std::path::Path, summary: &str) -> CiCh
     }
 }
 
+// ── #TEST_COUNT: VERIFIED test-count gate ────────────────────────────────────
+//
+// A VERIFIED verdict whose Evidence block contains a `test result: ok. N passed`
+// line must have N ≥ MIN_VERIFIED_TEST_COUNT. This closes the "ran 1 test →
+// VERIFIED" loophole: agy-worker ran a single named test (`cargo test
+// coalesce_falls_back_to_append → 1 passed`) and reported VERIFIED — the
+// evidence-presence gate passed (cargo token present), but the count betrayed
+// the sub-suite run. Gate only fires when the line IS present; absence of a
+// test result line is handled by the Phase-A evidence gate upstream.
+// VERIFIED-only: REJECTED verdicts legitimately abort early without a full run.
+
+/// agend-terminal currently has ~4 800 tests. 3 000 is a generous buffer for
+/// natural test-count drift (additions and deletions) while still catching any
+/// sub-suite or single-test run.
+const MIN_VERIFIED_TEST_COUNT: u64 = 3_000;
+
+/// Parse the first `test result: ok. N passed` line found in `body`.
+/// Returns `None` when no such line is present (gate stays silent).
+pub(crate) fn parse_test_pass_count(body: &str) -> Option<u64> {
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"test result:\s*ok\.\s*(\d+)\s*passed")
+            .expect("BUG: test_count regex must compile")
+    });
+    let caps = RE.captures(body)?;
+    caps.get(1)?.as_str().parse().ok()
+}
+
+/// #TEST_COUNT: reject a VERIFIED verdict whose reported test-pass count is
+/// below [`MIN_VERIFIED_TEST_COUNT`]. Only fires when a `test result: ok.`
+/// line is present — no line present means the Phase-A evidence gate is the
+/// enforcement path. UNVERIFIED and REJECTED are exempt.
+pub(crate) fn check_test_count_gate(body: &str, verdict: Verdict) -> Result<(), String> {
+    if !matches!(verdict, Verdict::Verified) {
+        return Ok(());
+    }
+    let Some(count) = parse_test_pass_count(body) else {
+        return Ok(()); // no test-result line → gate doesn't fire
+    };
+    if count >= MIN_VERIFIED_TEST_COUNT {
+        return Ok(());
+    }
+    Err(format!(
+        "VERIFIED verdict shows only {count} test(s) passed — agend-terminal has \
+         ~4 800 tests; a sub-suite run is not sufficient for a VERIFIED verdict. \
+         Run `cargo test --bin agend-terminal` (full suite, ≥{MIN_VERIFIED_TEST_COUNT} \
+         expected) and re-send with the final summary line \
+         (`test result: ok. N passed; ...`)."
+    ))
+}
+
 /// #1666 Phase B: run the WARN-first cross-check with the production deps and LOG
 /// each warning. WARN-ONLY — the caller still delivers the verdict; this only
 /// emits observability so we can measure the false-positive rate. Kept here
@@ -519,6 +569,69 @@ mod tests {
         assert!(
             warns.is_empty(),
             "undeterminable CI repo must not warn: {warns:?}"
+        );
+    }
+
+    // ── #TEST_COUNT: test-count gate ─────────────────────────────────────────
+
+    #[test]
+    fn test_count_gate_full_suite_passes() {
+        let body = "VERIFIED\n### Evidence\nran: cargo test --bin agend-terminal \
+                    → test result: ok. 4817 passed; 0 failed; 15 ignored";
+        assert!(check_test_count_gate(body, Verdict::Verified).is_ok());
+    }
+
+    #[test]
+    fn test_count_gate_single_test_rejects() {
+        // The agy-worker failure mode: ran a single named test.
+        let body = "VERIFIED\n### Evidence\nran: cargo test coalesce_falls_back_to_append \
+                    → test result: ok. 1 passed; 0 failed";
+        let r = check_test_count_gate(body, Verdict::Verified);
+        assert!(r.is_err(), "1-test VERIFIED must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn test_count_gate_below_threshold_rejects() {
+        let body = "VERIFIED\ntest result: ok. 42 passed; 0 failed";
+        let r = check_test_count_gate(body, Verdict::Verified);
+        assert!(r.is_err(), "sub-threshold count must be rejected: {r:?}");
+    }
+
+    #[test]
+    fn test_count_gate_no_result_line_passes() {
+        // No `test result:` line → gate stays silent; Phase-A handles evidence.
+        let body = "VERIFIED\n### Evidence\nran: cargo test --bin agend-terminal → Finished";
+        assert!(check_test_count_gate(body, Verdict::Verified).is_ok());
+    }
+
+    #[test]
+    fn test_count_gate_rejected_exempt() {
+        // REJECTED can legitimately abort early before full suite.
+        let body = "REJECTED\ntest result: ok. 1 passed; 0 failed";
+        assert!(check_test_count_gate(body, Verdict::Rejected).is_ok());
+    }
+
+    #[test]
+    fn test_count_gate_unverified_exempt() {
+        let body = "UNVERIFIED\ntest result: ok. 1 passed; 0 failed";
+        assert!(check_test_count_gate(body, Verdict::Unverified).is_ok());
+    }
+
+    #[test]
+    fn parse_test_pass_count_variants() {
+        assert_eq!(
+            parse_test_pass_count("test result: ok. 4817 passed; 0 failed; 15 ignored"),
+            Some(4817)
+        );
+        assert_eq!(
+            parse_test_pass_count("test result:  ok.  100  passed"),
+            Some(100)
+        );
+        assert_eq!(parse_test_pass_count("no result here"), None);
+        // FAILED result must not match (gate only fires on ok.)
+        assert_eq!(
+            parse_test_pass_count("test result: FAILED. 1 passed; 1 failed"),
+            None
         );
     }
 
