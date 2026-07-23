@@ -82,8 +82,15 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
     }
 
     if args["rebase_mode"].as_bool().unwrap_or(false) {
-        if let Err(e) = crate::mcp::handlers::force_release::rebase_clean_self(home, agent, branch)
-        {
+        let source_repo_hint = source_repo_arg.map(Path::new);
+        let sender_str = sender.as_ref().map(Sender::as_str);
+        if let Err(e) = crate::mcp::handlers::force_release::rebase_clean_self(
+            home,
+            agent,
+            branch,
+            source_repo_hint,
+            sender_str,
+        ) {
             return json!({"error": e, "code": "path_outside_pool"});
         }
     }
