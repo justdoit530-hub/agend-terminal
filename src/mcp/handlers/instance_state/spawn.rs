@@ -19,6 +19,7 @@ pub(super) fn spawn_single_instance(
     runtime: Option<&crate::mcp::handlers::dispatch::RuntimeContext>,
 ) -> Value {
     // #2454 Slice 2: in-process SPAWN when runtime is available.
+    #[allow(clippy::type_complexity)]
     let spawn_fn: Box<dyn Fn(&Path, &Value) -> anyhow::Result<Value>> =
         if let Some(rt) = runtime {
             let reg = rt.registry.clone();
