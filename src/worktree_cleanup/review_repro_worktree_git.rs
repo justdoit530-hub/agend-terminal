@@ -115,13 +115,13 @@ fn prune_keeps_remote_gone_branch_with_unpushed_commits_worktree_git() {
         "precondition: branch must exist before prune"
     );
 
-    let pruned = prune_orphaned_branches(&repo);
+    let pruned = prune_orphaned_branches(&repo, false);
 
     // CORRECT: a remote-gone branch with committed-but-unpushed local work that
     // is NOT in the default branch must be KEPT (its commits are otherwise
     // unrecoverable after `git branch -D`).
     assert!(
-        !pruned.iter().any(|b| b == "feat/unpushed"),
+        !pruned.iter().any(|b| b.0 == "feat/unpushed"),
         "remote-gone branch with unpushed local commits must NOT be force-deleted: {pruned:?}"
     );
     assert!(

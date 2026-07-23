@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+mod occupancy;
+pub(crate) use occupancy::{binding_scan_all_strict, bound_worktree_paths_or_ambiguous, is_in_use};
+
 /// Returns true unless `AGEND_WORKTREE_AUTO_CLEANUP` is explicitly set to "0".
 /// Cleanup is on by default — set `AGEND_WORKTREE_AUTO_CLEANUP=0` to disable.
 pub fn auto_cleanup_enabled() -> bool {
@@ -211,91 +214,8 @@ fn remove_worktree(
     wt_ok
 }
 
-/// Normalize a path: strip Windows `\\?\` UNC prefix.
-fn normalize_path(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy();
-    PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string())
-}
-
-/// Canonicalize `p`, or — when it does not exist yet — resolve symlinks on its
-/// longest EXISTING ancestor and re-append the missing tail. Returns `None`
-/// only when not even an existing ancestor canonicalizes.
-///
-/// #worktree-git-7: an active agent's `working_dir` recorded through a symlink
-/// alias whose leaf is transiently absent (mid-creation) would fail
-/// `canonicalize()` outright; the prior fail-OPEN fell back to the raw path,
-/// whose textual prefix misses the canonical worktree → `is_in_use` returned
-/// false and the sweep could remove a worktree out from under a live agent.
-fn canonicalize_lenient(p: &Path) -> Option<PathBuf> {
-    if let Ok(c) = p.canonicalize() {
-        return Some(c);
-    }
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut cur = p;
-    while let Some(parent) = cur.parent() {
-        if let Some(name) = cur.file_name() {
-            tail.push(name);
-        }
-        if let Ok(c) = parent.canonicalize() {
-            let mut out = c;
-            out.extend(tail.iter().rev());
-            return Some(out);
-        }
-        cur = parent;
-    }
-    None
-}
-
-/// #t-…81457-1: distinct `worktree` paths of every LIVE `binding.json`, for
-/// the delete-path occupancy check (mirrors `binding::bound_source_repos`'s
-/// self-healing shape, but this one MUST distinguish "no binding.json"
-/// (normal — agent never bound) from "binding.json exists but failed to
-/// read/parse" (ambiguous — may be hiding a live binding). `Err` signals the
-/// latter; the caller fails the whole sweep round closed rather than treat
-/// an ambiguous row as absent.
-fn bound_worktree_paths_or_ambiguous(home: &Path) -> Result<Vec<PathBuf>, ()> {
-    let Ok(entries) = std::fs::read_dir(crate::paths::runtime_dir(home)) else {
-        return Ok(Vec::new());
-    };
-    let mut paths = Vec::new();
-    for entry in entries.flatten() {
-        let agent = entry.file_name().to_string_lossy().into_owned();
-        let content = match std::fs::read_to_string(crate::paths::binding_path(home, &agent)) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(()),
-        };
-        let v: serde_json::Value = serde_json::from_str(&content).map_err(|_| ())?;
-        if let Some(wt) = v["worktree"].as_str() {
-            let path = PathBuf::from(wt);
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-        }
-    }
-    Ok(paths)
-}
-
-/// Check if a worktree path is in use by any active agent.
-fn is_in_use(wt_path: &Path, active_dirs: &[PathBuf]) -> bool {
-    let wt_norm = normalize_path(
-        &wt_path
-            .canonicalize()
-            .unwrap_or_else(|_| wt_path.to_path_buf()),
-    );
-    active_dirs.iter().any(|wd| match canonicalize_lenient(wd) {
-        Some(canon) => {
-            let wd_norm = normalize_path(&canon);
-            wd_norm.starts_with(&wt_norm) || wd.starts_with(wt_path)
-        }
-        // Fail-CLOSED: not even an existing ancestor canonicalizes, so we cannot
-        // prove this active dir is outside the worktree. Treat the ambiguity as
-        // in-use rather than risk sweeping a worktree a live agent is using.
-        None => true,
-    })
-}
-
-/// Runtime-based sweep: uses AgentConfig data to find repos and detect in-use worktrees.
+/// Runtime-based sweep: uses live `binding.json` state to find repos and
+/// AgentConfig working_dirs to detect in-use worktrees.
 ///
 /// `configs`: map of agent name → (working_dir, worktree_source) from daemon's live registry.
 /// `fleet_dirs`: fallback working_directories from fleet.yaml for stopped agents.
@@ -417,13 +337,21 @@ pub fn sweep_from_registry(
             }
         }
 
-        // Phase 2: prune orphaned branches (no worktree, remote gone or merged)
-        prune_stale_worktrees(repo);
-        let pruned = prune_orphaned_branches(repo);
-        for branch in pruned {
-            removed.push((branch, String::new()));
+        // Phase 2: prune orphaned branches (no worktree, remote gone or merged).
+        // PR-D6: sweep is always live now (gated by AUTO_CLEANUP only), so the
+        // helpers' still-supported `dry_run` param is passed `false` here.
+        prune_stale_worktrees(repo, false);
+        let pruned = prune_orphaned_branches_with_home(Some(home), repo, false);
+        for (branch, _reason) in pruned {
+            removed.push((branch, "(no worktree)".to_string()));
         }
     }
+    // Durable retry: settle any cleanup intents whose branches are now
+    // confirmed merged. This is the retry consumer for intents that survived
+    // a failed poller settlement or whose CI watch was removed before the
+    // settlement succeeded.
+    crate::cleanup_intents::sweep_settle_merged(home);
+    crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
     removed
 }
 
@@ -435,6 +363,35 @@ pub fn sweep_from_registry(
 /// genuinely-orphaned squash-merged branch's tip predates the merge, so it
 /// clears this floor on the next sweep.
 const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+const REVIEW_SCAFFOLD_TTL: Duration = Duration::from_secs(72 * 60 * 60);
+
+
+fn is_stale_review_scaffold(repo_root: &Path, branch: &str) -> bool {
+    if !crate::branch_sweep::is_reviewer_checkout(branch) {
+        return false;
+    }
+    let Some((_, tip_ts)) = branch_tip_info(repo_root, branch) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Duration::from_secs(now.saturating_sub(tip_ts)) >= REVIEW_SCAFFOLD_TTL
+}
+
+fn branch_reap_delete(provably_in_default: bool, remote_gone: bool, scaffold_ttl: bool) -> bool {
+    use crate::worktree::disposition::{branch_disposition, BranchDisposition, BranchSignal};
+    let signal = if provably_in_default {
+        BranchSignal::ProvablyInDefault
+    } else if remote_gone {
+        BranchSignal::RemoteGoneOnly
+    } else {
+        BranchSignal::NotMerged
+    };
+    matches!(branch_disposition(signal), BranchDisposition::DeleteBranch) || scaffold_ttl
+}
 
 /// #1750-B3: age of `branch`'s tip commit (committer date), or `None` if it
 /// can't be resolved. `%ct` is a unix timestamp (seconds), so no date parsing.
@@ -459,10 +416,62 @@ fn is_squash_gc_eligible(repo_root: &Path, branch: &str, default: &str) -> bool 
         && branch_tip_age(repo_root, branch).is_some_and(|age| age >= SQUASH_GC_MIN_TIP_AGE)
 }
 
+pub(crate) fn branch_has_active_binding(home: &Path, repo: &Path, branch: &str) -> Option<bool> {
+    branch_has_other_active_binding(home, repo, branch, None)
+}
+
+pub(crate) fn branch_has_other_active_binding(
+    home: &Path,
+    repo: &Path,
+    branch: &str,
+    excluded_worktree: Option<&str>,
+) -> Option<bool> {
+    let canonical_repo = std::fs::canonicalize(repo).ok()?;
+    let bindings = binding_scan_all_strict(home).ok()?;
+    for (_, binding) in bindings {
+        let bound_branch = binding["branch"]
+            .as_str()
+            .filter(|branch| !branch.is_empty())?;
+        let source = binding["source_repo"]
+            .as_str()
+            .filter(|source| !source.is_empty())?;
+        // #2874: canonicalize once; skip rows proven unrelated before worktree identity.
+        let cs = std::fs::canonicalize(source);
+        if matches!(&cs, Ok(s) if bound_branch != branch || *s != canonical_repo) {
+            continue;
+        }
+        if excluded_worktree.is_some() && binding["worktree"].as_str().is_none_or(str::is_empty) {
+            return None;
+        }
+        if excluded_worktree
+            .zip(binding["worktree"].as_str())
+            .is_some_and(|(excluded, bound)| excluded == bound)
+        {
+            continue;
+        }
+        return if cs.is_ok() { Some(true) } else { None };
+    }
+    Some(false)
+}
+
 /// Run `git worktree prune` then delete local branches whose remote tracking
 /// ref is gone, that are merged into main, or that are squash-merge orphans
 /// (#1750-B3). Skips branches checked out in any worktree.
-fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
+///
+/// #2605: `dry_run` computes the exact same eligibility (merged/squash gate,
+/// worktree-occupancy skip) but skips the actual `git branch -D` — eligible
+/// branches are still returned (with their real reason: `"merged"` or
+/// `"squash-merged"`) so the caller can log/audit the candidate list.
+#[allow(dead_code)]
+fn prune_orphaned_branches(repo_root: &Path, dry_run: bool) -> Vec<(String, &'static str)> {
+    prune_orphaned_branches_with_home(None, repo_root, dry_run)
+}
+
+fn prune_orphaned_branches_with_home(
+    home: Option<&Path>,
+    repo_root: &Path,
+    dry_run: bool,
+) -> Vec<(String, &'static str)> {
     let default = crate::git_helpers::default_branch(repo_root);
     // Collect branches currently checked out in worktrees — cannot delete these
     let wt_branches: HashSet<String> = list_worktrees(repo_root)
@@ -480,6 +489,11 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
                 .collect(),
             _ => return Vec::new(),
         };
+    // Snapshot the open-PR inventory once for this repository/sweep.  Each
+    // branch below consumes the bounded snapshot instead of issuing its own
+    // synchronous SCM lookup; an Unknown snapshot keeps all terminal
+    // candidates fail-closed.
+    let open_pr_snapshot = crate::branch_sweep::open_pr_snapshot(repo_root, &default);
 
     let mut pruned = Vec::new();
     for branch in &branches {
@@ -503,21 +517,121 @@ fn prune_orphaned_branches(repo_root: &Path) -> Vec<String> {
         // (which no longer excludes the gone case) instead of the unguarded
         // remote-gone trigger.
         let squash = !merged && is_squash_gc_eligible(repo_root, branch, &default);
-        if !merged && !squash {
+        // PR-A P1 (branch-residue RCA §3): disposable reviewer-checkout
+        // scaffolding (review/* etc.) that is unoccupied (checked above) and
+        // aged past REVIEW_SCAFFOLD_TTL. These never carry a PR and never merge,
+        // so the merged/squash paths never reap them — a TTL is their only live
+        // terminal path (H1 in the RCA).
+        let scaffold = !merged && !squash && is_stale_review_scaffold(repo_root, branch);
+        let provenance = if merged {
+            crate::worktree::disposition::BranchProvenance::Merged
+        } else if squash {
+            crate::worktree::disposition::BranchProvenance::SquashMerged
+        } else if scaffold {
+            crate::worktree::disposition::BranchProvenance::ReviewerResidue
+        } else {
+            crate::worktree::disposition::BranchProvenance::Unknown
+        };
+        let task_active = match home {
+            Some(h) => crate::branch_sweep::branch_has_active_task(h, branch),
+            None => Some(false),
+        };
+        let binding_active = match home {
+            Some(h) => branch_has_active_binding(h, repo_root, branch),
+            None => Some(false),
+        };
+        let active_holder = match (wt_branches.contains(branch), binding_active) {
+            (true, _) | (_, Some(true)) => Some(true),
+            (false, Some(false)) => Some(false),
+            _ => None,
+        };
+        let open_pr = if merged || squash || scaffold {
+            match open_pr_snapshot.status_for(branch) {
+                crate::branch_sweep::OpenPrStatus::Open => Some(true),
+                crate::branch_sweep::OpenPrStatus::NotOpen => Some(false),
+                crate::branch_sweep::OpenPrStatus::Unknown => None,
+            }
+        } else {
+            // Unknown provenance is already a KEEP decision; avoid an
+            // unnecessary network probe for branches that cannot be deleted.
+            Some(false)
+        };
+        let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
+            &crate::worktree::disposition::BranchLifecycleInput {
+                provenance,
+                terminal: merged || squash || scaffold,
+                active_holder,
+                task_active,
+                open_pr,
+                // Reviewer residue is snapshotted into a recovery ref before
+                // deletion below; merged/squash work is already in `default`.
+                unique_unpreserved_work: Some(false),
+            },
+        );
+        // PR-D·D3: the reap decision (L4) delegates to `branch_disposition` via
+        // `branch_reap_delete`. `merged || squash` = ProvablyInDefault → delete;
+        // `scaffold` is the explicit external-arm override (a NotMerged branch the
+        // classifier keeps, aged past its TTL). Phase-2 does not compute remote-gone
+        // (CR-2026-06-14 dropped it as a trigger) → remote_gone=false. Byte-identical
+        // to the prior `!merged && !squash && !scaffold` continue-gate.
+        if !branch_reap_delete(merged || squash, false, scaffold)
+            || !matches!(
+                lifecycle,
+                crate::worktree::disposition::BranchLifecycleDisposition::Delete
+            )
+        {
             continue;
         }
-        let ok = crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
+        // The scaffolding path never merged, so its commits survive only in the
+        // object store once the branch ref is gone — capture the tip SHA BEFORE
+        // deletion so the log keeps them recoverable.
+        let scaffold_tip = if scaffold {
+            branch_tip_info(repo_root, branch).map(|(sha, _)| sha)
+        } else {
+            None
+        };
+        if scaffold && !dry_run {
+            if let Some(tip) = scaffold_tip.as_deref() {
+                if crate::branch_sweep::prepare_branch_recovery(
+                    home,
+                    repo_root,
+                    branch,
+                    tip,
+                    "review-scaffold-ttl",
+                )
+                .is_err()
+                {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        }
+        let ok = dry_run || crate::git_helpers::git_ok(repo_root, &["branch", "-D", branch]);
+        let reason = if merged {
+            "merged"
+        } else if squash {
+            "squash-merged"
+        } else {
+            "review-residue"
+        };
         if ok {
-            let reason = if merged { "merged" } else { "squash-merged" };
-            tracing::info!(branch, reason, "pruned orphaned branch");
-            pruned.push(branch.clone());
+            if dry_run {
+                tracing::info!(branch, reason, tip_sha = ?scaffold_tip, "would prune orphaned branch (dry-run)");
+            } else {
+                tracing::info!(branch, reason, tip_sha = ?scaffold_tip, "pruned orphaned branch");
+            }
+            pruned.push((branch.clone(), reason));
         }
     }
     pruned
 }
 
 /// Run `git worktree prune` to clean stale worktree bookkeeping entries.
-fn prune_stale_worktrees(repo_root: &Path) {
+fn prune_stale_worktrees(repo_root: &Path, dry_run: bool) {
+    if dry_run {
+        return;
+    }
     // W1.2: best-effort prune (result was already ignored).
     let _ = crate::git_helpers::git_ok(repo_root, &["worktree", "prune"]);
 }
@@ -854,9 +968,9 @@ mod tests {
             "no remote configured"
         );
 
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            pruned.iter().any(|b| b == "feat/squash-old"),
+            pruned.iter().any(|b| b.0 == "feat/squash-old"),
             "#1750-B3: a squash-merged orphan past the age floor must be auto-GC'd, got: {pruned:?}"
         );
         std::fs::remove_dir_all(&repo).ok();
@@ -882,9 +996,9 @@ mod tests {
             crate::branch_sweep::is_squash_merged(&repo, "main", "feat/squash-new"),
             "precondition: detected as squash-merged"
         );
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            !pruned.iter().any(|b| b == "feat/squash-new"),
+            !pruned.iter().any(|b| b.0 == "feat/squash-new"),
             "#1750-B3: a squash-merged branch under the tip-age floor must NOT be GC'd yet"
         );
         std::fs::remove_dir_all(&repo).ok();
@@ -905,9 +1019,9 @@ mod tests {
             !crate::branch_sweep::is_squash_merged(&repo, "main", "feat/wip"),
             "precondition: NOT squash-merged"
         );
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            !pruned.iter().any(|b| b == "feat/wip"),
+            !pruned.iter().any(|b| b.0 == "feat/wip"),
             "#1750-B3: a real unmerged branch must NOT be GC'd"
         );
         std::fs::remove_dir_all(&repo).ok();
@@ -925,9 +1039,9 @@ mod tests {
             &["worktree", "add", wt.to_str().unwrap(), "feat/squash-wt"],
         );
 
-        let pruned = prune_orphaned_branches(&repo);
+        let pruned = prune_orphaned_branches(&repo, false);
         assert!(
-            !pruned.iter().any(|b| b == "feat/squash-wt"),
+            !pruned.iter().any(|b| b.0 == "feat/squash-wt"),
             "#1750-B3: a squash-merged branch checked out in a worktree must NOT be GC'd"
         );
         std::fs::remove_dir_all(&repo).ok();
@@ -1255,6 +1369,9 @@ mod tests {
         std::fs::remove_dir_all(&remote_dir).ok();
     }
 }
+
+#[cfg(test)]
+mod lifecycle_r1_tests;
 
 #[cfg(test)]
 mod review_repro_worktree_git;

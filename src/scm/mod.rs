@@ -562,6 +562,10 @@ not_supported_provider!(BitbucketScmProvider, "bitbucket");
 // ---------------------------------------------------------------------------
 
 pub(crate) fn make_scm_provider(repo: &str, scm_override: Option<&str>) -> Box<dyn ScmProvider> {
+    #[cfg(test)]
+    if let Some(p) = TEST_SCM_PROVIDER.with(|c| c.borrow().clone()) {
+        return Box::new(TestScmHandle(p));
+    }
     let kind = match scm_override {
         Some(k) => k,
         None => crate::daemon::ci_watch::detect_provider_from_remote(repo).0,
@@ -572,6 +576,251 @@ pub(crate) fn make_scm_provider(repo: &str, scm_override: Option<&str>) -> Box<d
         // `detect_provider_from_remote` already defaults unknown/short-form
         // remotes to "github", so this arm is GitHub + any explicit "github".
         _ => Box::new(GitHubScmProvider),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #t-…24962-7 test seam: mock `gh` at the `make_scm_provider` boundary so any
+// call site can be driven without a live `gh` in unit/integration tests. Single
+// source of truth for gh mocking across the crate (lead seam-ownership ruling).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SCM_PROVIDER: std::cell::RefCell<Option<std::sync::Arc<dyn ScmProvider>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: install `provider` as the ScmProvider for the current thread until
+/// the returned guard drops; `make_scm_provider` then returns it verbatim
+/// (ignoring repo/override). Nextest runs each test on its own thread, so the
+/// override is isolated per test.
+#[cfg(test)]
+pub(crate) fn set_test_scm_provider(provider: std::sync::Arc<dyn ScmProvider>) -> TestScmGuard {
+    TEST_SCM_PROVIDER.with(|c| *c.borrow_mut() = Some(provider));
+    TestScmGuard
+}
+
+#[cfg(test)]
+#[must_use = "the mock provider is uninstalled when this guard is dropped"]
+pub(crate) struct TestScmGuard;
+
+#[cfg(test)]
+impl Drop for TestScmGuard {
+    fn drop(&mut self) {
+        TEST_SCM_PROVIDER.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Adapts the thread-local `Arc<dyn ScmProvider>` back into the `Box<dyn
+/// ScmProvider>` that `make_scm_provider` returns (a `dyn` value can't be moved
+/// out of the `Arc`). Delegates every method.
+#[cfg(test)]
+struct TestScmHandle(std::sync::Arc<dyn ScmProvider>);
+
+#[cfg(test)]
+impl ScmProvider for TestScmHandle {
+    fn pr_view(&self, r: &str, p: u64, f: &[&str]) -> anyhow::Result<PrSummary> {
+        self.0.pr_view(r, p, f)
+    }
+    fn pr_checks(&self, r: &str, p: u64) -> anyhow::Result<Vec<CheckState>> {
+        self.0.pr_checks(r, p)
+    }
+    fn pr_list(
+        &self,
+        r: &str,
+        f: &ListFilter,
+        fl: &[&str],
+        c: Option<&Path>,
+    ) -> anyhow::Result<Vec<PrSummary>> {
+        self.0.pr_list(r, f, fl, c)
+    }
+    fn pr_merge(&self, r: &str, p: u64, o: &MergeOpts) -> anyhow::Result<MergeOutcome> {
+        self.0.pr_merge(r, p, o)
+    }
+    fn issue_view(&self, r: &str, n: u64, f: &[&str]) -> anyhow::Result<IssueSummary> {
+        self.0.issue_view(r, n, f)
+    }
+    fn compare(&self, r: &str, b: &str, h: &str) -> anyhow::Result<CompareResult> {
+        self.0.compare(r, b, h)
+    }
+}
+
+/// A closure run inside [`MockScmProvider::compare`] before it returns — see
+/// [`MockScmProvider::with_compare_err_hook`].
+#[cfg(test)]
+type CompareHook = Box<dyn Fn() + Send + Sync>;
+
+/// Reusable [`ScmProvider`] test double. Only the methods a test configures are
+/// implemented; the rest panic to surface an unexpected call. Extend as new call
+/// sites need mocking (this is the single shared mock).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MockScmProvider {
+    pr_list: Option<MockPrList>,
+    pr_list_calls: std::sync::atomic::AtomicUsize,
+    pr_list_saw_base: std::sync::atomic::AtomicBool,
+    pr_list_saw_head: std::sync::atomic::AtomicBool,
+    pr_list_last_limit: std::sync::atomic::AtomicU32,
+    compare: Option<Result<CompareResult, String>>,
+    /// #2749 correction: counts `compare` invocations so a test can assert the
+    /// off-tick populator's retry-lease BACKOFF (one compare per lease, not per cycle).
+    compare_calls: std::sync::atomic::AtomicUsize,
+    /// #2749 R3: a hook run INSIDE `compare` before it returns, so a test can
+    /// inject an in-flight observation change (the delayed old-tuple Err race) and
+    /// prove the populator's full-tuple CAS discards the stale error.
+    compare_hook: Option<CompareHook>,
+}
+
+/// Configured `pr_list` behavior for [`MockScmProvider`].
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) enum MockPrList {
+    /// Return this many default PRs — non-empty ⇒ "the branch has/had a PR".
+    Prs(usize),
+    /// Return open PR summaries with the supplied head branch names.
+    Branches(Vec<String>),
+    /// Return an `Err` ⇒ a transient gh failure (a no-PR confirm must NOT release).
+    Fail(String),
+}
+
+#[cfg(test)]
+impl MockScmProvider {
+    pub(crate) fn with_pr_list(behavior: MockPrList) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pr_list: Some(behavior),
+            ..Default::default()
+        })
+    }
+
+    /// #2749 3b: a canned `compare` result — `behind_by` commits behind the base.
+    #[allow(dead_code)]
+    pub(crate) fn with_compare(behind_by: u64) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            compare: Some(Ok(CompareResult {
+                behind_by,
+                files: vec![],
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// #2749 3b: a `compare` that FAILS (a transient remote-forge error) — the
+    /// off-tick populator must stamp `freshness_error` without clobbering.
+    #[allow(dead_code)]
+    pub(crate) fn with_compare_err(msg: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            compare: Some(Err(msg.to_string())),
+            ..Default::default()
+        })
+    }
+
+    /// #2749 R3: a `compare` that runs `hook` and THEN fails — lets a test inject
+    /// an in-flight observation advance (A→B) during the compare and prove the
+    /// off-tick populator's FULL-TUPLE CAS discards the delayed base-A error (a
+    /// head-only CAS would wrongly stamp it onto the superseding base-B tuple).
+    #[allow(dead_code)]
+    pub(crate) fn with_compare_err_hook(
+        msg: &str,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            compare: Some(Err(msg.to_string())),
+            compare_hook: Some(Box::new(hook)),
+            ..Default::default()
+        })
+    }
+
+    /// #2749 correction: how many times `compare` has been invoked (backoff assert).
+    #[allow(dead_code)]
+    pub(crate) fn compare_calls(&self) -> usize {
+        self.compare_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pr_list_calls(&self) -> usize {
+        self.pr_list_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pr_list_saw_base(&self) -> bool {
+        self.pr_list_saw_base
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pr_list_saw_head(&self) -> bool {
+        self.pr_list_saw_head
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn pr_list_last_limit(&self) -> Option<u32> {
+        match self
+            .pr_list_last_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            limit => Some(limit),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ScmProvider for MockScmProvider {
+    fn pr_list(
+        &self,
+        _repo: &str,
+        filter: &ListFilter,
+        _fields: &[&str],
+        _cwd: Option<&Path>,
+    ) -> anyhow::Result<Vec<PrSummary>> {
+        self.pr_list_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.pr_list_saw_base
+            .store(filter.base.is_some(), std::sync::atomic::Ordering::Relaxed);
+        self.pr_list_saw_head
+            .store(filter.head.is_some(), std::sync::atomic::Ordering::Relaxed);
+        self.pr_list_last_limit.store(
+            filter.limit.unwrap_or_default(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        match &self.pr_list {
+            Some(MockPrList::Prs(n)) => Ok(vec![PrSummary::default(); *n]),
+            Some(MockPrList::Branches(branches)) => Ok(branches
+                .iter()
+                .map(|branch| PrSummary {
+                    head_ref: Some(branch.clone()),
+                    ..Default::default()
+                })
+                .collect()),
+            Some(MockPrList::Fail(msg)) => Err(anyhow::anyhow!(msg.clone())),
+            None => Ok(vec![]),
+        }
+    }
+    fn pr_view(&self, _r: &str, _p: u64, _f: &[&str]) -> anyhow::Result<PrSummary> {
+        unimplemented!("MockScmProvider::pr_view not configured")
+    }
+    fn pr_checks(&self, _r: &str, _p: u64) -> anyhow::Result<Vec<CheckState>> {
+        unimplemented!("MockScmProvider::pr_checks not configured")
+    }
+    fn pr_merge(&self, _r: &str, _p: u64, _o: &MergeOpts) -> anyhow::Result<MergeOutcome> {
+        unimplemented!("MockScmProvider::pr_merge not configured")
+    }
+    fn issue_view(&self, _r: &str, _n: u64, _f: &[&str]) -> anyhow::Result<IssueSummary> {
+        unimplemented!("MockScmProvider::issue_view not configured")
+    }
+    fn compare(&self, _r: &str, _b: &str, _h: &str) -> anyhow::Result<CompareResult> {
+        self.compare_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // #2749 R3: fire the in-flight hook (e.g. an observation advance) BEFORE
+        // returning, so a delayed old-tuple Err races a superseding observation.
+        if let Some(hook) = &self.compare_hook {
+            hook();
+        }
+        match &self.compare {
+            Some(Ok(r)) => Ok(r.clone()),
+            Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
+            None => unimplemented!("MockScmProvider::compare not configured"),
+        }
     }
 }
 
