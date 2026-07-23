@@ -460,6 +460,9 @@ pub(super) fn handle_report_result(
             if let Err(e) = super::comms_gates::check_evidence_gate(&evidence_body, verdict) {
                 return json!({"error": e});
             }
+            if let Err(e) = super::comms_gates::check_test_count_gate(&evidence_body, verdict) {
+                return json!({"error": e});
+            }
 
             if verdict == super::comms_gates::Verdict::Rejected {
                 let category = args["category"].as_str();
