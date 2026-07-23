@@ -805,6 +805,23 @@ pub fn find_agent_by_branch_or_task(
     None
 }
 
+pub(crate) fn binding_scan_all(home: &Path) -> Vec<(String, serde_json::Value)> {
+    let runtime_dir = crate::paths::runtime_dir(home);
+    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let agent_name = entry.file_name().to_string_lossy().into_owned();
+            let binding_path = entry.path().join("binding.json");
+            let content = std::fs::read_to_string(&binding_path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+            Some((agent_name, v))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

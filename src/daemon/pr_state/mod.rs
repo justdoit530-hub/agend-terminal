@@ -1002,6 +1002,9 @@ pub fn record_verdict(
         let repo = state.repo.clone();
         let branch = state.branch.clone();
         let label = verdict_label(&kind);
+        // Resolve binding identity before entering with_pr_state: local
+        // source_repo paths may require a git-origin subprocess.
+        let binding_recipient = resolve_binding_notify_recipient(home, &repo, &branch);
         // #2 (t-verdict-to-author-routing): capture the verdict notification under
         // the flock, enqueue it AFTER `with_pr_state` returns (self-IPC safety —
         // mirrors the scanner's #1629 deferred-emit pattern).
@@ -1020,7 +1023,7 @@ pub fn record_verdict(
             // it (no double-notify). REJECTED/UNVERIFIED never reach merge-ready,
             // so they always notify (the author must learn they need to fix).
             if !is_merge_ready(s) {
-                let recipient = resolve_notify_recipient(home, s);
+                let recipient = resolve_notify_recipient_precomputed(s, binding_recipient.as_deref());
                 let body = format_verdict_body(s, reviewer, label);
                 let msg = crate::inbox::InboxMessage::new_system(
                     "system:pr-state",
@@ -1095,11 +1098,66 @@ pub fn resolve_author(state: &PrState) -> String {
 /// existing `resolve_author` chain (`pr_author` → `subscribers[0]` → `fixup-lead`)
 /// unchanged. The binding lookup is a plain FS read (no flock / subprocess), so it
 /// is safe inside a `with_pr_state` closure.
+#[cfg(test)]
 pub fn resolve_notify_recipient(home: &Path, state: &PrState) -> String {
-    // #2117 P3b: branch-only scan (source_repo="") — "who holds this branch" for
-    // notify routing; cross-repo precision is not needed here.
-    crate::binding::scan_existing_branch_binding(home, "", &state.branch, "")
+    let binding_recipient = resolve_binding_notify_recipient(home, &state.repo, &state.branch);
+    resolve_notify_recipient_precomputed(state, binding_recipient.as_deref())
+}
+
+fn resolve_notify_recipient_precomputed(
+    state: &PrState,
+    binding_recipient: Option<&str>,
+) -> String {
+    binding_recipient
+        .map(str::to_owned)
         .unwrap_or_else(|| resolve_author(state))
+}
+
+/// Resolve a verdict recipient from all branch bindings without changing the
+/// generic lease scanner. Known repo matches win over legacy branch-only
+/// bindings regardless of directory enumeration order; a non-empty binding
+/// repo that cannot be resolved is never treated as legacy.
+fn resolve_binding_notify_recipient(home: &Path, repo: &str, branch: &str) -> Option<String> {
+    if repo.is_empty() || branch.is_empty() {
+        return None;
+    }
+    let canonical_repo =
+        crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(repo)?;
+    let mut legacy_recipient = None;
+    for (agent, binding) in crate::binding::binding_scan_all(home) {
+        if binding["branch"].as_str() != Some(branch) {
+            continue;
+        }
+        let Some(source_value) = binding.get("source_repo") else {
+            if legacy_recipient.is_none() {
+                legacy_recipient = Some(agent);
+            }
+            continue;
+        };
+        if source_value.is_null() {
+            if legacy_recipient.is_none() {
+                legacy_recipient = Some(agent);
+            }
+            continue;
+        }
+        let Some(source_repo) = source_value.as_str().map(str::trim) else {
+            continue;
+        };
+        if source_repo.is_empty() {
+            if legacy_recipient.is_none() {
+                legacy_recipient = Some(agent);
+            }
+            continue;
+        }
+        let source_slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(source_repo)
+            .or_else(|| {
+                crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(source_repo))
+            });
+        if source_slug.as_deref() == Some(canonical_repo.as_str()) {
+            return Some(agent);
+        }
+    }
+    legacy_recipient
 }
 
 /// #2059-#3: resolve the MERGE AUTHORITY for `[pr-ready-for-merge]` — a
@@ -3424,5 +3482,173 @@ mod tests {
             "no team and no author → last-ditch fixup-lead default"
         );
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn real_repo_with_github_origin(root: &Path, name: &str, slug: &str) -> std::path::PathBuf {
+        let repo = root.join(name);
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("spawn git init");
+        assert!(init.status.success(), "git init failed: {:?}", init);
+        let origin = format!("https://github.com/{slug}.git");
+        let remote = std::process::Command::new("git")
+            .args(["remote", "add", "origin", &origin])
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("spawn git remote add");
+        assert!(
+            remote.status.success(),
+            "git remote add failed: {:?}",
+            remote
+        );
+        assert_eq!(
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(&repo).as_deref(),
+            Some(slug),
+            "fixture origin must resolve to the expected canonical GitHub slug"
+        );
+        repo
+    }
+
+    fn bind_route_agent(home: &Path, agent: &str, branch: &str, source_repo: Option<&Path>) {
+        let dir = crate::paths::runtime_dir(home).join(agent);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut binding = serde_json::json!({
+            "version": 1,
+            "agent": agent,
+            "task_id": "t-2920-route",
+            "branch": branch,
+            "worktree": "/tmp/2920-route-worktree",
+            "issued_at": "2026-07-22T00:00:00Z",
+        });
+        if let Some(repo) = source_repo {
+            binding["source_repo"] = serde_json::json!(repo.display().to_string());
+        }
+        std::fs::write(
+            dir.join("binding.json"),
+            serde_json::to_string_pretty(&binding).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn route_messages(home: &Path, agent: &str) -> Vec<crate::inbox::InboxMessage> {
+        crate::inbox::drain(home, agent)
+            .into_iter()
+            .filter(|message| message.kind.as_deref() == Some("review-verdict"))
+            .collect()
+    }
+
+    /// #2920 RED: two real source repositories share `feat/shared`; the verdict
+    /// for repo-B must go to repo-B's bound agent, not whichever binding a
+    /// branch-only scan happens to enumerate first.
+    #[test]
+    fn review_verdict_routes_same_branch_by_binding_repo_2920() {
+        let root = std::env::temp_dir().join(format!("agend-2920-collision-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let repo_a = real_repo_with_github_origin(&root, "repo-a", "owner/repo-a");
+        let repo_b = real_repo_with_github_origin(&root, "repo-b", "owner/repo-b");
+        let branch = "feat/shared";
+        // Creation order is intentional: the pre-fix branch-only scan sees A
+        // before B, while the repo-aware contract must select B by its origin.
+        bind_route_agent(&home, "repo-a-holder", branch, Some(&repo_a));
+        bind_route_agent(&home, "repo-b-holder", branch, Some(&repo_b));
+
+        let head = "d".repeat(40);
+        let mut state = new_for_branch("owner/repo-b", branch, &head, ReviewClass::Single);
+        state.pr_author = "shared-login-fallback".into();
+        save(&home, &state).unwrap();
+
+        record_verdict(
+            &home,
+            "t-2920-route",
+            "reviewer-2920",
+            Some(&head),
+            VerdictKind::Verified,
+        );
+
+        assert_eq!(route_messages(&home, "repo-b-holder").len(), 1);
+        assert!(
+            route_messages(&home, "repo-a-holder").is_empty(),
+            "repo-A binding must not receive repo-B's verdict"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2920 RED: when no binding's origin matches `PrState.repo`, routing must
+    /// fall through to the existing repo-aware #2919 author resolution chain.
+    #[test]
+    fn review_verdict_no_matching_binding_falls_back_to_author_2920() {
+        let root = std::env::temp_dir().join(format!("agend-2920-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let repo_a = real_repo_with_github_origin(&root, "repo-a", "owner/repo-a");
+        let repo_b = real_repo_with_github_origin(&root, "repo-b", "owner/repo-b");
+        let branch = "feat/shared";
+        bind_route_agent(&home, "repo-a-holder", branch, Some(&repo_a));
+        bind_route_agent(&home, "repo-b-holder", branch, Some(&repo_b));
+
+        let head = "e".repeat(40);
+        let mut state = new_for_branch("owner/repo-c", branch, &head, ReviewClass::Single);
+        state.pr_author = "resolved-author-2919".into();
+        save(&home, &state).unwrap();
+
+        record_verdict(
+            &home,
+            "t-2920-route",
+            "reviewer-2920",
+            Some(&head),
+            VerdictKind::Verified,
+        );
+
+        assert_eq!(route_messages(&home, "resolved-author-2919").len(), 1);
+        assert!(route_messages(&home, "repo-a-holder").is_empty());
+        assert!(route_messages(&home, "repo-b-holder").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2920 compatibility: one legacy binding without `source_repo` still
+    /// receives a verdict for its matching branch.
+    #[test]
+    fn review_verdict_routes_legacy_binding_without_source_repo_2920() {
+        let root = std::env::temp_dir().join(format!(
+            "agend-2920-legacy-binding-{}-{}",
+            std::process::id(),
+            "single"
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let branch = "feat/legacy-shared";
+        bind_route_agent(&home, "legacy-holder", branch, None);
+
+        let head = "f".repeat(40);
+        let mut state = new_for_branch("owner/repo", branch, &head, ReviewClass::Single);
+        state.pr_author = "legacy-author-fallback".into();
+        save(&home, &state).unwrap();
+
+        record_verdict(
+            &home,
+            "t-2920-route",
+            "reviewer-2920",
+            Some(&head),
+            VerdictKind::Verified,
+        );
+
+        assert_eq!(route_messages(&home, "legacy-holder").len(), 1);
+        assert!(route_messages(&home, "legacy-author-fallback").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
