@@ -25,6 +25,7 @@ pub(crate) struct CleanupIntent {
     pub pr_number: Option<u64>,
 }
 
+#[allow(dead_code)] // wired in upstream #2807 but intentionally unconnected here
 pub(crate) fn persist_intent(
     home: &Path,
     repo: &str,
@@ -187,6 +188,7 @@ pub(crate) fn settle_intent(
 
 /// Settle intents matching an SCM slug. The CI poller knows the slug but not
 /// the local canonical path; this scans all intents for a slug match.
+#[allow(dead_code)] // wired in upstream #2807 but intentionally unconnected here
 pub(crate) fn settle_by_scm_slug(
     home: &Path,
     scm_slug: &str,
@@ -269,6 +271,7 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
     }
 }
 
+#[allow(dead_code)] // wired in upstream #2807 but intentionally unconnected here
 pub(crate) fn intent_repos(home: &Path) -> Vec<String> {
     let dir = intents_dir(home);
     let entries = match std::fs::read_dir(&dir) {

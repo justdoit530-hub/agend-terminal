@@ -694,6 +694,7 @@ impl MockScmProvider {
     }
 
     /// #2749 3b: a canned `compare` result — `behind_by` commits behind the base.
+    #[allow(dead_code)]
     pub(crate) fn with_compare(behind_by: u64) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             compare: Some(Ok(CompareResult {
@@ -706,6 +707,7 @@ impl MockScmProvider {
 
     /// #2749 3b: a `compare` that FAILS (a transient remote-forge error) — the
     /// off-tick populator must stamp `freshness_error` without clobbering.
+    #[allow(dead_code)]
     pub(crate) fn with_compare_err(msg: &str) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             compare: Some(Err(msg.to_string())),
@@ -717,6 +719,7 @@ impl MockScmProvider {
     /// an in-flight observation advance (A→B) during the compare and prove the
     /// off-tick populator's FULL-TUPLE CAS discards the delayed base-A error (a
     /// head-only CAS would wrongly stamp it onto the superseding base-B tuple).
+    #[allow(dead_code)]
     pub(crate) fn with_compare_err_hook(
         msg: &str,
         hook: impl Fn() + Send + Sync + 'static,
@@ -729,6 +732,7 @@ impl MockScmProvider {
     }
 
     /// #2749 correction: how many times `compare` has been invoked (backoff assert).
+    #[allow(dead_code)]
     pub(crate) fn compare_calls(&self) -> usize {
         self.compare_calls
             .load(std::sync::atomic::Ordering::Relaxed)

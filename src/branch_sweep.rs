@@ -421,6 +421,7 @@ fn local_sha_matches_merged_head(repo: &Path, local_sha: &str, head_ref_oid: &st
         )
 }
 
+#[allow(dead_code)] // wired in upstream #2807 but intentionally unconnected here
 pub(crate) fn extract_github_repo_for_intent(url: &str) -> Option<String> {
     extract_github_repo(url)
 }

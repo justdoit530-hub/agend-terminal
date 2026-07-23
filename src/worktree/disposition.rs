@@ -1,3 +1,5 @@
+#![allow(dead_code)] // wired in upstream D5/D6 but intentionally unconnected here
+
 //! PR-D · D1 — the single `terminal_disposition` classifier (janitor spike §1).
 //!
 //! Today the worktree-cleanup / GC-retention / auto-release paths each run their

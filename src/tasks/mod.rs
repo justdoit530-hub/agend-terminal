@@ -591,6 +591,7 @@ pub enum TaskRouteError {
         path: std::path::PathBuf,
         cause: String,
     },
+    #[allow(dead_code)] // used in strict route implementation but unused on this branch
     Ambiguous {
         candidates: Vec<String>,
         cause: String,
