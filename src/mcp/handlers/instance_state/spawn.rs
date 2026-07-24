@@ -20,29 +20,28 @@ pub(super) fn spawn_single_instance(
 ) -> Value {
     // #2454 Slice 2: in-process SPAWN when runtime is available.
     #[allow(clippy::type_complexity)]
-    let spawn_fn: Box<dyn Fn(&Path, &Value) -> anyhow::Result<Value>> =
-        if let Some(rt) = runtime {
-            let reg = rt.registry.clone();
-            let configs = rt.configs.clone();
-            let externals = rt.externals.clone();
-            Box::new(move |home, req| {
-                let params = &req["params"];
-                let ctx = crate::api::handlers::HandlerCtx {
-                    registry: &reg,
-                    configs: &configs,
-                    externals: &externals,
-                    notifier: rt.notifier.clone(),
-                    home,
-                };
-                Ok(crate::api::handlers::instance::handle_spawn(params, &ctx))
-            })
-        } else {
-            Box::new(|_home, _req| {
-                Err(anyhow::anyhow!(
-                    "runtime unavailable: spawn requires the in-process daemon runtime"
-                ))
-            })
-        };
+    let spawn_fn: Box<dyn Fn(&Path, &Value) -> anyhow::Result<Value>> = if let Some(rt) = runtime {
+        let reg = rt.registry.clone();
+        let configs = rt.configs.clone();
+        let externals = rt.externals.clone();
+        Box::new(move |home, req| {
+            let params = &req["params"];
+            let ctx = crate::api::handlers::HandlerCtx {
+                registry: &reg,
+                configs: &configs,
+                externals: &externals,
+                notifier: rt.notifier.clone(),
+                home,
+            };
+            Ok(crate::api::handlers::instance::handle_spawn(params, &ctx))
+        })
+    } else {
+        Box::new(|_home, _req| {
+            Err(anyhow::anyhow!(
+                "runtime unavailable: spawn requires the in-process daemon runtime"
+            ))
+        })
+    };
     spawn_single_instance_impl(home, instance_name, args, spawn_fn.as_ref(), runtime)
 }
 

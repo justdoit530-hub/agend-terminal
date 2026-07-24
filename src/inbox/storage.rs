@@ -1702,6 +1702,138 @@ pub(super) fn msg_already_drained_in_jsonl(home: &Path, agent_name: &str, msg_id
     false
 }
 
+pub fn nonce_present_actionable(home: &Path, target: &str, nonce: &str) -> bool {
+    let path = inbox_path_resolved(home, target);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains(nonce))
+        .any(|l| {
+            serde_json::from_str::<InboxMessage>(l)
+                .ok()
+                .filter(|m| m.delivery_nonce.as_deref() == Some(nonce))
+                .map(|m| {
+                    m.read_at.is_none() && m.delivering_at.is_none() && m.superseded_by.is_none()
+                })
+                .unwrap_or(false)
+        })
+}
+
+pub fn nonce_present_not_superseded(home: &Path, target: &str, nonce: &str) -> bool {
+    let path = inbox_path_resolved(home, target);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter(|l| l.contains(nonce))
+        .any(|l| {
+            serde_json::from_str::<InboxMessage>(l)
+                .ok()
+                .filter(|m| m.delivery_nonce.as_deref() == Some(nonce))
+                .map(|m| m.superseded_by.is_none())
+                .unwrap_or(false)
+        })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NonceSupersedeOutcome {
+    pub found: bool,
+    pub was_read: bool,
+}
+
+pub fn supersede_by_nonce(
+    home: &Path,
+    target: &str,
+    nonce: &str,
+    successor: &str,
+) -> NonceSupersedeOutcome {
+    supersede_by_nonce_inner(home, target, nonce, successor).unwrap_or_default()
+}
+
+pub fn supersede_by_nonce_strict(
+    home: &Path,
+    target: &str,
+    nonce: &str,
+    successor: &str,
+) -> anyhow::Result<NonceSupersedeOutcome> {
+    supersede_by_nonce_inner(home, target, nonce, successor)
+}
+
+fn supersede_by_nonce_inner(
+    home: &Path,
+    target: &str,
+    nonce: &str,
+    successor: &str,
+) -> anyhow::Result<NonceSupersedeOutcome> {
+    let path = inbox_path_resolved(home, target);
+    if !path.exists() {
+        return Ok(NonceSupersedeOutcome::default());
+    }
+    let inner = with_inbox_lock(
+        home,
+        target,
+        |path| -> anyhow::Result<NonceSupersedeOutcome> {
+            let mut outcome = NonceSupersedeOutcome::default();
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("read inbox {}: {e}", path.display()))?;
+            let mut changed = false;
+            let mut lines: Vec<String> = Vec::new();
+            for line in content.lines() {
+                if line.trim().is_empty() {
+                    lines.push(line.to_string());
+                    continue;
+                }
+                if !line.contains(nonce) {
+                    lines.push(line.to_string());
+                    continue;
+                }
+                if let Ok(mut msg) = serde_json::from_str::<InboxMessage>(line) {
+                    if msg.delivery_nonce.as_deref() == Some(nonce) {
+                        outcome.found = true;
+                        if msg.read_at.is_some() {
+                            outcome.was_read = true;
+                        }
+                        if msg.read_at.is_none() && msg.superseded_by.is_none() {
+                            msg.superseded_by = Some(successor.to_string());
+                            changed = true;
+                        }
+                    }
+                    lines.push(serde_json::to_string(&msg).unwrap_or_else(|_| line.to_string()));
+                } else {
+                    lines.push(line.to_string());
+                }
+            }
+            if changed {
+                let tmp = path.with_extension("jsonl.tmp");
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)
+                    .map_err(|e| anyhow::anyhow!("open tmp {}: {e}", tmp.display()))?;
+                use std::io::Write;
+                for l in &lines {
+                    writeln!(f, "{l}")
+                        .map_err(|e| anyhow::anyhow!("write tmp {}: {e}", tmp.display()))?;
+                }
+                f.sync_all()
+                    .map_err(|e| anyhow::anyhow!("fsync tmp {}: {e}", tmp.display()))?;
+                std::fs::rename(&tmp, path).map_err(|e| {
+                    anyhow::anyhow!("rename {} -> {}: {e}", tmp.display(), path.display())
+                })?;
+                crate::store::fsync_parent_dir(path);
+            }
+            Ok(outcome)
+        },
+    )?;
+    inner
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod review_repro_inbox_notify;

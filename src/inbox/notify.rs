@@ -541,6 +541,21 @@ pub(crate) fn renudge_actionable_unread(
     }
 }
 
+pub(crate) fn wake_review_assignment(home: &Path, target: &str) {
+    let (inbox_count, _) = storage::unread_count(home, target);
+    let now_field = operator_now_field();
+    let pointer = build_pending_pointer(
+        "review-assignment",
+        "review-assignment",
+        "system:review",
+        inbox_count,
+        &now_field,
+    );
+    if let Err(e) = inject_with_submit(home, target, &pointer) {
+        tracing::debug!(%target, error = %e, "wake_review_assignment: best-effort inject failed");
+    }
+}
+
 /// #1335: convenience wrapper for the common daemon notification pattern:
 /// `InboxMessage::new_system` + optional `delivery_mode` / `correlation_id` /
 /// `task_id` + `enqueue_with_idle_hint`. Covers ~15 watchdog-class call sites.

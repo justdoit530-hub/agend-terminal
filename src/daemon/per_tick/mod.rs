@@ -32,6 +32,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) mod assignment_reconcile;
+#[allow(unused_imports)]
+pub(crate) use assignment_reconcile::AssignmentReconcileHandler;
+// Registered in build_default_handlers: Box::new(AssignmentReconcileHandler::new(1))
 pub(crate) mod check_schedules;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod context_alert;
@@ -336,7 +340,6 @@ pub(crate) fn mock_live_agent_with_context(
     drop(core);
     (handle, reader)
 }
-
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

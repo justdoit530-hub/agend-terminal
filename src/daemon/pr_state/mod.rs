@@ -119,8 +119,21 @@ pub struct PrState {
     /// files written before this field existed.
     #[serde(default)]
     pub closed_unmerged_pending: bool,
+    #[serde(default)]
+    pub reserved_assignments: Vec<ReservedAssignment>,
+    #[serde(default)]
+    pub authority_unknown: bool,
+    #[serde(default)]
+    pub validated_review_receipts: Vec<crate::review_receipt::ReviewReceiptSummary>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReservedAssignment {
+    pub target: String,
+    pub review_author: crate::mcp::handlers::comms_gates::ReviewAuthor,
+    pub assignment_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,12 +197,13 @@ pub enum DraftState {
     Draft,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReviewClass {
     /// §3.6 — single VERIFIED triggers MergeReady.
     Single,
     /// §3.5 — two VERIFIED required.
     Dual,
+    Unresolved,
 }
 
 impl ReviewClass {
@@ -197,6 +211,7 @@ impl ReviewClass {
         match self {
             ReviewClass::Single => 1,
             ReviewClass::Dual => 2,
+            ReviewClass::Unresolved => usize::MAX,
         }
     }
 }
@@ -827,6 +842,9 @@ pub fn new_for_branch(
         gh_poll_failures: 0,
         last_gh_state: None,
         closed_unmerged_pending: false,
+        reserved_assignments: Vec::new(),
+        authority_unknown: false,
+        validated_review_receipts: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     }
@@ -1023,7 +1041,8 @@ pub fn record_verdict(
             // it (no double-notify). REJECTED/UNVERIFIED never reach merge-ready,
             // so they always notify (the author must learn they need to fix).
             if !is_merge_ready(s) {
-                let recipient = resolve_notify_recipient_precomputed(s, binding_recipient.as_deref());
+                let recipient =
+                    resolve_notify_recipient_precomputed(s, binding_recipient.as_deref());
                 let body = format_verdict_body(s, reviewer, label);
                 let msg = crate::inbox::InboxMessage::new_system(
                     "system:pr-state",
@@ -1088,6 +1107,30 @@ pub fn resolve_author(state: &PrState) -> String {
     "fixup-lead".to_string()
 }
 
+pub(crate) fn list_state_identities(home: &Path) -> Vec<(String, String)> {
+    let dir = pr_state_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_e) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_pr_state_file(&path) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Ok(state) = serde_json::from_str::<PrState>(&content) {
+            out.push((state.repo, state.branch));
+        }
+    }
+    out
+}
+
 /// t-verdict-to-author-routing-design (#2): resolve the AGENT to notify for an
 /// author-facing pr-state signal (`[review-verdict]`, `[pr-ready-for-merge]`).
 ///
@@ -1121,8 +1164,7 @@ fn resolve_binding_notify_recipient(home: &Path, repo: &str, branch: &str) -> Op
     if repo.is_empty() || branch.is_empty() {
         return None;
     }
-    let canonical_repo =
-        crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(repo)?;
+    let canonical_repo = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(repo)?;
     let mut legacy_recipient = None;
     for (agent, binding) in crate::binding::binding_scan_all(home) {
         if binding["branch"].as_str() != Some(branch) {
@@ -1151,7 +1193,9 @@ fn resolve_binding_notify_recipient(home: &Path, repo: &str, branch: &str) -> Op
         }
         let source_slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(source_repo)
             .or_else(|| {
-                crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(source_repo))
+                crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(
+                    source_repo,
+                ))
             });
         if source_slug.as_deref() == Some(canonical_repo.as_str()) {
             return Some(agent);
@@ -1324,6 +1368,9 @@ mod tests {
             gh_poll_failures: 0,
             last_gh_state: None,
             closed_unmerged_pending: false,
+            reserved_assignments: Vec::new(),
+            authority_unknown: false,
+            validated_review_receipts: Vec::new(),
             created_at: now(),
             updated_at: now(),
         }
@@ -3547,7 +3594,8 @@ mod tests {
     /// branch-only scan happens to enumerate first.
     #[test]
     fn review_verdict_routes_same_branch_by_binding_repo_2920() {
-        let root = std::env::temp_dir().join(format!("agend-2920-collision-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("agend-2920-collision-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();

@@ -951,10 +951,7 @@ pub fn maybe_create_skill(
             );
         }
         Err(e) => {
-            tracing::debug!(
-                ?e,
-                "maybe_create_skill: send to general failed; skipping"
-            );
+            tracing::debug!(?e, "maybe_create_skill: send to general failed; skipping");
         }
     }
 }
@@ -3616,7 +3613,9 @@ mod tests {
             "prompt should ask for SKILL_WRITTEN confirm"
         );
         assert!(
-            calls[0].1.contains(auto_dir.join(&filename).to_str().unwrap()),
+            calls[0]
+                .1
+                .contains(auto_dir.join(&filename).to_str().unwrap()),
             "prompt should include target path"
         );
         assert!(calls[0].1.contains(summary));

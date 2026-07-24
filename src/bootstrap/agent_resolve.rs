@@ -133,11 +133,7 @@ fn resolve_one(config: &FleetConfig, ctx: &ResolveContext<'_>, name: &str) -> Op
             resolved.backend,
             backend::Backend::Shell | backend::Backend::Raw(_)
         ) {
-            backend::Backend::push_model_arg(
-                &mut args,
-                &resolved.backend.command_string(),
-                model,
-            );
+            backend::Backend::push_model_arg(&mut args, &resolved.backend.command_string(), model);
         }
     }
 

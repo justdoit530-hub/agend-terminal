@@ -86,8 +86,10 @@ pub(super) fn delete_in_process(
         return Ok(handlers::instance::handle_delete(&params, &ctx));
     }
     if let Some(reg) = crate::agent::get_pending_registry() {
-        let configs = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let externals = std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let configs =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let externals =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let ctx = HandlerCtx {
             registry: &reg,
             configs: &configs,
@@ -98,7 +100,10 @@ pub(super) fn delete_in_process(
         let params = json!({"name": name, "no_wait": no_wait});
         return Ok(handlers::instance::handle_delete(&params, &ctx));
     }
-    Err("runtime unavailable: delete requires the in-process daemon runtime or registry".to_string())
+    Err(
+        "runtime unavailable: delete requires the in-process daemon runtime or registry"
+            .to_string(),
+    )
 }
 
 /// #2454: CREATE_TEAM in-process.
@@ -161,9 +166,7 @@ pub(super) fn list_agents_in_process(
     runtime: Option<&RuntimeContext>,
 ) -> Result<Value, String> {
     let Some(runtime) = runtime else {
-        return Err(
-            "runtime unavailable: list requires the in-process daemon runtime".to_string(),
-        );
+        return Err("runtime unavailable: list requires the in-process daemon runtime".to_string());
     };
     Ok(crate::agent_ops::list_snapshot(
         home,

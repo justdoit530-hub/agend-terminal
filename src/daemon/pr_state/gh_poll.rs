@@ -602,6 +602,9 @@ pub(crate) mod tests {
             gh_poll_failures: 0,
             last_gh_state: None,
             closed_unmerged_pending: false,
+            reserved_assignments: Vec::new(),
+            authority_unknown: false,
+            validated_review_receipts: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         }

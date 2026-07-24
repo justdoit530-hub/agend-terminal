@@ -7,6 +7,7 @@ mod api_server;
 // #t-5: `pub(crate)` so `render::overlay` can read the completion specs
 // (`CommandSpec` / `COMMAND_SPECS` / `matching_specs`). `execute` stays
 // `pub(super)` = app-only, so command EXECUTION is not widened.
+mod app_state;
 pub(crate) mod commands;
 mod dispatch;
 mod frame_timing;
@@ -15,7 +16,6 @@ mod overlay;
 mod pane_factory;
 mod session;
 mod telegram_hooks;
-mod app_state;
 mod tui_events;
 mod tui_spawn;
 mod ui_state;
@@ -412,7 +412,11 @@ fn build_app_maintenance(
     (app_externals, app_configs, app_handlers)
 }
 
-fn log_pre_render_milestone(size_debug: bool, restore_start: std::time::Instant, attached_mode: bool) {
+fn log_pre_render_milestone(
+    size_debug: bool,
+    restore_start: std::time::Instant,
+    attached_mode: bool,
+) {
     trace_tty_size(size_debug, "pre-render-loop");
     tracing::info!(
         phase = "pre-render-loop",
@@ -499,7 +503,13 @@ fn run_app(terminal: &mut DefaultTerminal, fleet_override: Option<&Path>) -> Res
         }
     }
 
-    app_teardown(&home, &state.ui.layout, &registry, attached_mode, attach_workers);
+    app_teardown(
+        &home,
+        &state.ui.layout,
+        &registry,
+        attached_mode,
+        attach_workers,
+    );
     Ok(())
 }
 

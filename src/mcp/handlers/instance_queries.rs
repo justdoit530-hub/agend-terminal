@@ -79,9 +79,7 @@ pub(super) fn handle_describe_instance(
             let mut info = agent.clone();
             merge_metadata(home, name, &mut info);
             if info.get("topic_id").is_none() {
-                if let Some(tid) =
-                    crate::channel::telegram::lookup_topic_for_instance(home, name)
-                {
+                if let Some(tid) = crate::channel::telegram::lookup_topic_for_instance(home, name) {
                     info["topic_id"] = json!(tid);
                 }
             }

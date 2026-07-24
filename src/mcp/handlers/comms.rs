@@ -486,8 +486,7 @@ pub(super) fn handle_report_result(
                     success_category,
                 );
                 crate::reflexion::mark_mistake_corrected(home, &implementer_agent, category);
-                let evidence =
-                    crate::reflexion::extract_evidence_from_report(&evidence_body);
+                let evidence = crate::reflexion::extract_evidence_from_report(&evidence_body);
                 crate::reflexion::maybe_create_skill(
                     &implementer_agent,
                     success_category,

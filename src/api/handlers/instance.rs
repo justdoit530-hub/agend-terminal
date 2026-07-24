@@ -1582,7 +1582,6 @@ mod tests {
         );
     }
 
-
     /// #2038 ingress 2 (deploy Phase 3 / args-less SPAWN shape) — SPAWN
     /// params omit `args` entirely; handle_spawn MUST fall back to the
     /// fleet entry's resolved `args` AND append its `model`. Pre-fix an

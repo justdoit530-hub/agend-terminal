@@ -41,7 +41,10 @@ pub(super) fn resolve_checkout_source_path(
             .and_then(|f| {
                 f.instances.get(source).map(|inst| {
                     inst.working_directory.clone().unwrap_or_else(|| {
-                        crate::paths::workspace_dir(home).join(source).display().to_string()
+                        crate::paths::workspace_dir(home)
+                            .join(source)
+                            .display()
+                            .to_string()
                     })
                 })
             });

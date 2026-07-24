@@ -24,3 +24,9 @@ pub(super) use anti_stall::enforce_send_invariants;
 
 // Delegate-task pre-send gates (handle_delegate_task).
 pub(super) use dispatch::run_dispatch_pre_checks;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) enum ReviewAuthor {
+    Agent(String),
+    External(String),
+}

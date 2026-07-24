@@ -1240,6 +1240,8 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             force_meta: None,
             correlation_id: None,
             reviewed_head: None,
+            delivery_nonce: None,
+            review_assignment: None,
             from: "user:test".to_string(),
             text: "hello".to_string(),
             kind: Some("telegram".to_string()),
@@ -1312,6 +1314,8 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             force_meta: None,
             correlation_id: None,
             reviewed_head: None,
+            delivery_nonce: None,
+            review_assignment: None,
             from: "user:test".to_string(),
             text: "burst".to_string(),
             kind: Some("telegram".to_string()),
@@ -1467,7 +1471,10 @@ fn test_send_to_inbox_fallback_mode() {
         &json!({"instance": "receiver", "message": "test"}),
         "sender",
     );
-    assert!(is_ok_result(&result), "in-process send must succeed: {result}");
+    assert!(
+        is_ok_result(&result),
+        "in-process send must succeed: {result}"
+    );
     assert_eq!(
         result["delivery_mode"].as_str(),
         Some("inbox_only"),
@@ -1480,7 +1487,10 @@ fn test_send_to_inbox_fallback_mode() {
         "sender",
     );
     assert!(
-        no_rt.get("error").and_then(|e| e.as_str()).is_some_and(|e| e.contains("runtime unavailable")),
+        no_rt
+            .get("error")
+            .and_then(|e| e.as_str())
+            .is_some_and(|e| e.contains("runtime unavailable")),
         "runtime=None must fail closed: {no_rt}"
     );
     std::env::remove_var("AGEND_HOME");
@@ -1512,6 +1522,8 @@ fn test_describe_message_shows_delivery_mode() {
         force_meta: None,
         correlation_id: None,
         reviewed_head: None,
+        delivery_nonce: None,
+        review_assignment: None,
         task_id: None,
         attachments: vec![],
         in_reply_to_msg_id: None,
@@ -2419,7 +2431,8 @@ fn create_instance_explicit_working_directory_used() {
 fn send_kind_task_maps_message_field_to_task() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "do X", "request_kind": "task", "task_id": "t-test-fixture"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     // Whatever error/success we observe, it must NOT be the field-name bug:
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert_ne!(
@@ -2435,7 +2448,8 @@ fn send_kind_task_maps_message_field_to_task() {
 fn send_kind_query_maps_message_field_to_question() {
     let sender = crate::identity::Sender::new("lead2-test").expect("valid sender name");
     let args = json!({"instance": "dev", "message": "what?", "request_kind": "query"});
-    let result = super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
+    let result =
+        super::comms::handle_unified_send(&std::env::temp_dir(), &args, &Some(sender), None);
     let err = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
     assert_ne!(
         err, "missing 'question'",
