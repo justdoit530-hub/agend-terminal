@@ -1109,6 +1109,28 @@ mod tests {
         );
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// Ghost-inbox guard rollout (t-20260724035332273132-42380-3): a
+    /// decision-timeout alert whose resolved recipient has no fleet.yaml
+    /// instance must be dropped at the deliver seam, not enqueued into a
+    /// ghost inbox nobody drains.
+    #[test]
+    fn deliver_timeout_skips_ghost_recipient() {
+        let _g = env_lock();
+        let home = tmp_home("ghost-recipient");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker: {}\n",
+        )
+        .unwrap();
+        deliver_timeout(&home, "d-ghost", "worker", 2000, 1800, "proceed");
+        assert!(
+            drained_payloads(&home, "general").is_empty(),
+            "default recipient `general` has no instance — alert must be dropped \
+             (ghost-inbox guard)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[cfg(test)]

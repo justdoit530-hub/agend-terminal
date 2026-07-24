@@ -170,6 +170,31 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
+    /// Ghost-inbox guard rollout (t-20260724035332273132-42380-3): a stuck
+    /// alert must not be enqueued to a recipient with no fleet.yaml instance —
+    /// pre-fix the team-less `FALLBACK_RECIPIENT` ("lead") grew
+    /// `~/.agend/inbox/lead.jsonl` forever (68 of the 101 archived ghost
+    /// entries on the reporting fleet were inbox_stuck alerts).
+    #[test]
+    fn skips_alert_when_fallback_recipient_has_no_instance() {
+        let home = tmp_home("ghost-fallback");
+        // No teams and no `lead` instance → the fallback recipient is a ghost.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker:\n    backend: claude\n",
+        )
+        .unwrap();
+        seed_unread(&home, "worker", 4, 45);
+        let now = chrono::Utc::now();
+        let mut last = HashMap::new();
+        scan_and_emit(&home, &now, &mut last);
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "lead has no fleet.yaml instance — alert must be dropped (ghost-inbox guard)"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
     #[test]
     fn no_alert_when_below_count_or_age_threshold() {
         let home = tmp_home("below");

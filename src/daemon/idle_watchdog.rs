@@ -1979,4 +1979,110 @@ mod tests {
         assert_eq!(alerts[0].1.as_deref(), Some("fleet_idle_watchdog"));
         std::fs::remove_dir_all(&home).ok();
     }
+
+    // Ghost-inbox guard rollout (t-20260724035332273132-42380-3): an idle
+    // alert whose recipient has no fleet.yaml instance must be dropped at the
+    // route seam, not enqueued into a ghost inbox nobody drains (the archived
+    // lead.jsonl held 4 idle-watchdog entries). A missing fleet.yaml stays
+    // permissive — `route_idle_alert_delivers_via_bus` above covers that.
+    #[test]
+    fn route_idle_alert_skips_ghost_recipient() {
+        let home = tmp_home("ghost-recipient");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  general: {}\n",
+        )
+        .unwrap();
+        route_idle_alert(&home, "lead", "dev_idle_watchdog", "idle 1800s", None);
+        assert!(
+            alert_payloads(&home, "lead").is_empty(),
+            "lead has no fleet.yaml instance — alert must be dropped (ghost-inbox guard)"
+        );
+        // A recipient that DOES have an instance keeps working on the same home.
+        route_idle_alert(&home, "general", "dev_idle_watchdog", "idle 1800s", None);
+        assert_eq!(
+            alert_payloads(&home, "general").len(),
+            1,
+            "existing-instance recipient must still be alerted"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #1084/#2548 watchdog CLI tests (moved from the retired `watchdog` MCP tool) ──
+
+    #[test]
+    fn cli_watchdog_snooze_then_status_round_trip() {
+        let home = tmp_home("cli-watchdog-snooze-status");
+        let args = json!({"action": "snooze", "duration": "1h"});
+        let result = handle_watchdog(&home, &args, "test-agent");
+        assert_eq!(result["snoozed"], true);
+        assert!(result["snoozed_until"].is_string());
+        assert_eq!(result["duration_secs"], 3600);
+
+        let status_args = json!({"action": "status"});
+        let status = handle_watchdog(&home, &status_args, "test-agent");
+        assert_eq!(status["snoozed"], true);
+        assert!(status["remaining_secs"].as_i64().unwrap() > 0);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cli_watchdog_snooze_duration_clamped_to_4h() {
+        let home = tmp_home("cli-watchdog-snooze-clamp");
+        let args = json!({"action": "snooze", "duration": "24h"});
+        let result = handle_watchdog(&home, &args, "test-agent");
+        assert_eq!(
+            result["duration_secs"],
+            4 * 3600,
+            "#1084: 24h must clamp to 4h"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cli_watchdog_resume_clears_snooze() {
+        let home = tmp_home("cli-watchdog-resume");
+        let snooze_args = json!({"action": "snooze", "duration": "2h"});
+        handle_watchdog(&home, &snooze_args, "test-agent");
+
+        let resume_args = json!({"action": "resume"});
+        let result = handle_watchdog(&home, &resume_args, "test-agent");
+        assert_eq!(result["snoozed"], false);
+
+        let status_args = json!({"action": "status"});
+        let status = handle_watchdog(&home, &status_args, "test-agent");
+        assert_eq!(status["snoozed"], false);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn cli_watchdog_unknown_action_errors() {
+        let home = tmp_home("cli-watchdog-unknown");
+        let args = json!({"action": "frobnicate"});
+        let result = handle_watchdog(&home, &args, "test-agent");
+        assert!(result["error"].as_str().unwrap_or("").contains("unknown"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2548-moved review-repro (mcp-dispatch-comms batch, Finding 5): `parse_duration_secs`
+    /// multiplies an `i64` parsed from an arbitrary digit run by 3600/60 with checked
+    /// arithmetic. An attacker-controlled duration such as `"9999999999999999h"` parses to
+    /// a valid `i64` (~1e16) whose unchecked `* 3600` (~3.6e19) would overflow `i64::MAX`
+    /// (~9.2e18) — checked_mul rejects it as invalid (`None`) instead of panicking (debug)
+    /// or wrapping to a bogus value (release).
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn parse_duration_secs_does_not_overflow_on_huge_input_mcp_dispatch_comms() {
+        let malicious = "9999999999999999h";
+        let outcome = std::panic::catch_unwind(|| parse_duration_secs(malicious));
+        let parsed = outcome.expect(
+            "parse_duration_secs must NOT panic on an oversized duration: the unchecked `n * 3600` \
+             overflows i64 (debug builds panic). Use checked arithmetic returning None instead.",
+        );
+        assert_eq!(
+            parsed, None,
+            "an oversized/overflowing duration must be rejected as invalid (None), \
+             not silently wrapped to a bogus value"
+        );
+    }
 }

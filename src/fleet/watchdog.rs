@@ -414,4 +414,22 @@ instances: {}
             fs::remove_dir_all(&h).ok();
         }
     }
+
+    /// Ghost-guard rollout (t-20260724035332273132-42380-3): the task-stall
+    /// recipient list must get the same `instances:` filter as
+    /// helper-staleness — pre-fix its `[general, lead]` default fed the same
+    /// ghost inbox.
+    #[test]
+    fn task_stall_recipients_filtered_by_instances() {
+        let _g = env_guard();
+        clear_env();
+        let home = tmp_home("stall-filter");
+        write_fleet(&home, "instances:\n  general: {}\n");
+        assert_eq!(
+            resolve_task_stall_recipients(&home),
+            vec!["general".to_string()],
+            "lead has no instance — must be dropped from the task-stall default"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
 }
