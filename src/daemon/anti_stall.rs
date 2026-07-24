@@ -545,7 +545,8 @@ mod tests {
         let home = tmp_home("fleet-stall-route");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "watchdog:\n  task_stall_recipients:\n    - reviewer\n    - ops\ninstances: {}\n",
+            "watchdog:\n  task_stall_recipients:\n    - reviewer\n    - ops\n\
+             instances:\n  reviewer: {}\n  ops: {}\n",
         )
         .unwrap();
         let task = make_task(

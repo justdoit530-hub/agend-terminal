@@ -128,27 +128,17 @@ pub fn resolve_fleet_idle_recipient(home: &Path) -> String {
     }
 }
 
-/// Recipients for task-stall warnings. Default `[general, lead]`. The env form
-/// is comma-separated; entries are trimmed and empties filtered.
+/// Recipients for task-stall warnings. Default `[general, lead]`, filtered
+/// against the `instances:` map (ghost-inbox guard — see
+/// [`drop_ghost_recipients`]).
 pub fn resolve_task_stall_recipients(home: &Path) -> Vec<String> {
-    if let Some(w) = load(home) {
-        if !w.task_stall_recipients.is_empty() {
-            return w.task_stall_recipients;
-        }
-    }
+    let base = match load(home) {
+        Some(w) if !w.task_stall_recipients.is_empty() => w.task_stall_recipients,
+        _ => vec!["general".to_string(), "lead".to_string()],
+    };
     static WARNED: AtomicBool = AtomicBool::new(false);
-    if let Some(custom) = env_nonempty("AGEND_TASK_STALL_RECIPIENTS") {
-        let parsed: Vec<String> = custom
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !parsed.is_empty() {
-            warn_env_deprecated("AGEND_TASK_STALL_RECIPIENTS", &WARNED);
-            return parsed;
-        }
-    }
-    vec!["general".to_string(), "lead".to_string()]
+    drop_ghost_recipients(home, base, "task_stall", &WARNED)
+}
 }
 
 /// Recipients for helper-staleness alerts. Default `[general, lead]`. No env
@@ -167,22 +157,46 @@ pub fn resolve_helper_staleness_recipients(home: &Path) -> Vec<String> {
         Some(w) if !w.helper_staleness_recipients.is_empty() => w.helper_staleness_recipients,
         _ => vec!["general".to_string(), "lead".to_string()],
     };
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    drop_ghost_recipients(home, base, "helper_staleness", &WARNED)
+}
+
+/// Ghost-inbox guard shared by every list-shaped recipient resolver
+/// (t-20260724035332273132-42380-3 rollout of the #2951 guard): drop names
+/// with no fleet.yaml instance — enqueueing to one just grows
+/// `~/.agend/inbox/<name>.jsonl` forever with nobody to drain it. A
+/// missing/unparseable fleet.yaml skips the filter (no fleet = no
+/// restriction, mirroring `tasks::acl::instance_exists`). `warned` is the
+/// caller's per-resolver dedup latch so each resolver warns at most once per
+/// process.
+fn drop_ghost_recipients(
+    home: &Path,
+    base: Vec<String>,
+    resolver: &'static str,
+    warned: &'static AtomicBool,
+) -> Vec<String> {
     let Some(instances) = fleet_instance_names(home) else {
         return base;
     };
     let (kept, dropped): (Vec<String>, Vec<String>) =
         base.into_iter().partition(|r| instances.contains(r));
-    if !dropped.is_empty() {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                dropped = ?dropped,
-                "helper-staleness recipients without a fleet.yaml instance \
-                 skipped (ghost-inbox guard)"
-            );
-        }
+    if !dropped.is_empty() && !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            resolver,
+            dropped = ?dropped,
+            "watchdog recipients without a fleet.yaml instance skipped \
+             (ghost-inbox guard)"
+        );
     }
     kept
+}
+
+/// Ghost-inbox guard for a single already-resolved recipient, used at the
+/// emit seams whose resolvers return one name (idle route, decision-timeout
+/// deliver): `true` when the name has a fleet.yaml instance, or when
+/// fleet.yaml is missing/unparseable (permissive — no fleet, no restriction).
+pub(crate) fn recipient_has_instance(home: &Path, name: &str) -> bool {
+    fleet_instance_names(home).is_none_or(|set| set.contains(name))
 }
 
 /// The fleet.yaml `instances:` name set; `None` when fleet.yaml is missing or
@@ -288,7 +302,8 @@ instances: {}
         let _g = env_guard();
         clear_env();
         let home = tmp_home("defaults");
-        write_fleet(&home, "instances: {}\n");
+        // Recipients need instances since the ghost-inbox guard rollout.
+        write_fleet(&home, "instances:\n  general: {}\n  lead: {}\n");
         assert_eq!(resolve_idle_watchdog_agent(&home), None);
         assert_eq!(resolve_dev_idle_recipient(&home), "lead");
         // #1563: fleet-idle default must be lead, not general.
@@ -318,7 +333,8 @@ watchdog:
   task_stall_recipients:
     - yaml-a
   decision_timeout_recipient: yaml-dec
-instances: {}
+instances:
+  yaml-a: {}
 "#,
         );
         assert_eq!(resolve_dev_idle_recipient(&home), "yaml-dev");
@@ -352,7 +368,7 @@ instances: {}
         clear_env();
         std::env::set_var("AGEND_TASK_STALL_RECIPIENTS", " alice, bob ,, carol ");
         let home = tmp_home("stall-split");
-        write_fleet(&home, "instances: {}\n");
+        write_fleet(&home, "instances:\n  general: {}\n  lead: {}\n");
         assert_eq!(
             resolve_task_stall_recipients(&home),
             vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]

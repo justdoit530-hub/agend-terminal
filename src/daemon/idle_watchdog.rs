@@ -752,6 +752,22 @@ fn route_idle_alert(
     text: &str,
     correlation_agent: Option<&str>,
 ) {
+    // Ghost-inbox guard (t-20260724035332273132-42380-3): a recipient with no
+    // fleet.yaml instance would accumulate alerts in an inbox nobody drains.
+    // One seam covers BOTH the dev and fleet vantages. Missing fleet.yaml
+    // stays permissive.
+    if !crate::fleet::watchdog::recipient_has_instance(home, recipient) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                recipient,
+                kind,
+                "idle alert dropped — recipient has no fleet.yaml instance \
+                 (ghost-inbox guard)"
+            );
+        }
+        return;
+    }
     // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path. The
     // recipient is already resolved by the caller and carried on the event.
     crate::daemon::event_bus::global().emit(
@@ -1251,7 +1267,8 @@ mod tests {
         let home = tmp_home("fleet-dev-route");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "watchdog:\n  idle_watchdog_agent: dev\n  dev_recipient: custom-arbiter\ninstances: {}\n",
+            "watchdog:\n  idle_watchdog_agent: dev\n  dev_recipient: custom-arbiter\n\
+             instances:\n  custom-arbiter: {}\n",
         )
         .unwrap();
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
@@ -1803,7 +1820,7 @@ mod tests {
         let home = tmp_home("per-agent-override");
         write_fleet_yaml(
             &home,
-            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n",
+            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n  lead:\n    backend: claude\n",
         );
         let stale = chrono::Utc::now() - chrono::Duration::seconds(400);
         write_activity_at(&home, "fast-reviewer", stale);
@@ -1831,7 +1848,7 @@ mod tests {
         let home = tmp_home("per-agent-within");
         write_fleet_yaml(
             &home,
-            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n",
+            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n  lead:\n    backend: claude\n",
         );
         let recent = chrono::Utc::now() - chrono::Duration::seconds(200);
         write_activity_at(&home, "fast-reviewer", recent);
@@ -1851,7 +1868,10 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("per-agent-fallback");
-        write_fleet_yaml(&home, "instances:\n  slow-dev:\n    backend: claude\n");
+        write_fleet_yaml(
+            &home,
+            "instances:\n  slow-dev:\n    backend: claude\n  lead:\n    backend: claude\n",
+        );
         // Stale beyond global threshold (3600s default)
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "slow-dev", stale);
@@ -1874,7 +1894,7 @@ mod tests {
         let home = tmp_home("per-agent-task-info");
         write_fleet_yaml(
             &home,
-            "instances:\n  dev:\n    backend: claude\n    timeout_secs: 300\n",
+            "instances:\n  dev:\n    backend: claude\n    timeout_secs: 300\n  lead:\n    backend: claude\n",
         );
         // Create an in-progress task owned by "dev"
         let event = crate::task_events::TaskEvent::Created {
