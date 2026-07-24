@@ -1109,6 +1109,60 @@ pub fn spawn_agent(
                 );
             }
         }
+
+        // Cockpit token isolation: cockpit broadcasts the currently-active
+        // Google account's OAuth token to two shared locations on every
+        // token refresh (~1 h) and on manual account switch, causing all agy
+        // workers to drift to the same account. Clear both paths before spawn
+        // so agy falls back to $HOME/.gemini/oauth_creds.json, which is
+        // per-worker and never touched by cockpit.
+        //
+        // Path 1 — shared macOS Keychain (service="gemini", account="antigravity"):
+        //   used by ALL agy processes regardless of HOME; deleting it is safe
+        //   because oauth_creds.json is the authoritative fallback.
+        // Path 2 — per-HOME antigravity-oauth-token: cockpit overwrites every
+        //   worker HOME's copy with the same active-account token.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("security")
+                .args([
+                    "delete-generic-password",
+                    "-s", "gemini",
+                    "-a", "antigravity",
+                ])
+                .output();
+            tracing::info!(
+                target: "agy_auth",
+                agent = %name,
+                "agy pre-spawn: cleared shared Keychain entry (gemini/antigravity)"
+            );
+        }
+
+        let agy_home: Option<PathBuf> = config
+            .env
+            .and_then(|e| e.get("HOME"))
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir);
+        if let Some(ref h) = agy_home {
+            let token_file = h.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            if token_file.exists() {
+                match std::fs::remove_file(&token_file) {
+                    Ok(()) => tracing::info!(
+                        target: "agy_auth",
+                        agent = %name,
+                        path = %token_file.display(),
+                        "agy pre-spawn: cleared cockpit-broadcast token file"
+                    ),
+                    Err(e) => tracing::warn!(
+                        target: "agy_auth",
+                        agent = %name,
+                        path = %token_file.display(),
+                        error = %e,
+                        "agy pre-spawn: failed to remove cockpit token file"
+                    ),
+                }
+            }
+        }
     }
 
     let pty_system = native_pty_system();
