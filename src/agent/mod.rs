@@ -1110,34 +1110,13 @@ pub fn spawn_agent(
             }
         }
 
-        // Cockpit token isolation: cockpit broadcasts the currently-active
-        // Google account's OAuth token to two shared locations on every
-        // token refresh (~1 h) and on manual account switch, causing all agy
-        // workers to drift to the same account. Clear both paths before spawn
-        // so agy falls back to $HOME/.gemini/oauth_creds.json, which is
-        // per-worker and never touched by cockpit.
-        //
-        // Path 1 — shared macOS Keychain (service="gemini", account="antigravity"):
-        //   used by ALL agy processes regardless of HOME; deleting it is safe
-        //   because oauth_creds.json is the authoritative fallback.
-        // Path 2 — per-HOME antigravity-oauth-token: cockpit overwrites every
-        //   worker HOME's copy with the same active-account token.
-        #[cfg(target_os = "macos")]
-        {
-            let _ = std::process::Command::new("security")
-                .args([
-                    "delete-generic-password",
-                    "-s", "gemini",
-                    "-a", "antigravity",
-                ])
-                .output();
-            tracing::info!(
-                target: "agy_auth",
-                agent = %name,
-                "agy pre-spawn: cleared shared Keychain entry (gemini/antigravity)"
-            );
-        }
-
+        // Cockpit token isolation: cockpit overwrites each worker HOME's
+        // antigravity-oauth-token on every token refresh (~1 h), causing drift
+        // to the cockpit active account. Clear the per-HOME file before spawn
+        // so agy falls back to $HOME/.gemini/oauth_creds.json instead.
+        // NOTE: do NOT delete the shared macOS Keychain entry here — it is
+        // system-wide and deleting it invalidates all concurrently running
+        // agy processes, triggering unwanted browser re-auth flows.
         let agy_home: Option<PathBuf> = config
             .env
             .and_then(|e| e.get("HOME"))
