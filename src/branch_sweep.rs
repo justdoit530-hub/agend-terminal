@@ -1436,6 +1436,8 @@ mod tests {
             ],
         );
         origin
+    }
+
     // PR-A RED: preservation evidence is returned through the real
     // cleanup_merged_branches dry-run handler. These assertions deliberately
     // use JSON fields so the RED commit compiles against the pre-feature
