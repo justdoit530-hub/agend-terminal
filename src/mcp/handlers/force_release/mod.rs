@@ -98,7 +98,13 @@ pub(crate) fn handle_force_release_worktree(
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
-    match rebase_clean_self(home, agent, branch, source_repo_hint.as_deref(), _sender.as_ref().map(Sender::as_str)) {
+    match rebase_clean_self(
+        home,
+        agent,
+        branch,
+        source_repo_hint.as_deref(),
+        _sender.as_ref().map(Sender::as_str),
+    ) {
         Ok(o) => {
             // #826 L2 GC: when the binding-clear path short-circuited
             // on "no binding" (the post-disband state), the

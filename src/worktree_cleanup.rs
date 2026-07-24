@@ -366,7 +366,6 @@ const SQUASH_GC_MIN_TIP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 const REVIEW_SCAFFOLD_TTL: Duration = Duration::from_secs(72 * 60 * 60);
 
-
 fn is_stale_review_scaffold(repo_root: &Path, branch: &str) -> bool {
     if !crate::branch_sweep::is_reviewer_checkout(branch) {
         return false;

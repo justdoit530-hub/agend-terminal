@@ -341,7 +341,6 @@ pub(crate) fn mock_live_agent_with_context(
     (handle, reader)
 }
 
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {

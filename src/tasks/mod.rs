@@ -606,7 +606,10 @@ impl std::fmt::Display for TaskRouteError {
                 write!(f, "task route unreadable ({}): {cause}", path.display())
             }
             TaskRouteError::Ambiguous { candidates, cause } => {
-                write!(f, "task route ambiguous (candidates: {candidates:?}): {cause}")
+                write!(
+                    f,
+                    "task route ambiguous (candidates: {candidates:?}): {cause}"
+                )
             }
         }
     }
@@ -622,13 +625,14 @@ pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, Task
     // Under our single-board layout, search DEFAULT_PROJECT's board first.
     let default_project = crate::task_events::DEFAULT_PROJECT;
     let board = crate::task_events::board_root(home, default_project);
-    let state = crate::task_events::replay_at(&board).map_err(|e| {
-        TaskRouteError::Unreadable {
-            path: board.clone(),
-            cause: e.to_string(),
-        }
+    let state = crate::task_events::replay_at(&board).map_err(|e| TaskRouteError::Unreadable {
+        path: board.clone(),
+        cause: e.to_string(),
     })?;
-    if let Some(record) = state.tasks.get(&crate::task_events::TaskId(task_id.to_string())) {
+    if let Some(record) = state
+        .tasks
+        .get(&crate::task_events::TaskId(task_id.to_string()))
+    {
         return Ok(RoutedTask {
             task: record_to_task(record),
         });
@@ -641,7 +645,10 @@ pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, Task
             let path = entry.path();
             if path.is_dir() && path != board {
                 if let Ok(state) = crate::task_events::replay_at(&path) {
-                    if let Some(record) = state.tasks.get(&crate::task_events::TaskId(task_id.to_string())) {
+                    if let Some(record) = state
+                        .tasks
+                        .get(&crate::task_events::TaskId(task_id.to_string()))
+                    {
                         return Ok(RoutedTask {
                             task: record_to_task(record),
                         });
@@ -659,11 +666,9 @@ pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> 
     // Default board
     let default_project = crate::task_events::DEFAULT_PROJECT;
     let board = crate::task_events::board_root(home, default_project);
-    let state = crate::task_events::replay_at(&board).map_err(|e| {
-        TaskRouteError::Unreadable {
-            path: board.clone(),
-            cause: e.to_string(),
-        }
+    let state = crate::task_events::replay_at(&board).map_err(|e| TaskRouteError::Unreadable {
+        path: board.clone(),
+        cause: e.to_string(),
     })?;
     for record in state.tasks.values() {
         tasks.push(record_to_task(record));
@@ -690,4 +695,3 @@ pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> 
 
     Ok(tasks)
 }
-

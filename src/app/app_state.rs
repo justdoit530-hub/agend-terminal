@@ -6,13 +6,11 @@ use std::collections::HashMap;
 use crossterm::event::{Event, KeyEventKind};
 use ratatui::DefaultTerminal;
 
-use super::*;
-use crate::agent::AgentRegistry;
 use super::frame_timing::trace_tty_size;
 use super::overlay::Overlay;
-use super::{
-    flush_idle_notifications, kill_agent, sync_notification_state, write_to_focused,
-};
+use super::*;
+use super::{flush_idle_notifications, kill_agent, sync_notification_state, write_to_focused};
+use crate::agent::AgentRegistry;
 
 /// #2453: typed restart sub-owner. Fields are retained for the structural
 /// contract even when this fork has no live restart machinery wired yet.
@@ -391,7 +389,8 @@ impl AppState {
                 if self.booting {
                     render::render_boot_indicator(
                         frame,
-                        self.attaches_expected.saturating_sub(self.pending_fwd.len()),
+                        self.attaches_expected
+                            .saturating_sub(self.pending_fwd.len()),
                         self.attaches_expected,
                     );
                 }
@@ -513,7 +512,12 @@ impl AppState {
         outcome: Result<pane_factory::AttachOutcome, crossbeam_channel::RecvError>,
         deps: &AppDeps<'_>,
     ) {
-        let AppDeps { home, registry, wakeup_tx, .. } = *deps;
+        let AppDeps {
+            home,
+            registry,
+            wakeup_tx,
+            ..
+        } = *deps;
         self.dirty = true;
         if let Ok(outcome) = outcome {
             let pane_id = outcome.pane_id();
@@ -641,9 +645,12 @@ impl AppState {
                                 "reused retained tab for re-appeared remote agent (no duplicate)"
                             );
                         } else {
-                            self.ui.layout.push_tab_preserve_focus(
-                                crate::layout::Tab::new(tab_name.to_string(), pane),
-                            );
+                            self.ui
+                                .layout
+                                .push_tab_preserve_focus(crate::layout::Tab::new(
+                                    tab_name.to_string(),
+                                    pane,
+                                ));
                             tracing::info!(
                                 agent = %name,
                                 "opened tab for newly-appeared remote agent"

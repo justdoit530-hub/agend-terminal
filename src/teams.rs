@@ -343,9 +343,9 @@ pub fn delete(home: &Path, args: &Value) -> Value {
                 "#1903: task cancel failed during team disband"
             );
         }
-        if let Err(e) =
-            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(home, member, None)
-        {
+        if let Err(e) = crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(
+            home, member, None,
+        ) {
             cascade_warnings.push(format!("{member}: {e}"));
             tracing::warn!(
                 team = %name,

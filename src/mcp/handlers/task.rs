@@ -90,7 +90,9 @@ pub(super) fn handle_create_team(
     args: &Value,
     runtime: Option<&RuntimeContext>,
 ) -> Value {
-    if let Ok(val) = crate::mcp::handlers::runtime_bridge::create_team_in_process(home, runtime, args) {
+    if let Ok(val) =
+        crate::mcp::handlers::runtime_bridge::create_team_in_process(home, runtime, args)
+    {
         return val;
     }
     crate::teams::create(home, args)
@@ -109,7 +111,9 @@ pub(super) fn handle_update_team(
     args: &Value,
     runtime: Option<&RuntimeContext>,
 ) -> Value {
-    if let Ok(val) = crate::mcp::handlers::runtime_bridge::update_team_in_process(home, runtime, args) {
+    if let Ok(val) =
+        crate::mcp::handlers::runtime_bridge::update_team_in_process(home, runtime, args)
+    {
         return val;
     }
     crate::teams::update(home, args)

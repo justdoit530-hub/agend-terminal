@@ -617,7 +617,6 @@ fn resolve_branch_cleanup(
     }
 }
 
-
 /// Parse `.agend-managed` key=value lines. Distinguishes a MISSING `source_repo`
 /// line (legacy pre-#2860) from an explicit blank value.
 #[derive(Debug, Default)]

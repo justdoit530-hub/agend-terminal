@@ -6,11 +6,11 @@ use std::path::Path;
 
 use crossterm::event::{KeyEvent, MouseEvent};
 
+use super::mouse;
+use super::overlay::{self, Overlay, OverlayCtx};
 use super::*;
 use crate::agent::AgentRegistry;
 use crate::layout::Layout;
-use super::mouse;
-use super::overlay::{self, Overlay, OverlayCtx};
 
 pub(super) struct UiState {
     pub(super) layout: Layout,

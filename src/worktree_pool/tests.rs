@@ -3419,8 +3419,7 @@ fn target_sweep_skips_when_bind_lock_contended() {
 fn arch14_lease_marker_writes_canonical_source_repo() {
     let home = tmp_home("arch14-lease-src");
     let repo = tmp_repo("arch14-lease-src-repo");
-    let lease = super::lease(&home, &repo, "dev-a", "feat/arch14-src")
-        .expect("lease must succeed");
+    let lease = super::lease(&home, &repo, "dev-a", "feat/arch14-src").expect("lease must succeed");
     let marker = std::fs::read_to_string(lease.path.join(MANAGED_MARKER)).expect("marker");
     assert!(
         marker.contains("agent=dev-a\n"),
@@ -3446,8 +3445,7 @@ fn arch14_lease_marker_write_failure_fails_loud() {
     let home = tmp_home("arch14-lease-fail");
     let repo = tmp_repo("arch14-lease-fail-repo");
     // First lease succeeds and creates the worktree.
-    let lease = super::lease(&home, &repo, "dev-b", "feat/arch14-fail")
-        .expect("first lease");
+    let lease = super::lease(&home, &repo, "dev-b", "feat/arch14-fail").expect("first lease");
     // Block the marker path with a directory so the re-write on re-lease fails.
     let marker = lease.path.join(MANAGED_MARKER);
     std::fs::remove_file(&marker).ok();
@@ -3479,7 +3477,12 @@ fn arch14_lease_marker_write_failure_fails_loud() {
     if lease.path.exists() {
         let _ = crate::git_helpers::git_bypass(
             &repo,
-            &["worktree", "remove", "--force", &lease.path.display().to_string()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &lease.path.display().to_string(),
+            ],
         );
         let _ = std::fs::remove_dir_all(&lease.path);
     }
@@ -3494,8 +3497,7 @@ fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
     let repo = tmp_repo("arch14-absent-repo");
     // Create a real managed worktree via lease, then drop the binding so only
     // the marker remains (ghost residue).
-    let lease = super::lease(&home, &repo, "ghost-a", "feat/ghost")
-        .expect("lease");
+    let lease = super::lease(&home, &repo, "ghost-a", "feat/ghost").expect("lease");
     // Rewrite marker to LEGACY three-line shape (no source_repo line).
     std::fs::write(
         lease.path.join(MANAGED_MARKER),
@@ -3562,8 +3564,8 @@ fn arch14_absent_binding_zero_byte_marker_still_refused() {
 fn arch14_worktree_create_first_marker_writes_source_repo() {
     let home = tmp_home("arch14-create-src");
     let repo = tmp_repo("arch14-create-src-repo");
-    let info = crate::worktree::create(&home, &repo, "agent-c", Some("feat/create-src"))
-        .expect("create");
+    let info =
+        crate::worktree::create(&home, &repo, "agent-c", Some("feat/create-src")).expect("create");
     let marker = std::fs::read_to_string(info.path.join(MANAGED_MARKER)).expect("marker");
     let canonical = std::fs::canonicalize(&repo).expect("canon");
     assert!(
@@ -3573,7 +3575,12 @@ fn arch14_worktree_create_first_marker_writes_source_repo() {
     if info.path.exists() {
         let _ = crate::git_helpers::git_bypass(
             &repo,
-            &["worktree", "remove", "--force", &info.path.display().to_string()],
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &info.path.display().to_string(),
+            ],
         );
         let _ = std::fs::remove_dir_all(&info.path);
     }
@@ -3626,7 +3633,13 @@ fn make_review_branch(repo: &Path, name: &str) -> String {
     tip
 }
 
-fn binding_with_lease(branch: &str, repo: &str, kind: Option<&str>, assign: Option<&str>, expected_head: Option<&str>) -> serde_json::Value {
+fn binding_with_lease(
+    branch: &str,
+    repo: &str,
+    kind: Option<&str>,
+    assign: Option<&str>,
+    expected_head: Option<&str>,
+) -> serde_json::Value {
     let mut b = serde_json::json!({
         "branch": branch,
         "repo": repo,

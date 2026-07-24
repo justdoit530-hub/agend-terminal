@@ -1041,7 +1041,8 @@ pub fn record_verdict(
             // it (no double-notify). REJECTED/UNVERIFIED never reach merge-ready,
             // so they always notify (the author must learn they need to fix).
             if !is_merge_ready(s) {
-                let recipient = resolve_notify_recipient_precomputed(s, binding_recipient.as_deref());
+                let recipient =
+                    resolve_notify_recipient_precomputed(s, binding_recipient.as_deref());
                 let body = format_verdict_body(s, reviewer, label);
                 let msg = crate::inbox::InboxMessage::new_system(
                     "system:pr-state",
@@ -1163,8 +1164,7 @@ fn resolve_binding_notify_recipient(home: &Path, repo: &str, branch: &str) -> Op
     if repo.is_empty() || branch.is_empty() {
         return None;
     }
-    let canonical_repo =
-        crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(repo)?;
+    let canonical_repo = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(repo)?;
     let mut legacy_recipient = None;
     for (agent, binding) in crate::binding::binding_scan_all(home) {
         if binding["branch"].as_str() != Some(branch) {
@@ -1193,7 +1193,9 @@ fn resolve_binding_notify_recipient(home: &Path, repo: &str, branch: &str) -> Op
         }
         let source_slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(source_repo)
             .or_else(|| {
-                crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(source_repo))
+                crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(Path::new(
+                    source_repo,
+                ))
             });
         if source_slug.as_deref() == Some(canonical_repo.as_str()) {
             return Some(agent);
@@ -3592,7 +3594,8 @@ mod tests {
     /// branch-only scan happens to enumerate first.
     #[test]
     fn review_verdict_routes_same_branch_by_binding_repo_2920() {
-        let root = std::env::temp_dir().join(format!("agend-2920-collision-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("agend-2920-collision-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let home = root.join("home");
         std::fs::create_dir_all(&home).unwrap();

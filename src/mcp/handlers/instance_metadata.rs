@@ -267,13 +267,8 @@ pub(super) fn handle_report_health(
         return json!({"error": format!("unknown reason: {reason_str}")});
     };
     let note = args["note"].as_str();
-    match crate::agent_ops::set_blocked_reason(
-        &runtime.registry,
-        home,
-        instance_name,
-        reason,
-        note,
-    ) {
+    match crate::agent_ops::set_blocked_reason(&runtime.registry, home, instance_name, reason, note)
+    {
         Some(out) => json!({
             "status": "reason_set",
             "reason": reason_str,

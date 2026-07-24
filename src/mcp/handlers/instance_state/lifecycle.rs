@@ -104,7 +104,8 @@ pub(crate) fn full_delete_instance(
     // Prefer in-process DELETE via runtime_bridge::delete_in_process
     // (RuntimeContext or pending registry). Socket loopback only when neither
     // is available (cross-process TUI -> standalone daemon).
-    if crate::mcp::handlers::runtime_bridge::delete_in_process(home, runtime, name, false).is_err() {
+    if crate::mcp::handlers::runtime_bridge::delete_in_process(home, runtime, name, false).is_err()
+    {
         let _ = crate::api::call(
             home,
             &json!({"method": crate::api::method::DELETE, "params": {"name": name}}),

@@ -364,11 +364,7 @@ fn spawn_and_subscribe(
                     team: None,
                     extra_instructions: None,
                 };
-                crate::instructions::generate_with_context(
-                    work_dir,
-                    &behavior_command,
-                    Some(&ctx),
-                );
+                crate::instructions::generate_with_context(work_dir, &behavior_command, Some(&ctx));
             }
             SpawnIdentity::UnmanagedLocalShell => {
                 crate::instructions::generate(work_dir, &behavior_command);
@@ -875,15 +871,8 @@ pub(super) fn run_attach(
             let mut args = resolved.args.clone();
             if let Some(ref model) = resolved.model {
                 // #2744 / #2801: declared identity drives model format + shell withhold.
-                if !matches!(
-                    resolved.backend,
-                    Backend::Shell | Backend::Raw(_)
-                ) {
-                    Backend::push_model_arg(
-                        &mut args,
-                        &resolved.backend.command_string(),
-                        model,
-                    );
+                if !matches!(resolved.backend, Backend::Shell | Backend::Raw(_)) {
+                    Backend::push_model_arg(&mut args, &resolved.backend.command_string(), model);
                 }
             }
             let command = resolved.backend_command.clone();

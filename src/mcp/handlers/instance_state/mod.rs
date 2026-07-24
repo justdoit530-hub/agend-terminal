@@ -136,12 +136,7 @@ pub(super) fn handle_create_instance(
                                 // registries were captured; otherwise skip (no socket).
                                 if let (Some(reg), Some(ext)) = (&registry, &externals) {
                                     if let Err(e) = crate::agent_ops::inject_input(
-                                        reg,
-                                        ext,
-                                        &home,
-                                        inst_name,
-                                        &task_text,
-                                        false,
+                                        reg, ext, &home, inst_name, &task_text, false,
                                     ) {
                                         tracing::warn!(
                                             agent = %inst_name,
@@ -383,8 +378,7 @@ pub(super) fn handle_replace_instance(
         spawn_params["working_directory"] = json!(wd);
     }
     // #2454 Slice 2: SPAWN in-process.
-    let spawn_result =
-        super::runtime_bridge::spawn_in_process(home, runtime, &spawn_params);
+    let spawn_result = super::runtime_bridge::spawn_in_process(home, runtime, &spawn_params);
 
     let spawned = spawn_result
         .as_ref()
@@ -575,8 +569,7 @@ pub(super) fn handle_restart_instance(
         mode,
     );
 
-    let spawn_result =
-        super::runtime_bridge::spawn_in_process(home, runtime, &spawn_params);
+    let spawn_result = super::runtime_bridge::spawn_in_process(home, runtime, &spawn_params);
     let spawned = spawn_result
         .as_ref()
         .map(|r| r["ok"].as_bool() == Some(true))
@@ -603,7 +596,9 @@ pub(super) fn handle_restart_instance(
 pub(crate) fn restart_instance_autonomic(home: &Path, name: &str, reason: &str) -> bool {
     let result = handle_restart_instance(
         home,
-        &json!({"name": name, "mode": "fresh", "reason": reason}), None);
+        &json!({"name": name, "mode": "fresh", "reason": reason}),
+        None,
+    );
     result
         .get("spawned")
         .and_then(serde_json::Value::as_bool)
@@ -702,7 +697,9 @@ mod tests {
         // fresh + dirty + no force → refused at the guard (before any spawn).
         let refused = handle_restart_instance(
             &home,
-            &serde_json::json!({"instance": "dev", "mode": "fresh"}), None);
+            &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+            None,
+        );
         assert_eq!(
             refused["code"], "uncommitted_work_at_risk",
             "got: {refused}"
@@ -711,7 +708,9 @@ mod tests {
         // force bypasses the guard (proceeds past it — a later error is NOT the guard).
         let forced = handle_restart_instance(
             &home,
-            &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}), None);
+            &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+            None,
+        );
         assert_ne!(
             forced["code"], "uncommitted_work_at_risk",
             "force must bypass: {forced}"
@@ -720,7 +719,9 @@ mod tests {
         // resume keeps context → never guarded.
         let resumed = handle_restart_instance(
             &home,
-            &serde_json::json!({"instance": "dev", "mode": "resume"}), None);
+            &serde_json::json!({"instance": "dev", "mode": "resume"}),
+            None,
+        );
         assert_ne!(
             resumed["code"], "uncommitted_work_at_risk",
             "resume must not guard: {resumed}"
