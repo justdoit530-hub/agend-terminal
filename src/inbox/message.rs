@@ -143,6 +143,10 @@ pub struct InboxMessage {
     /// this flag is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_assignment: Option<crate::review_receipt::ReviewAssignmentEnvelope>,
 }
 
 /// Metadata attached to a forced delegation (busy gate override).

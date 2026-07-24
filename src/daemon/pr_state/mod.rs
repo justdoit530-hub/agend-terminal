@@ -119,8 +119,21 @@ pub struct PrState {
     /// files written before this field existed.
     #[serde(default)]
     pub closed_unmerged_pending: bool,
+    #[serde(default)]
+    pub reserved_assignments: Vec<ReservedAssignment>,
+    #[serde(default)]
+    pub authority_unknown: bool,
+    #[serde(default)]
+    pub validated_review_receipts: Vec<crate::review_receipt::ReviewReceiptSummary>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReservedAssignment {
+    pub target: String,
+    pub review_author: crate::mcp::handlers::comms_gates::ReviewAuthor,
+    pub assignment_id: uuid::Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -184,12 +197,13 @@ pub enum DraftState {
     Draft,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReviewClass {
     /// §3.6 — single VERIFIED triggers MergeReady.
     Single,
     /// §3.5 — two VERIFIED required.
     Dual,
+    Unresolved,
 }
 
 impl ReviewClass {
@@ -197,6 +211,7 @@ impl ReviewClass {
         match self {
             ReviewClass::Single => 1,
             ReviewClass::Dual => 2,
+            ReviewClass::Unresolved => usize::MAX,
         }
     }
 }
@@ -827,6 +842,9 @@ pub fn new_for_branch(
         gh_poll_failures: 0,
         last_gh_state: None,
         closed_unmerged_pending: false,
+        reserved_assignments: Vec::new(),
+        authority_unknown: false,
+        validated_review_receipts: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     }
@@ -1088,6 +1106,30 @@ pub fn resolve_author(state: &PrState) -> String {
     "fixup-lead".to_string()
 }
 
+pub(crate) fn list_state_identities(home: &Path) -> Vec<(String, String)> {
+    let dir = pr_state_dir(home);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(_e) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_pr_state_file(&path) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Ok(state) = serde_json::from_str::<PrState>(&content) {
+            out.push((state.repo, state.branch));
+        }
+    }
+    out
+}
+
 /// t-verdict-to-author-routing-design (#2): resolve the AGENT to notify for an
 /// author-facing pr-state signal (`[review-verdict]`, `[pr-ready-for-merge]`).
 ///
@@ -1324,6 +1366,9 @@ mod tests {
             gh_poll_failures: 0,
             last_gh_state: None,
             closed_unmerged_pending: false,
+            reserved_assignments: Vec::new(),
+            authority_unknown: false,
+            validated_review_receipts: Vec::new(),
             created_at: now(),
             updated_at: now(),
         }

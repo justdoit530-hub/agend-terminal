@@ -358,6 +358,8 @@ pub(super) fn handle_replace_instance(
                 in_reply_to_msg_id: None,
                 in_reply_to_excerpt: None,
                 superseded_by: None,
+                delivery_nonce: None,
+                review_assignment: None,
                 from_id: None,
                 broadcast_context: None,
                 sequencing: None,

@@ -2,6 +2,7 @@
 //! schedule checking, health monitoring, Telegram notifications.
 
 pub(crate) mod anti_stall;
+pub(crate) mod assignment_authority;
 pub(crate) mod auto_release;
 pub(crate) mod boot_sweep;
 pub(crate) mod cadence_gate;
@@ -643,6 +644,7 @@ pub(crate) fn build_default_handlers(
         Box::new(per_tick::CheckSchedulesHandler::new()),
         Box::new(per_tick::CiWatchPollHandler::new()),
         Box::new(per_tick::PrStateScanHandler::new()),
+        Box::new(per_tick::assignment_reconcile::AssignmentReconcileHandler::new(1)),
         Box::new(per_tick::InboxMaintenanceHandler::new(60)),
         Box::new(per_tick::PollReminderHandler::new(30)),
         Box::new(per_tick::ContextWatermarkHandler::new(30)),

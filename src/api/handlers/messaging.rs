@@ -297,6 +297,8 @@ fn build_message(
         in_reply_to_msg_id: None,
         in_reply_to_excerpt: None,
         superseded_by: None,
+        delivery_nonce: None,
+        review_assignment: None,
         broadcast_context: params
             .get("broadcast_context")
             .and_then(|v| serde_json::from_value::<crate::inbox::BroadcastContext>(v.clone()).ok()),
@@ -2159,6 +2161,8 @@ mod tests {
             force_meta: None,
             correlation_id: Some(corr.to_string()),
             reviewed_head: None,
+            delivery_nonce: None,
+            review_assignment: None,
             from: "from:fixup-lead".to_string(),
             text: format!("seeded blocker {kind}"),
             kind: Some(kind.to_string()),
@@ -2256,6 +2260,8 @@ mod tests {
             force_meta: None,
             correlation_id: Some("corr-b3".to_string()),
             reviewed_head: None,
+            delivery_nonce: None,
+            review_assignment: None,
             from: "from:fixup-lead".to_string(),
             text: "undrained query".to_string(),
             kind: Some("query".to_string()),
