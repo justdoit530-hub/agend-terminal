@@ -64,11 +64,19 @@ pub fn auto_arm_unwatched_open_prs(home: &Path, repo: &str, prs: &[GhPrMetadata]
             continue;
         };
 
-        // Arm with the bound agent as the sole subscriber; next_after_ci unset →
-        // on CI pass the agent receives the informational `[ci-pass]` (PR-1 #1796
-        // fallback). The actionable `[ci-ready-for-action]` chain still requires
-        // an explicit next_after_ci (review handoff stays explicit, PR-2 #1797).
-        let args = serde_json::json!({ "repository": repo, "branch": branch });
+        // Arm with the bound agent as the sole subscriber. When the agent is a
+        // non-orchestrator team member, populate next_after_ci with the team
+        // orchestrator so CI pass fires actionable `[ci-ready-for-action]`
+        // (PR-2 #1797) instead of informational-only `[ci-pass]` (PR-1 #1796).
+        // Upstream #2912 / arch14. task_id and review_class intentionally left
+        // absent (Unresolved/fail-closed) — auto-arm is a best-effort fallback,
+        // not a dispatch.
+        let mut args = serde_json::json!({ "repository": repo, "branch": branch });
+        if let Some(orch) = crate::fleet::team_orchestrator_for(home, &agent) {
+            if orch != agent {
+                args["next_after_ci"] = serde_json::json!(orch);
+            }
+        }
         let resp = crate::mcp::handlers::ci::handle_watch_ci(home, &args, &agent);
         if let Some(err) = resp.get("error").and_then(|e| e.as_str()) {
             tracing::warn!(
@@ -163,6 +171,54 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn watch_json(home: &Path, branch: &str) -> serde_json::Value {
+        let path = crate::daemon::ci_watch::ci_watches_dir(home)
+            .join(crate::daemon::ci_watch::watch_filename(REPO, branch));
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
+    }
+
+    fn write_fleet(home: &Path) {
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(home),
+            "instances:\n  dev-x:\n    backend: claude\n  lead:\n    backend: claude\n\
+             teams:\n  t:\n    members: [dev-x, lead]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+    }
+
+    /// Port of upstream #2912: auto-arm of a bound non-orchestrator team member
+    /// must set next_after_ci to the team orchestrator so CI-pass is actionable.
+    #[test]
+    fn auto_arm_team_member_carries_next_after_ci_orchestrator() {
+        let home = tmp_home("team-nac");
+        write_fleet(&home);
+        bind(&home, "dev-x", "feat/x");
+        auto_arm_unwatched_open_prs(
+            &home,
+            REPO,
+            &[meta("feat/x", GhPrState::Open, false, false)],
+        );
+        assert!(watch_exists(&home, "feat/x"), "watch must be armed");
+        let watch = watch_json(&home, "feat/x");
+        // Fork stores next_after_ci as Option<String> (not a multi-value list).
+        assert_eq!(
+            watch.get("next_after_ci").and_then(|v| v.as_str()),
+            Some("lead"),
+            "auto-arm of a non-orchestrator team member must carry \
+             next_after_ci=<team orchestrator>; got {:?}",
+            watch.get("next_after_ci")
+        );
+        assert!(
+            watch.get("task_id").and_then(|v| v.as_str()).is_none(),
+            "auto-arm must NOT fabricate a task_id"
+        );
+        assert!(
+            watch.get("review_class").and_then(|v| v.as_str()).is_none(),
+            "auto-arm must NOT set review_class (stays Unresolved/fail-closed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
