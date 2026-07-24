@@ -588,6 +588,7 @@ pub(crate) fn emit_delete_batch(
         confirm_ids,
         audit_reason,
     )
+    .map(|(count, _)| count)
 }
 
 /// Apply a branch-sweep confirmation with lifecycle evidence. The legacy
@@ -601,7 +602,7 @@ pub(crate) fn emit_delete_batch_with_context(
     categories: &Categories,
     confirm_ids: &std::collections::HashSet<String>,
     audit_reason: &str,
-) -> Result<usize, String> {
+) -> Result<(usize, Vec<serde_json::Value>), String> {
     // #2011: prune orphaned worktree REGISTRATIONS first, in the same
     // transaction as the branch deletions. A worktree whose physical
     // directory is gone (crashed release, manual rm, pre-prune-era leak)
@@ -638,6 +639,7 @@ pub(crate) fn emit_delete_batch_with_context(
         }
     };
     let mut deleted = 0usize;
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
     for name in confirm_ids {
         let Some(cand) = name_to_candidate.get(name.as_str()) else {
             continue;
@@ -695,14 +697,21 @@ pub(crate) fn emit_delete_batch_with_context(
             lifecycle,
             crate::worktree::disposition::BranchLifecycleDisposition::Delete
         ) {
+            let blocker = first_lifecycle_blocker(
+                terminal,
+                active_holder,
+                task_active,
+                open_pr,
+                unique_unpreserved_work,
+                provenance,
+            );
             crate::event_log::log(
                 home.unwrap_or(repo),
                 "branch_sweep_apply_skipped",
                 "system:branch_sweep",
-                &format!(
-                    "branch={name} reason=branch lifecycle evidence not terminal or provenance unknown; preserved"
-                ),
+                &format!("branch={name} blocker={blocker}"),
             );
+            skipped.push(serde_json::json!({"branch": name, "blocker": blocker}));
             continue;
         }
         let recovery_ref = if is_reviewer {
@@ -752,7 +761,55 @@ pub(crate) fn emit_delete_batch_with_context(
             }
         }
     }
-    Ok(deleted)
+    Ok((deleted, skipped))
+}
+
+fn first_lifecycle_blocker(
+    terminal: bool,
+    active_holder: Option<bool>,
+    task_active: Option<bool>,
+    open_pr: Option<bool>,
+    unique_unpreserved_work: Option<bool>,
+    provenance: crate::worktree::disposition::BranchProvenance,
+) -> &'static str {
+    if !terminal {
+        return "non_terminal";
+    }
+    if active_holder != Some(false) {
+        return if active_holder == Some(true) {
+            "active_holder"
+        } else {
+            "active_holder_unknown"
+        };
+    }
+    if task_active != Some(false) {
+        return if task_active == Some(true) {
+            "task_active"
+        } else {
+            "task_active_unknown"
+        };
+    }
+    if open_pr != Some(false) {
+        return if open_pr == Some(true) {
+            "open_pr"
+        } else {
+            "open_pr_status_unknown"
+        };
+    }
+    if unique_unpreserved_work != Some(false) {
+        return if unique_unpreserved_work == Some(true) {
+            "unique_unpreserved_work"
+        } else {
+            "unique_unpreserved_work_unknown"
+        };
+    }
+    if matches!(
+        provenance,
+        crate::worktree::disposition::BranchProvenance::Unknown
+    ) {
+        return "provenance_unknown";
+    }
+    "unknown"
 }
 
 fn branch_is_checked_out(repo: &Path, branch: &str) -> Option<bool> {
@@ -1004,6 +1061,60 @@ mod tests {
             .to_string();
         git_run(repo, &["checkout", "main"]);
         sha
+    }
+
+    fn bind_handler_repo(home: &Path, repo: &Path, agent: &str) {
+        let binding_dir = home.join("runtime").join(agent);
+        std::fs::create_dir_all(&binding_dir).expect("mkdir binding");
+        std::fs::write(
+            binding_dir.join("binding.json"),
+            serde_json::json!({
+                "source_repo": repo.display().to_string(),
+                "branch": "feature",
+                "worktree": repo.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("write binding");
+    }
+
+    fn handler_dry_run(home: &Path, repo: &Path, agent: &str) -> serde_json::Value {
+        bind_handler_repo(home, repo, agent);
+        crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            home,
+            &serde_json::json!({"instance": agent}),
+            agent,
+        )
+    }
+
+    fn reviewer_candidate<'a>(
+        response: &'a serde_json::Value,
+        name: &str,
+    ) -> &'a serde_json::Value {
+        response["categories"]["reviewer_checkout"]
+            .as_array()
+            .expect("reviewer_checkout array")
+            .iter()
+            .find(|candidate| candidate["name"] == name)
+            .unwrap_or_else(|| panic!("missing reviewer candidate {name}: {response}"))
+    }
+
+    fn add_local_bare_origin(repo: &Path) -> PathBuf {
+        let origin = repo.parent().expect("repo parent").join("origin.git");
+        git_run(
+            repo,
+            &["init", "--bare", origin.to_str().expect("origin path")],
+        );
+        git_run(
+            repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().expect("origin path"),
+            ],
+        );
+        origin
     }
 
     #[test]
@@ -1412,6 +1523,131 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.name == "wip-active"),
             "active_unknown branch must remain after explicit confirmation"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// RED: a clean-merged branch with a non-GitHub local origin causes
+    /// `open_pr_status` → `Unknown` → lifecycle Keep. The apply response
+    /// currently returns only `applied: 0` with zero structured explanation.
+    /// Assert that a `skipped` list surfaces the concrete blocker so
+    /// operators can distinguish "safely preserved because of open-PR
+    /// uncertainty" from "nothing matched".
+    #[test]
+    fn apply_skipped_surfaces_local_origin_unknown_pr_blocker() {
+        let repo = setup_repo("skip-local-pr-unknown");
+        let home = repo.parent().unwrap().to_path_buf();
+        let agent = "skip-pr-agent";
+
+        // Local bare origin → extract_github_repo returns None →
+        // OpenPrStatus::Unknown for any terminal branch.
+        add_local_bare_origin(&repo);
+
+        // Create a branch and merge it → clean_merged (terminal provenance).
+        create_branch_with_commit(&repo, "feat-merged-local", "feat: local work");
+        git_run(
+            &repo,
+            &[
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge feat-merged-local",
+                "feat-merged-local",
+            ],
+        );
+
+        bind_handler_repo(&home, &repo, agent);
+
+        // Apply with the merged branch → lifecycle Keep (open_pr = Unknown).
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({
+                "instance": agent,
+                "apply": true,
+                "confirm_ids": ["feat-merged-local"],
+                "audit_reason": "RED: verify skipped reason surfaces",
+            }),
+            agent,
+        );
+        assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
+
+        // The response MUST contain a structured skipped list.
+        let skipped = r["skipped"]
+            .as_array()
+            .unwrap_or_else(|| panic!("apply response must contain 'skipped' array, got: {r}"));
+        assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
+        assert_eq!(
+            skipped[0]["branch"], "feat-merged-local",
+            "skipped entry must name the branch: {r}"
+        );
+        assert_eq!(
+            skipped[0]["blocker"], "open_pr_status_unknown",
+            "skipped entry must pin the exact blocker: {r}"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    /// RED: a clean-merged branch with a live binding on another agent
+    /// causes `active_holder` → `Some(true)` → lifecycle Keep. The apply
+    /// response must surface the concrete binding blocker, not just
+    /// `applied: 0`.
+    #[test]
+    fn apply_skipped_surfaces_active_binding_blocker() {
+        let repo = setup_repo("skip-active-binding");
+        let home = repo.parent().unwrap().to_path_buf();
+        let caller = "skip-binding-caller";
+        let holder = "holder-agent";
+
+        // Create and merge a branch → clean_merged.
+        create_branch_with_commit(&repo, "feat-held", "feat: held work");
+        git_run(
+            &repo,
+            &["merge", "--no-ff", "-m", "merge feat-held", "feat-held"],
+        );
+
+        // Bind the caller agent so handle_cleanup finds source_repo.
+        bind_handler_repo(&home, &repo, caller);
+
+        // Create a SECOND agent's binding on the same branch + repo →
+        // branch_has_active_binding returns Some(true).
+        let holder_dir = home.join("runtime").join(holder);
+        std::fs::create_dir_all(&holder_dir).expect("holder dir");
+        std::fs::write(
+            holder_dir.join("binding.json"),
+            serde_json::json!({
+                "source_repo": repo.display().to_string(),
+                "branch": "feat-held",
+                "worktree": repo.display().to_string(),
+            })
+            .to_string(),
+        )
+        .expect("holder binding");
+
+        let r = crate::mcp::handlers::ci::handle_cleanup_merged_branches(
+            &home,
+            &serde_json::json!({
+                "instance": caller,
+                "apply": true,
+                "confirm_ids": ["feat-held"],
+                "audit_reason": "verify binding blocker surfaces",
+            }),
+            caller,
+        );
+        assert_eq!(r["applied"], 0, "branch must be preserved: {r}");
+
+        let skipped = r["skipped"]
+            .as_array()
+            .unwrap_or_else(|| panic!("apply response must contain 'skipped' array, got: {r}"));
+        assert_eq!(skipped.len(), 1, "exactly one skipped entry expected: {r}");
+        assert_eq!(
+            skipped[0]["branch"], "feat-held",
+            "skipped entry must name the branch: {r}"
+        );
+        assert_eq!(
+            skipped[0]["blocker"], "active_holder",
+            "skipped entry must pin the exact blocker: {r}"
         );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
