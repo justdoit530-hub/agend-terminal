@@ -119,6 +119,9 @@ pub(crate) enum BranchProvenance {
     /// `review/*` checkout). This is distinct from a forged name: callers
     /// still need all the terminal/occupancy/task/PR gates below.
     ReviewerResidue,
+    /// A branch whose tip commit is older than the stale_idle threshold and
+    /// is neither merged nor squash-merged.
+    StaleIdle,
     /// Evidence was missing or contradictory.
     Unknown,
 }
@@ -162,7 +165,8 @@ pub(crate) fn branch_lifecycle_disposition(
         BranchProvenance::ManagedReview
         | BranchProvenance::Merged
         | BranchProvenance::SquashMerged
-        | BranchProvenance::ReviewerResidue => BranchLifecycleDisposition::Delete,
+        | BranchProvenance::ReviewerResidue
+        | BranchProvenance::StaleIdle => BranchLifecycleDisposition::Delete,
         BranchProvenance::Unknown => BranchLifecycleDisposition::Keep,
     }
 }
@@ -575,5 +579,43 @@ mod tests {
                 "unsafe or unknown branch evidence must keep the ref"
             );
         }
+    }
+
+    #[test]
+    fn disposable_review_subject_pr_open_is_irrelevant_but_review_pr_protects() {
+        let mut input = branch_input(BranchProvenance::ManagedReview);
+        // The subject PR may remain open; the lifecycle probe is scoped to the
+        // disposable review branch itself, so no PR headed at this branch is
+        // evidence of safety to delete.
+        input.open_pr = Some(false);
+        assert_eq!(
+            branch_lifecycle_disposition(&input),
+            BranchLifecycleDisposition::Delete
+        );
+        input.open_pr = Some(true);
+        assert_eq!(
+            branch_lifecycle_disposition(&input),
+            BranchLifecycleDisposition::Keep
+        );
+    }
+
+    /// Bug 2 RED: stale_idle branches must be deletable via the lifecycle
+    /// classifier. Currently StaleIdle is grouped with Unknown => Keep, so
+    /// this assertion fails.
+    #[test]
+    fn branch_lifecycle_stale_idle_deletes() {
+        let input = BranchLifecycleInput {
+            provenance: BranchProvenance::StaleIdle,
+            terminal: true,
+            active_holder: Some(false),
+            task_active: Some(false),
+            open_pr: Some(false),
+            unique_unpreserved_work: Some(false),
+        };
+        assert_eq!(
+            branch_lifecycle_disposition(&input),
+            BranchLifecycleDisposition::Delete,
+            "stale_idle branches with all safety gates cleared must be deletable"
+        );
     }
 }
