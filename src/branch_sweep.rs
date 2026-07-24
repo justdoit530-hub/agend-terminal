@@ -736,6 +736,7 @@ fn local_sha_matches_merged_head(repo: &Path, local_sha: &str, head_ref_oid: &st
         )
 }
 
+#[allow(dead_code)]
 pub(crate) fn extract_github_repo_for_intent(url: &str) -> Option<String> {
     extract_github_repo(url)
 }
