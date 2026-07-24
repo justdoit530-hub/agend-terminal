@@ -26,6 +26,34 @@
 
 use std::path::Path;
 
+/// PR-A preservation classification is dry-run observability only. None of
+/// these values participate in `candidate_ids`, confirmation, or apply.
+#[derive(Debug, serde::Serialize)]
+struct PreservationEvidence {
+    classification: &'static str,
+    durable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unique_commit_count: Option<usize>,
+    note: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct SpikeResidueAnnotation {
+    name: String,
+    tip_sha: String,
+    annotation: &'static str,
+}
+
+#[derive(Debug)]
+enum ExternalInventory {
+    Available(Vec<String>),
+    LookupFailed(String),
+}
+
+/// Keep a network-backed dry-run probe below the MCP proxy budget. The result
+/// is computed once and reused for every reviewer candidate in the scan.
+const EXTERNAL_REF_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Threshold for `stale_idle` category. Branches whose tip commit
 /// committer-date is older than this AND not merged AND not squash-
 /// merged land in `stale_idle`. Operator can override via
@@ -620,6 +648,15 @@ pub(crate) fn open_pr_status(repo: &Path, _base: &str, branch: &str) -> OpenPrSt
     }
 }
 
+/// GitHub API based detection: query whether a merged PR exists for this
+/// branch with matching HEAD SHA. Most reliable — not affected by git history
+/// topology. SHA check prevents false positives from branch name reuse.
+///
+/// #P3: returns a TRI-STATE (`PrMergeStatus`) so a caller can tell "detection
+/// couldn't run" (`Unknown`) apart from "ran, no matching merged PR"
+/// (`NotMerged`). The private `is_squash_merged_diff` wrapper below collapses
+/// `Merged → true` / else → false to keep `is_squash_merged`'s Method-2
+/// behavior byte-identical.
 pub(crate) fn pr_merge_status(repo: &Path, base: &str, branch: &str) -> PrMergeStatus {
     // Resolve owner/repo from git remote origin.
     // W1.2 class-2: git_cmd always adds AGEND_GIT_BYPASS + trims stdout (this
@@ -676,6 +713,21 @@ fn is_squash_merged_diff(repo: &Path, base: &str, branch: &str) -> bool {
 
 /// True iff `head_ref_oid` (a merged PR's recorded HEAD SHA) equals
 /// `local_sha`, or `local_sha` is a strict ancestor of it.
+///
+/// t-20260704054810920172-67777-3: main's now-default strict-up-to-date
+/// branch protection means a required "Update branch" sync commit lands on
+/// the remote HEAD before the squash-merge — but this sweep's
+/// `fetch --prune` only refreshes remote-tracking refs, never fast-forwards
+/// the local branch ref itself, so `local_sha` stays one sync-commit behind
+/// `head_ref_oid` forever once the remote branch is deleted. is-ancestor
+/// accepts "local's own work is a strict prefix of what was actually merged"
+/// as proof; the caller's `state: "merged"` filter already guarantees
+/// `head_ref_oid` came from an actually-merged PR, so no unmerged work can
+/// ever satisfy this check (reflexive when equal, so this strictly extends
+/// rather than replaces the old exact-match behavior). Fails CLOSED (not a
+/// match) if the ancestor check itself errors — e.g. `head_ref_oid`'s commit
+/// no longer exists locally after the remote branch's deletion — via
+/// `git_ok`'s exit-code-0-only success semantics.
 fn local_sha_matches_merged_head(repo: &Path, local_sha: &str, head_ref_oid: &str) -> bool {
     head_ref_oid == local_sha
         || crate::git_helpers::git_ok(
@@ -684,7 +736,6 @@ fn local_sha_matches_merged_head(repo: &Path, local_sha: &str, head_ref_oid: &st
         )
 }
 
-#[allow(dead_code)] // wired in upstream #2807 but intentionally unconnected here
 pub(crate) fn extract_github_repo_for_intent(url: &str) -> Option<String> {
     extract_github_repo(url)
 }
@@ -886,6 +937,7 @@ pub(crate) fn emit_delete_batch_with_context(
         .iter()
         .chain(categories.squash_merged.iter())
         .chain(categories.stale_idle.iter())
+        .chain(categories.reviewer_checkout.iter())
         .chain(categories.active_unknown.iter())
     {
         name_to_candidate.insert(cand.name.as_str(), cand);
@@ -897,6 +949,8 @@ pub(crate) fn emit_delete_batch_with_context(
             "squash_merged"
         } else if categories.stale_idle.iter().any(|c| c.name == name) {
             "stale_idle"
+        } else if categories.reviewer_checkout.iter().any(|c| c.name == name) {
+            "reviewer_checkout"
         } else {
             "active_unknown"
         }
@@ -1381,6 +1435,223 @@ mod tests {
             ],
         );
         origin
+    // PR-A RED: preservation evidence is returned through the real
+    // cleanup_merged_branches dry-run handler. These assertions deliberately
+    // use JSON fields so the RED commit compiles against the pre-feature
+    // Candidate type and fails at the actual public response boundary.
+    #[test]
+    fn review_preservation_main_reachable_is_observability_only() {
+        let repo = setup_repo("preservation_main");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo);
+        git_run(&repo, &["branch", "tmp_main_reachable", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-main-agent");
+        let candidate = reviewer_candidate(&response, "tmp_main_reachable");
+        assert_eq!(
+            candidate["preservation"]["classification"], "MAIN_REACHABLE",
+            "main ancestry must be surfaced as current evidence: {response}"
+        );
+        assert_eq!(candidate["preservation"]["durable"], false);
+        assert!(
+            response["candidate_ids"]
+                .as_array()
+                .expect("candidate_ids")
+                .iter()
+                .any(|id| id == "tmp_main_reachable"),
+            "PR-A is observability-only: classification must not remove the existing reviewer candidate"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn review_preservation_external_ancestor_uses_hermetic_pull_ref() {
+        let repo = setup_repo("preservation_external");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo);
+        let candidate_sha =
+            create_branch_with_commit(&repo, "tmp_external", "review work under inspection");
+        git_run(
+            &repo,
+            &["checkout", "-b", "external-descendant", &candidate_sha],
+        );
+        std::fs::write(repo.join("external-descendant.txt"), "sync commit\n").expect("write");
+        git_run(&repo, &["add", "external-descendant.txt"]);
+        git_run(&repo, &["commit", "-m", "external descendant"]);
+        let descendant_sha =
+            String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+                .trim()
+                .to_string();
+        git_run(
+            &repo,
+            &[
+                "push",
+                "origin",
+                &format!("{descendant_sha}:refs/pull/7/head"),
+            ],
+        );
+        git_run(&repo, &["checkout", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-external-agent");
+        let candidate = reviewer_candidate(&response, "tmp_external");
+        assert_eq!(
+            candidate["preservation"]["classification"],
+            "EXTERNALLY_REACHABLE_UNGUARANTEED",
+            "candidate ancestor of a current pull head must be visible without claiming durability: {response}"
+        );
+        assert_eq!(candidate["preservation"]["durable"], false);
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn review_preservation_orphaned_reports_exact_unique_count() {
+        let repo = setup_repo("preservation_orphan");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo); // successful, empty external inventory
+        create_branch_with_commit(&repo, "tmp_orphan", "orphan commit one");
+        git_run(&repo, &["checkout", "tmp_orphan"]);
+        std::fs::write(repo.join("orphan-two.txt"), "second unique commit\n").expect("write");
+        git_run(&repo, &["add", "orphan-two.txt"]);
+        git_run(&repo, &["commit", "-m", "orphan commit two"]);
+        git_run(&repo, &["checkout", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-orphan-agent");
+        let candidate = reviewer_candidate(&response, "tmp_orphan");
+        assert_eq!(
+            candidate["preservation"]["classification"], "ORPHANED_UNIQUE",
+            "orphan classification requires a successful external inventory: {response}"
+        );
+        assert_eq!(candidate["preservation"]["unique_commit_count"], 2);
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn review_preservation_external_failure_keeps_inventory_unknown() {
+        let repo = setup_repo("preservation_unknown");
+        let home = repo.parent().unwrap().to_path_buf();
+        create_branch_with_commit(&repo, "tmp_unknown", "review work with offline origin");
+        git_run(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "/definitely/missing/agend-origin.git",
+            ],
+        );
+
+        let response = handler_dry_run(&home, &repo, "preservation-unknown-agent");
+        assert_eq!(
+            response["dry_run"], true,
+            "local inventory must survive: {response}"
+        );
+        let candidate = reviewer_candidate(&response, "tmp_unknown");
+        assert_eq!(
+            candidate["preservation"]["classification"], "UNKNOWN_EXTERNAL_LOOKUP_FAILED",
+            "offline evidence must never fall through to ORPHANED: {response}"
+        );
+        assert_ne!(
+            candidate["preservation"]["classification"],
+            "ORPHANED_UNIQUE"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn review_preservation_unavailable_non_equal_external_object_is_unknown() {
+        let repo = setup_repo("preservation_unavailable_object");
+        let home = repo.parent().unwrap().to_path_buf();
+        let origin = add_local_bare_origin(&repo);
+        let candidate_sha =
+            create_branch_with_commit(&repo, "tmp_unavailable", "locally available review tip");
+        git_run(
+            &repo,
+            &[
+                "push",
+                "origin",
+                &format!("{candidate_sha}:refs/heads/seed"),
+            ],
+        );
+
+        // Create the external descendant in a separate clone, then remove the
+        // seed ref. `ls-remote` can see the pull-head SHA, while the repository
+        // being classified has never fetched that descendant object.
+        let peer = repo.parent().unwrap().join("external-peer");
+        git_run(
+            &repo,
+            &[
+                "clone",
+                origin.to_str().expect("origin path"),
+                peer.to_str().expect("peer path"),
+            ],
+        );
+        git_run(&peer, &["config", "user.name", "test"]);
+        git_run(&peer, &["config", "user.email", "t@t"]);
+        git_run(&peer, &["checkout", "seed"]);
+        std::fs::write(peer.join("remote-only.txt"), "unfetched descendant\n").expect("write");
+        git_run(&peer, &["add", "remote-only.txt"]);
+        git_run(&peer, &["commit", "-m", "remote-only descendant"]);
+        git_run(&peer, &["push", "origin", "HEAD:refs/pull/9/head"]);
+        git_run(&repo, &["push", "origin", ":refs/heads/seed"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-unavailable-agent");
+        let candidate = reviewer_candidate(&response, "tmp_unavailable");
+        assert_eq!(
+            candidate["preservation"]["classification"], "UNKNOWN_EXTERNAL_LOOKUP_FAILED",
+            "a non-equal remote-only object cannot prove ancestry: {response}"
+        );
+        assert_ne!(
+            candidate["preservation"]["classification"],
+            "ORPHANED_UNIQUE"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn spike_residue_is_separate_annotation_not_candidate() {
+        let repo = setup_repo("preservation_spike");
+        let home = repo.parent().unwrap().to_path_buf();
+        add_local_bare_origin(&repo);
+        git_run(&repo, &["checkout", "-b", "spike/preservation-probe"]);
+        std::fs::write(repo.join("spike-probe.txt"), "analysis artifact\n").expect("write");
+        git_run(&repo, &["add", "spike-probe.txt"]);
+        git_run(&repo, &["commit", "-m", "spike artifact"]);
+        git_run(&repo, &["checkout", "main"]);
+
+        let response = handler_dry_run(&home, &repo, "preservation-spike-agent");
+        let annotations = response["annotations"]["spike_residue"]
+            .as_array()
+            .expect("separate spike_residue annotations");
+        assert!(
+            annotations.iter().any(|entry| {
+                entry["name"] == "spike/preservation-probe"
+                    && entry["annotation"] == "SPIKE_RESIDUE"
+            }),
+            "spike residue must be visible only as an annotation: {response}"
+        );
+        assert!(
+            !response["candidate_ids"]
+                .as_array()
+                .expect("candidate_ids")
+                .iter()
+                .any(|id| id == "spike/preservation-probe"),
+            "annotation must not add spike residue to candidate_ids"
+        );
+        assert!(
+            !response["categories"]["reviewer_checkout"]
+                .as_array()
+                .expect("reviewer_checkout")
+                .iter()
+                .any(|candidate| candidate["name"] == "spike/preservation-probe"),
+            "spike residue must remain outside reviewer_checkout"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
     #[test]
@@ -1442,6 +1713,147 @@ mod tests {
         // ancestry post-squash (main has a different SHA with same
         // patch-id).
         assert!(!cats.clean_merged.iter().any(|c| c.name == "feat-b"));
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    // #2550 W6: cross-test pinning the behavior GAP between the
+    // ancestor-check (`git merge-base --is-ancestor`, used by
+    // worktree_cleanup.rs's is_branch_merged / worktree_pool.rs's
+    // cleanup_merged_branch via git_helpers::git_ok) and this file's own
+    // squash-merge detection (is_squash_merged, cherry + tree-diff based) —
+    // for a GitHub-style squash-merged branch. This is the decision input
+    // for whether the three merge-detection sites should unify onto
+    // branch_sweep.rs's heavier squash-aware method.
+    #[test]
+    fn ancestor_check_misses_squash_merge_that_branch_sweep_catches() {
+        let repo = setup_repo("w6_ancestor_vs_squash");
+        create_branch_with_commit(&repo, "feat-c", "feat: c body");
+        // Make main diverge first so cherry-pick doesn't fast-forward
+        // (mirrors test_branch_sweep_scan_categorizes_squash_merged above).
+        std::fs::write(repo.join("unrelated2.txt"), "main moves\n").expect("write");
+        git_run(&repo, &["add", "unrelated2.txt"]);
+        git_run(&repo, &["commit", "-m", "main: unrelated work 2"]);
+        git_run(&repo, &["cherry-pick", "--no-commit", "feat-c"]);
+        git_run(&repo, &["commit", "-m", "squash: feat-c body"]);
+
+        assert!(
+            !crate::git_helpers::git_ok(&repo, &["merge-base", "--is-ancestor", "feat-c", "main"],),
+            "ancestor-check must return false for a squash-merged branch — \
+             squash produces a new commit on main with no direct ancestry \
+             back to feat-c's tip, so this is a real (not incidental) gap, \
+             not a bug to unify away lightly"
+        );
+        assert!(
+            is_squash_merged(&repo, "main", "feat-c"),
+            "is_squash_merged (this file's cherry/patch-id detection) must \
+             still catch it — this is the gap ancestor-check callers close \
+             via a DIFFERENT, cheaper signal instead (remote-tracking-ref-gone,\
+             see worktree_cleanup.rs's is_remote_gone / worktree_pool.rs's \
+             is_gone), not by adopting this file's cherry+diff(+gh API) method"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    // t-20260704054810920172-67777-3: `local_sha_matches_merged_head`
+    // regression coverage. main's now-default strict-up-to-date branch
+    // protection means a required "Update branch" sync commit lands on the
+    // remote HEAD before squash-merge, but this sweep's `fetch --prune`
+    // never fast-forwards the local branch ref — so `local_sha` (this
+    // sweep's only source of truth) stays one sync-commit behind the
+    // merged PR's real `head_ref_oid` forever once the remote branch is
+    // deleted. These pin the new is-ancestor acceptance without needing a
+    // live GitHub API / ScmProvider mock — `local_sha_matches_merged_head`
+    // takes both SHAs directly.
+
+    #[test]
+    fn local_sha_matches_merged_head_true_for_strict_ancestor_2637() {
+        let repo = setup_repo("ancestor_true");
+        let local_sha = create_branch_with_commit(&repo, "feat-d", "feat: d body");
+        // Simulate the "Update branch" sync commit landing on the remote
+        // HEAD after `local_sha` was last touched — one more commit on top,
+        // never fetched back into the local branch ref.
+        git_run(&repo, &["checkout", "feat-d"]);
+        std::fs::write(repo.join("sync.txt"), "update-branch sync\n").expect("write");
+        git_run(&repo, &["add", "sync.txt"]);
+        git_run(&repo, &["commit", "-m", "sync with main"]);
+        let head_ref_oid = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        git_run(&repo, &["checkout", "main"]);
+
+        assert!(
+            local_sha_matches_merged_head(&repo, &local_sha, &head_ref_oid),
+            "local_sha strictly behind the actually-merged head_ref_oid (the \
+             update-branch sync gap) must still match"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn local_sha_matches_merged_head_false_for_divergent_unmerged_commit_2637() {
+        let repo = setup_repo("ancestor_false");
+        let merged_base = create_branch_with_commit(&repo, "feat-e", "feat: e body");
+        // `head_ref_oid`: what actually got merged (one commit past the
+        // shared base).
+        git_run(&repo, &["checkout", "feat-e"]);
+        std::fs::write(repo.join("merged.txt"), "this landed in main\n").expect("write");
+        git_run(&repo, &["add", "merged.txt"]);
+        git_run(&repo, &["commit", "-m", "merged work"]);
+        let head_ref_oid = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        // `local_sha`: a DIFFERENT, never-merged commit branched off the
+        // same shared base — diverged, not an ancestor of head_ref_oid.
+        git_run(&repo, &["checkout", "-b", "feat-e-local", &merged_base]);
+        std::fs::write(repo.join("unmerged.txt"), "this never landed\n").expect("write");
+        git_run(&repo, &["add", "unmerged.txt"]);
+        git_run(&repo, &["commit", "-m", "unmerged local-only work"]);
+        let local_sha = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+        git_run(&repo, &["checkout", "main"]);
+
+        assert!(
+            !local_sha_matches_merged_head(&repo, &local_sha, &head_ref_oid),
+            "a local_sha carrying real unmerged work outside head_ref_oid's \
+             history must NOT match — this is the false-positive guard: \
+             is-ancestor must never wrongly clear a branch with unpushed work"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn local_sha_matches_merged_head_true_for_exact_equal_2637() {
+        let repo = setup_repo("ancestor_equal");
+        let sha = create_branch_with_commit(&repo, "feat-f", "feat: f body");
+
+        assert!(
+            local_sha_matches_merged_head(&repo, &sha, &sha),
+            "the pre-existing exact-SHA-match behavior must still hold"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn local_sha_matches_merged_head_false_when_head_ref_oid_unknown_locally_2637() {
+        let repo = setup_repo("ancestor_missing_object");
+        let local_sha = create_branch_with_commit(&repo, "feat-g", "feat: g body");
+
+        assert!(
+            !local_sha_matches_merged_head(
+                &repo,
+                &local_sha,
+                "0000000000000000000000000000000000dead"
+            ),
+            "an is-ancestor check against an object git doesn't have locally \
+             (e.g. a deleted remote branch's newest commit, never fetched) \
+             must fail CLOSED — not treated as a match"
+        );
 
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
@@ -1658,6 +2070,68 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
+    /// t-20260704115315460591-14440-0 (#817 behavior gap): a `reviewer_checkout`
+    /// candidate is NOT an unknown confirm_id — it's a recognized category, part
+    /// of `deletable_ids()`'s own documented default-deletable list, and it
+    /// survives the handler's `all_ids()` validation before ever reaching
+    /// `emit_delete_batch`. Unlike `test_branch_sweep_apply_skips_unknown_
+    /// confirm_id`'s intentional "typo confirm_id → silent no-op" contract,
+    /// this must behave like `clean_merged`/`squash_merged`: real delete-or-log,
+    /// never a silent no-op. Production incident (2026-07-04): dry-run listed
+    /// 24 `review/*` branches as candidates, apply=true confirmed them, but
+    /// `applied` didn't count them and no event-log entry appeared — the
+    /// operator had no signal the branches survived.
+    #[test]
+    fn test_branch_sweep_apply_deletes_reviewer_checkout_candidate_2620() {
+        let repo = setup_repo("apply_reviewer_checkout");
+        let home = repo.parent().unwrap().to_path_buf();
+        // Unmerged on purpose — reviewer_checkout is classified by NAME
+        // pattern alone (scan()'s bucket 0, checked before merge-status),
+        // so an unmerged residue branch must still be a REAL candidate.
+        create_branch_with_commit(&repo, "tmp_pr_review", "reviewer checkout residue");
+
+        let now = chrono::Utc::now();
+        let cats = scan(&repo, "main", STALE_IDLE_DEFAULT_DAYS, now).expect("scan");
+        assert_eq!(
+            cats.reviewer_checkout.len(),
+            1,
+            "precondition: review/123 must classify as reviewer_checkout: {cats:?}"
+        );
+        assert!(
+            cats.deletable_ids().contains(&"tmp_pr_review".to_string()),
+            "precondition: reviewer_checkout is in the default deletable list"
+        );
+
+        let mut confirm = std::collections::HashSet::new();
+        confirm.insert("tmp_pr_review".to_string());
+        let applied = emit_delete_batch(&home, &repo, &cats, &confirm, "reviewer-checkout probe")
+            .expect("emit");
+
+        assert_eq!(
+            applied, 1,
+            "a confirmed reviewer_checkout candidate must actually be deleted, \
+             not silently dropped like an unrecognized confirm_id"
+        );
+        let post = enumerate_branches(&repo).expect("enumerate");
+        assert!(
+            !post.iter().any(|b| b.name == "tmp_pr_review"),
+            "review/123 must actually be gone from the repo"
+        );
+        let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("branch_sweep_apply") && log.contains("tmp_pr_review"),
+            "a real delete must leave the same audit trail as any other category, \
+             not silence: {log}"
+        );
+        assert!(
+            log.contains("category=reviewer_checkout"),
+            "the audit trail must name the correct category, not fall through to \
+             active_unknown: {log}"
+        );
+
+        std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    }
+
     #[test]
     fn test_branch_sweep_handler_apply_requires_audit_reason_and_confirm_ids() {
         // GREEN: handler validator rejects apply=true with missing
@@ -1794,7 +2268,6 @@ mod tests {
         std::fs::remove_dir_all(repo.parent().unwrap()).ok();
     }
 
-<<<<<<< HEAD
     /// RED: a clean-merged branch with a non-GitHub local origin causes
     /// `open_pr_status` → `Unknown` → lifecycle Keep. The apply response
     /// currently returns only `applied: 0` with zero structured explanation.
