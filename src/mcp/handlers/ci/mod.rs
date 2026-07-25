@@ -28,6 +28,7 @@ mod watch;
 pub(super) use checkout::handle_checkout_repo;
 pub(super) use cleanup::handle_cleanup_init_commits;
 pub(crate) use cleanup::handle_cleanup_merged_branches;
+pub(crate) use handoff_ack::{handle_ack_handoff_ci, handle_defer_ci};
 pub(super) use merge::handle_merge_repo;
 pub(super) use release::handle_release_repo;
 pub(crate) use watch::{handle_status_ci, handle_unwatch_ci, handle_watch_ci};
