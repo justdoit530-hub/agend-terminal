@@ -66,9 +66,14 @@ where
     let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
         return;
     };
+    // #2978/#2979: ONE read_dir of the shared queue directory for the whole
+    // pass, instead of one per fleet agent — the idle fast-path gate below
+    // reads NO file contents (`has_pending`), so a productive agent's queue
+    // bytes are read exactly once total, by `flush_agent_queue`'s own drain.
+    let snapshot = crate::notification_queue::QueueDirSnapshot::scan(home);
     for agent in fleet.instances.keys() {
-        // Idle fast path: a read_dir + line count of any existing queue files.
-        if crate::notification_queue::pending_count(home, agent) == 0 {
+        // Idle fast path: does this agent have anything queued at all?
+        if !snapshot.has_pending(agent) {
             continue;
         }
         // Shared core applies the SAME draft/busy/typing gating + MAX_DEFER
@@ -213,6 +218,73 @@ mod tests {
             notification_queue::pending_count(&home, "a"),
             1,
             "failed inject must keep the item queued for the next tick"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    fn write_fleet_n(home: &std::path::Path, n: usize) {
+        let mut yaml = String::from("instances:\n");
+        for i in 0..n {
+            yaml.push_str(&format!("  agent{i}:\n    backend: claude\n"));
+        }
+        std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).expect("write fleet.yaml");
+    }
+
+    /// #2978/#2967 RED: a fleet-wide flush pass must perform exactly ONE
+    /// queue-directory `read_dir`, not one per agent. Pre-fix (`pending_count`
+    /// per agent, each doing its own `list_draining_files` `read_dir`) this
+    /// fails with N (here 8); post-fix (`QueueDirSnapshot::scan` once,
+    /// `has_pending` reading no content) it is exactly 1. All 8 agents are
+    /// idle (nothing queued) so no agent's `drain` path adds a further scan.
+    #[test]
+    fn fleet_flush_performs_exactly_one_dir_scan_2978() {
+        const N: usize = 8;
+        let home = tmp_home("dirscan-fleet");
+        write_fleet_n(&home, N);
+        notification_queue::reset_scan_counters();
+
+        flush_all_with(&home, |_, _| Ok(()));
+
+        assert_eq!(
+            notification_queue::dir_scan_count(),
+            1,
+            "a fleet-wide flush pass over {N} idle agents must perform exactly ONE \
+             queue-directory read_dir, not one per agent"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2979 RED: a PRODUCTIVE flush (one queued item, one agent) must not
+    /// read the queue file's bytes twice. Pre-fix: the standalone
+    /// `pending_count` gate reads the queue file's content once, then
+    /// `drain` (via `flush_agent_queue`) reads it again to deliver — 2 reads.
+    /// Post-fix: the gate (`has_pending`) reads only file LENGTH (0 content
+    /// reads), so `drain`'s single read is the only one — 1 read.
+    #[test]
+    fn productive_flush_reads_queue_content_exactly_once_2979() {
+        let home = tmp_home("content-read-once");
+        write_fleet(&home);
+        snapshot_state(&home, "a", "idle");
+        notification_queue::enqueue(&home, "a", "hello").expect("enqueue");
+        notification_queue::reset_scan_counters();
+
+        let delivered: Arc<Mutex<Vec<String>>> = Arc::default();
+        let d = delivered.clone();
+        flush_all_with(&home, |_, text| {
+            d.lock().push(text.to_string());
+            Ok(())
+        });
+
+        assert_eq!(
+            delivered.lock().len(),
+            1,
+            "the queued item must be delivered"
+        );
+        assert_eq!(
+            notification_queue::content_read_count(),
+            1,
+            "a productive flush must read the queue file's bytes exactly once \
+             across the whole pass — not once for the gate and once again for delivery"
         );
         std::fs::remove_dir_all(&home).ok();
     }

@@ -993,12 +993,15 @@ fn pane_input_contains_submit(backend: Option<&crate::backend::Backend>, bytes: 
 }
 
 fn sync_notification_state(home: &Path, layout: &mut Layout) {
+    // #2967/#2978: ONE read_dir of the queue directory per pass — was one
+    // `pending_count` (its own read_dir) per PANE, every ~1s.
+    let snapshot = notification_queue::QueueDirSnapshot::scan(home);
     for tab in &mut layout.tabs {
         let pane_ids = tab.root().pane_ids();
         for pane_id in pane_ids {
             if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
                 let prev = pane.pending_notification_count;
-                let now = notification_queue::pending_count(home, &pane.agent_name);
+                let now = snapshot.pending_count(&pane.agent_name);
                 // #1944 instrument: the pane-title `[N]` badge renders off this
                 // count (core_render.rs). Log every CHANGE so the "badge
                 // disappeared" report can be located at runtime — the code is
@@ -2109,6 +2112,46 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         }
+    }
+
+    /// #2967 RED: `sync_notification_state` must perform exactly ONE
+    /// queue-directory `read_dir` per pass, across ALL panes/tabs — not one
+    /// per pane (the shape the #84833-15 comment above `NOTIF_SYNC_INTERVAL`
+    /// already documents). Pre-fix (`pending_count` called per pane, each
+    /// doing its own `list_draining_files` `read_dir`) this fails with N
+    /// (here 5, spread across 3 tabs); post-fix
+    /// (`QueueDirSnapshot::scan` once, `pending_count` reading from the
+    /// snapshot) it is exactly 1. Every agent is idle (nothing queued) so no
+    /// content read is exercised here — this test is purely about the
+    /// `read_dir` count.
+    #[test]
+    fn sync_notification_state_performs_exactly_one_dir_scan_2967() {
+        let home = tmp_home("sync-notif-dirscan");
+        let mut layout = Layout::new();
+        // 5 panes across 3 tabs, each a distinct agent — mirrors a real
+        // multi-tab fleet session.
+        layout
+            .tabs
+            .push(crate::layout::Tab::new("tab0".into(), pane("agent0")));
+        layout.tabs[0].split_focused(crate::layout::SplitDir::Horizontal, pane("agent1"));
+        layout
+            .tabs
+            .push(crate::layout::Tab::new("tab1".into(), pane("agent2")));
+        layout.tabs[1].split_focused(crate::layout::SplitDir::Horizontal, pane("agent3"));
+        layout
+            .tabs
+            .push(crate::layout::Tab::new("tab2".into(), pane("agent4")));
+
+        notification_queue::reset_scan_counters();
+        sync_notification_state(&home, &mut layout);
+
+        assert_eq!(
+            notification_queue::dir_scan_count(),
+            1,
+            "a sync_notification_state pass over 5 panes must perform exactly ONE \
+             queue-directory read_dir, not one per pane"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #982 RC wiring-pin: assert `flush_idle_notifications` invokes
