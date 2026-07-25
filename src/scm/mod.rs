@@ -85,11 +85,23 @@ pub(crate) struct ListFilter {
 }
 
 /// Options for [`ScmProvider::pr_merge`] (site 3).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeOpts {
     pub admin: bool,
     pub squash: bool,
     pub delete_branch: bool,
+    pub expected_head_sha: Option<String>,
+}
+
+impl Default for MergeOpts {
+    fn default() -> Self {
+        Self {
+            admin: true,
+            squash: true,
+            delete_branch: true,
+            expected_head_sha: None,
+        }
+    }
 }
 
 /// Result of [`ScmProvider::pr_merge`]. `Submitted` means `gh pr merge`
@@ -254,6 +266,10 @@ fn pr_merge_args(repo: &str, pr: u64, opts: &MergeOpts) -> Vec<String> {
     }
     if opts.delete_branch {
         a.push("--delete-branch".into());
+    }
+    if let Some(ref sha) = opts.expected_head_sha {
+        a.push("--match-head-commit".into());
+        a.push(sha.clone());
     }
     a
 }
@@ -1048,6 +1064,7 @@ mod tests {
                     admin: true,
                     squash: true,
                     delete_branch: true,
+                    ..Default::default()
                 }
             ),
             vec![

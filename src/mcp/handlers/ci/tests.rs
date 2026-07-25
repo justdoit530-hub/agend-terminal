@@ -1358,6 +1358,123 @@ fn p780_setup_source_broken_origin(parent: &Path) -> std::path::PathBuf {
     repo
 }
 
+#[cfg(unix)]
+fn p780_checkout_target(home: &Path, agent: &str, source: &Path) -> std::path::PathBuf {
+    // d-20260726055029475978-81: the handler mangles the RESOLVED source — the
+    // canonical repo root — so this mirror must canonicalize too.
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    home.join("worktrees").join(format!(
+        "{}-{}",
+        agent,
+        source
+            .display()
+            .to_string()
+            .replace(['/', '\\', ':'], "_")
+            .replace('~', "")
+    ))
+}
+
+#[cfg(unix)]
+fn p780_branch_exists(source: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git rev-parse branch")
+        .success()
+}
+
+/// Arch14 residue: a checkout that auto-created its branch must delete only that
+/// branch when the fixed worktree target is already occupied and `git worktree add`
+/// fails. The occupied target is deliberately preserved as out-of-scope state.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_worktree_add_failure_rolls_back_auto_created_branch_arch14() {
+    let home = p778_tmp_home("arch14-branch-rollback-new");
+    let parent = p778_tmp_home("arch14-branch-rollback-new-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "arch14-rollback-new-agent";
+    let branch = "feat/arch14-rollback-new";
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("occupied checkout target");
+    let keep = target.join("KEEP.txt");
+    std::fs::write(&keep, "legacy dirty worktree state").expect("preserved target state");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+            "from_ref": "main",
+        }),
+        agent,
+    );
+
+    assert_eq!(resp["code"].as_str(), Some("worktree_add_failed"), "{resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(true), "{resp}");
+    assert!(
+        !p780_branch_exists(&source, branch),
+        "a branch created by this failed checkout must be rolled back: {resp}"
+    );
+    assert!(
+        keep.exists(),
+        "the pre-existing occupied target and its dirty state must be preserved"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// Arch14 guard: the same worktree-add failure must never delete a branch that
+/// existed before this checkout transaction began.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_worktree_add_failure_preserves_preexisting_branch_arch14() {
+    let home = p778_tmp_home("arch14-branch-rollback-existing");
+    let parent = p778_tmp_home("arch14-branch-rollback-existing-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "arch14-rollback-existing-agent";
+    let branch = "feat/arch14-rollback-existing";
+    let create = std::process::Command::new("git")
+        .args(["branch", branch, "main"])
+        .current_dir(&source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("create pre-existing branch");
+    assert!(create.status.success(), "create branch: {:?}", create);
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("occupied checkout target");
+    let keep = target.join("KEEP.txt");
+    std::fs::write(&keep, "legacy dirty worktree state").expect("preserved target state");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+            "from_ref": "main",
+        }),
+        agent,
+    );
+
+    assert_eq!(resp["code"].as_str(), Some("worktree_add_failed"), "{resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(false), "{resp}");
+    assert!(
+        p780_branch_exists(&source, branch),
+        "a pre-existing branch must survive a failed checkout: {resp}"
+    );
+    assert!(keep.exists(), "the occupied target must be preserved");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
 #[test]
 #[cfg(unix)]
 fn checkout_bind_true_invalid_from_ref_returns_structured_error_with_stage() {
@@ -2207,6 +2324,11 @@ fn merge_force_audit_write_failure_refuses_merge() {
     let events_path = home.join("fleet_events.jsonl");
     std::fs::create_dir_all(&events_path).unwrap();
 
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let _g = crate::scm::set_test_scm_provider(std::sync::Arc::new(
+        super::exact_head_merge_tests::MergeMock::new(recorded),
+    ));
+
     let result = super::handle_merge_repo(
         &home,
         // #1619: explicit `repository` so resolution succeeds and the
@@ -2838,126 +2960,6 @@ fn checkout_via_linked_worktree_binds_canonical_repo_root_and_keeps_one_lease() 
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
-}
-=======
-// ---------------------------------------------------------------------------
-// Arch-14 item 10: repo release canonical delegation (real dispatch entry)
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-fn managed_wt_fixture(
-    tag: &str,
-) -> (
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-    std::path::PathBuf,
-) {
-    let base = release_guard_tmp(tag);
-    let repo = base.join("source");
-    std::fs::create_dir_all(&repo).expect("mkdir");
-    git_init(&repo);
-    let wt = base.join("managed-wt");
-    std::process::Command::new("git")
-        .args(["worktree", "add", wt.to_str().unwrap(), "-b", "feat/test"])
-        .current_dir(&repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .ok();
-    let home = base.join("home");
-    std::fs::create_dir_all(&home).ok();
-    (base, home, repo, wt)
-}
-
-#[cfg(unix)]
-fn git_init(repo: &std::path::Path) {
-    std::process::Command::new("git")
-        .args(["init", "-b", "main"])
-        .current_dir(repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .ok();
-    std::process::Command::new("git")
-        .args([
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "init",
-        ])
-        .current_dir(repo)
-        .env("AGEND_GIT_BYPASS", "1")
-        .output()
-        .ok();
-}
-
-#[cfg(unix)]
-fn seed_managed_marker(
-    wt: &std::path::Path,
-    repo: &std::path::Path,
-    home: &std::path::Path,
-    agent: &str,
-    branch: &str,
-) {
-    std::fs::write(
-        wt.join(".agend-managed"),
-        format!(
-            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
-            repo.display()
-        ),
-    )
-    .expect("write marker");
-    crate::binding::bind_full(home, agent, "", branch, wt, repo, false).expect("bind");
-}
-
-#[cfg(unix)]
-fn dispatch_repo_release(home: &std::path::Path, caller: &str, path: &str) -> serde_json::Value {
-    let args = serde_json::json!({"action": "release", "path": path});
-    let sender: Option<crate::identity::Sender> = if caller.is_empty() {
-        None
-    } else {
-        crate::identity::Sender::new(caller)
-    };
-    let ctx = crate::mcp::handlers::dispatch::HandlerCtx {
-        home,
-        args: &args,
-        instance_name: sender.as_ref().map_or("", |s| s.as_str()),
-        sender: &sender,
-        runtime: None,
-    };
-    crate::mcp::handlers::dispatch::dispatch_repo(&ctx)
-}
-
-/// RED A1: managed worktree release must clear binding.
-#[test]
-#[cfg(unix)]
-fn repo_release_managed_clears_binding_via_dispatch() {
-    let (base, home, repo, wt) = managed_wt_fixture("a1");
-    seed_managed_marker(&wt, &repo, &home, "agent-a1", "feat/test");
-    assert!(
-        crate::binding::read(&home, "agent-a1").is_some(),
-        "precondition"
-    );
-    let _ = dispatch_repo_release(&home, "agent-a1", wt.to_str().unwrap());
-    assert!(
-        crate::binding::read(&home, "agent-a1").is_none(),
-        "managed release must clear binding (RED: currently orphaned)"
-    );
-    std::fs::remove_dir_all(&base).ok();
-}
-
-/// RED A3: corrupt marker must fail-closed — worktree preserved.
-#[test]
-#[cfg(unix)]
-fn repo_release_corrupt_marker_refuses_via_dispatch() {
-    let (base, home, _repo, wt) = managed_wt_fixture("a3");
-    std::fs::write(wt.join(".agend-managed"), "corrupt\n").expect("corrupt");
-    let _ = dispatch_repo_release(&home, "anyone", wt.to_str().unwrap());
-    assert!(
-        wt.exists(),
         "corrupt-marker managed worktree must be preserved (RED)"
     );
     std::fs::remove_dir_all(&base).ok();

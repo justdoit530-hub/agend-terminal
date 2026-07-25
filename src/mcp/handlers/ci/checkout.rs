@@ -305,6 +305,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 err["fetch_attempted"] = json!(fetch_attempted);
                 err["auto_created_branch"] = json!(auto_created_branch);
             }
+            if auto_created_branch {
+                let _ = crate::git_helpers::git_bypass(
+                    Path::new(&source_path),
+                    &["branch", "-D", branch],
+                );
+            }
             err
         }
         Err(e) => {
@@ -317,6 +323,12 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             if bind {
                 err["fetch_attempted"] = json!(fetch_attempted);
                 err["auto_created_branch"] = json!(auto_created_branch);
+            }
+            if auto_created_branch {
+                let _ = crate::git_helpers::git_bypass(
+                    Path::new(&source_path),
+                    &["branch", "-D", branch],
+                );
             }
             err
         }
