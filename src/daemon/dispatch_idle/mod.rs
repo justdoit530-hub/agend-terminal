@@ -282,6 +282,7 @@ pub(crate) fn record_dispatch(
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
+    let pending = correlation_id.map(|_| list_pending(home));
     // t-dispatchidle-clear-on-report (2): dedup by (dispatcher, target,
     // correlation_id). Re-dispatching the SAME task (same task_id) used to create a
     // fresh duplicate sidecar each call (`next_dispatch_id()`), so 142 correlation
@@ -298,7 +299,10 @@ pub(crate) fn record_dispatch(
                 && d.target == target
                 && d.correlation_id.as_deref() == Some(corr)
         };
-        if let Some(mut existing) = list_pending(home).into_iter().find(is_same_intent) {
+        if let Some(mut existing) = pending
+            .as_ref()
+            .and_then(|pending| pending.iter().find(|d| is_same_intent(d)).cloned())
+        {
             existing.issued_at = chrono::Utc::now().to_rfc3339();
             existing.status = DispatchStatus::Pending;
             existing.nudge_sent_at = None;
@@ -384,7 +388,7 @@ pub(crate) fn record_dispatch(
         correlation_id,
         chrono::DateTime::parse_from_rfc3339(&payload.issued_at),
     ) {
-        for stale in list_pending(home).into_iter().filter(|d| {
+        for stale in pending.unwrap_or_default().into_iter().filter(|d| {
             matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
                 && d.dispatcher == dispatcher
                 && d.target == target
@@ -412,6 +416,8 @@ pub(crate) fn record_dispatch(
 /// Read all pending dispatch sidecars from disk. Forward-compat: skips
 /// any sidecar whose `schema_version` is unknown.
 pub(crate) fn list_pending(home: &Path) -> Vec<PendingDispatch> {
+    note_list_pending();
+
     let dir = pending_dir(home);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
@@ -1515,6 +1521,29 @@ impl DispatchIdleTracker {
         scan_and_emit(home);
         true
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIST_PENDING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_list_pending() {
+    LIST_PENDING_CALLS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_list_pending() {}
+
+#[cfg(test)]
+pub(crate) fn reset_list_pending_call_count() {
+    LIST_PENDING_CALLS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn take_list_pending_call_count() -> usize {
+    LIST_PENDING_CALLS.with(|count| count.replace(0))
 }
 
 #[cfg(test)]
