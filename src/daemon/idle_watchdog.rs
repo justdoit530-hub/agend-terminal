@@ -2028,6 +2028,43 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // Contract pins (#3007 primary review): the ghost guard applies equally
+    // to an EXPLICITLY configured non-roster recipient, and a malformed
+    // fleet.yaml is fail-open at the same emit seam.
+    #[test]
+    fn route_idle_alert_pins_explicit_non_roster_and_malformed_fleet() {
+        // Explicitly configured non-roster recipient: dropped.
+        let home = tmp_home("explicit-non-roster");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "watchdog:\n  dev_recipient: ops-bot\ninstances:\n  general: {}\n",
+        )
+        .unwrap();
+        route_idle_alert(&home, "ops-bot", "dev_idle_watchdog", "idle 1800s", None);
+        assert!(
+            alert_payloads(&home, "ops-bot").is_empty(),
+            "an explicitly configured non-roster recipient must be dropped \
+             (every watchdog recipient must name a fleet instance)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+
+        // Malformed fleet.yaml (an unclosed flow mapping — a genuine parse
+        // error): fail-open — the alert still delivers.
+        let home = tmp_home("malformed-fleet");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "{ definitely-not-yaml\n",
+        )
+        .unwrap();
+        route_idle_alert(&home, "lead", "dev_idle_watchdog", "idle 1800s", None);
+        assert_eq!(
+            alert_payloads(&home, "lead").len(),
+            1,
+            "unparseable fleet.yaml must be fail-open (deliver)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ── #1084/#2548 watchdog CLI tests (moved from the retired `watchdog` MCP tool) ──
 
     #[test]

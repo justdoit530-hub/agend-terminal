@@ -18,9 +18,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `fleet.yaml` top-level `watchdog:` block. Every field is optional; an omitted
-/// field falls through to the env fallback, then the built-in default (see module
-/// docs). Defaults reproduce the pre-migration hard-coded behaviour exactly, so a
-/// fleet.yaml without a `watchdog:` block is byte-for-byte unchanged.
+/// field uses the built-in default. Recipient resolution — explicitly
+/// configured or default — then passes the ghost-inbox guard: names absent
+/// from the `instances:` map are skipped at emit time, and a missing or
+/// unparseable fleet.yaml is fail-open (no filtering). See
+/// [`drop_ghost_recipients`] / [`recipient_has_instance`] and the
+/// `watchdog` section of `docs/FEATURE-fleet.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WatchdogConfig {
     /// Legacy **single-agent mode** override for the dev-vantage idle watchdog.
@@ -266,6 +269,10 @@ mod tests {
         }
     }
 
+    /// Pure PARSER coverage: any recipient name is accepted at parse time.
+    /// Whether it is ever alerted is the delivery-time roster-filter contract
+    /// (ghost-inbox guard) — pinned separately at the resolvers and emit
+    /// seams.
     #[test]
     fn parses_watchdog_block() {
         let _g = env_guard();
@@ -447,5 +454,39 @@ instances:
             "lead has no instance — must be dropped from the task-stall default"
         );
         fs::remove_dir_all(&home).ok();
+    }
+
+    /// Contract pins (#3007 primary review): an EXPLICITLY configured
+    /// non-roster recipient is dropped exactly like a default one — every
+    /// watchdog recipient must name a fleet instance — and a malformed
+    /// fleet.yaml is fail-open (the unfiltered built-in default still
+    /// resolves).
+    #[test]
+    fn explicit_non_roster_dropped_and_malformed_fleet_fails_open() {
+        let _g = env_guard();
+        clear_env();
+        let explicit = tmp_home("explicit-non-roster");
+        write_fleet(
+            &explicit,
+            "watchdog:\n  task_stall_recipients:\n    - ghost-x\ninstances:\n  general: {}\n",
+        );
+        assert_eq!(
+            resolve_task_stall_recipients(&explicit),
+            Vec::<String>::new(),
+            "an explicitly configured non-roster recipient must be dropped"
+        );
+        let malformed = tmp_home("malformed-fleet");
+        // An UNCLOSED flow mapping — a genuine parse error, not merely an
+        // unexpected-but-valid document (which would parse to an empty
+        // `instances:` map and legitimately filter everything).
+        write_fleet(&malformed, "{ definitely-not-yaml\n");
+        assert_eq!(
+            resolve_task_stall_recipients(&malformed),
+            vec!["general".to_string(), "lead".to_string()],
+            "unparseable fleet.yaml must be fail-open: unfiltered built-in default"
+        );
+        for h in [explicit, malformed] {
+            fs::remove_dir_all(&h).ok();
+        }
     }
 }
