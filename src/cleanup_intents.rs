@@ -318,6 +318,7 @@ pub(crate) fn persist_release_intent(
     let scm_slug = crate::git_helpers::git_cmd(Path::new(repo), &["remote", "get-url", "origin"])
         .ok()
         .and_then(|url| crate::branch_sweep::extract_github_repo_for_intent(&url));
+    // Derive PR number from task metadata for generation identity.
     let pr_number = if task_id.is_empty() {
         None
     } else {
