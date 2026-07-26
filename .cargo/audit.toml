@@ -29,4 +29,9 @@ ignore = [
     #    dependencies (transitive); no runtime surface. Benign.
     "RUSTSEC-2024-0370", # proc-macro-error — unmaintained, no fix (build-time, benign)
     "RUSTSEC-2026-0173", # proc-macro-error2 — unmaintained, no fix (build-time, benign)
+    # ── quick-xml: DoS vulnerabilities in NsReader / duplicate attributes.
+    #    Pulled in transitively by `plist` (dev-dependency). `plist v1.9.0` pins
+    #    quick-xml ^0.39, no fixed plist version available yet. Dev-dependency only.
+    "RUSTSEC-2026-0194", # quick-xml — quadratic run time (plist dev-dep, no fix in plist)
+    "RUSTSEC-2026-0195", # quick-xml — unbounded namespace allocation DoS (plist dev-dep, no fix in plist)
 ]
