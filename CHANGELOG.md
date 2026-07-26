@@ -6,15 +6,12 @@ All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); project follows [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-
 ### Fixed
 
 - **`fleet.yaml` mutations no longer erase operator comments** — team and instance updates retain comment text in its original order; because semantic YAML serialization still normalizes presentation, retained comments are emitted as a document header rather than preserving their original indentation or key attachment (#3111).
 - **Removed the unused transcript context estimator** — deleted its uncalled implementation and tests; statusline-based context reporting and alerts are unchanged (#3100 Phase A).
 - **Resolving a CI watch's review class no longer leaves the merge gate stuck** — an explicit class now repairs an existing unresolved PR state directly, without replaying an already-delivered CI result or `ci-ready` handoff (#3114).
-
-## [0.11.3] — 2026-07-26
-
+- **`waiting_on` stale alerts no longer repeat or misroute** — the alert is delivered to the instance's configured name (so it reaches the agent's inbox and its team orchestrator) instead of an id-named file nothing reads, it respects the 30-minute re-alert interval instead of firing every 5-minute scan, and metadata left behind by an instance the fleet no longer runs is skipped (#3077).
 ### Changed
 
 - **Expired environment aliases removed** — watchdog topology now reads only the `fleet.yaml` `watchdog:` block, worktree archive fallback reads only `AGEND_WORKTREE_ARCHIVE_FALLBACK`, and decisions retention reads only `AGEND_RETENTION_DECISIONS_CUTOVER`.
@@ -46,6 +43,11 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 ## [0.11.0] — 2026-07-23
 
 212 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
+<<<<<<< HEAD
+=======
+
+>>>>>>> 7dec68de (fix(waiting_on_stale): key the live set by InstanceId, not name (#3077))
+>>>>>>> eb6c6cc4 (fix(waiting_on_stale): key the live set by InstanceId, not name (#3077))
 ### Added
 
 - **Per-role MCP tool subsetting (#2344, #2367)** — a per-role MCP capability registry (#2344) plus a typed, operator-declared `role_kind` in `fleet.yaml` (seven variants) that drives it (#2367), trimming the tool surface an agent advertises. The previous free-text `role:` match never matched real prose roles, so every agent saw all tools; read-only roles (reviewer/planner/explorer) now get report/read subsets, while an exhaustive match forces a deliberate decision for each new role. Opt-in, default all tools (#2300).
