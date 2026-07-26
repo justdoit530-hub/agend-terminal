@@ -501,12 +501,15 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                     all_messages.push(msg);
                     continue;
                 }
-                budget_used += sz;
-                // #2299: unread → DELIVERING (not processed). read_at stays None
-                // until the agent acks (explicit `inbox ack` / implicit next-drain)
-                // or the reclaim-TTL resets it. A turn dying after this drain leaves
-                // the row `delivering` → reclaimed → re-delivered (no silent loss).
-                msg.delivering_at = Some(now.clone());
+                if auto_ack_on_drain_kind(&msg) {
+                    msg.read_at = Some(now.clone());
+                } else {
+                    // #2299: unread → DELIVERING (not processed). read_at stays None
+                    // until the agent acks (explicit `inbox ack` / implicit next-drain)
+                    // or the reclaim-TTL resets it. A turn dying after this drain leaves
+                    // the row `delivering` → reclaimed → re-delivered (no silent loss).
+                    msg.delivering_at = Some(now.clone());
+                }
                 changed = true;
                 // #1888: a `ci-ready-for-action` handoff just transitioned to
                 // DELIVERING on this drain (#2299: was "read" pre-3-state). Phase-1
@@ -1254,10 +1257,8 @@ fn reclaim_renudge_worthy(home: &Path, msg: &InboxMessage) -> bool {
 fn kind_is_unknown(msg: &InboxMessage) -> bool {
     match msg.kind.as_deref() {
         None => false, // a plain message is a recognised non-obligation
-        Some(k) => !matches!(
-            k,
-            "query" | "task" | "report" | "update" | "ci-watch" | "poll"
-        ),
+        Some("query" | "task") => false,
+        Some(_) => !known_fire_and_forget_kind(msg),
     }
 }
 
@@ -1579,11 +1580,13 @@ pub fn reclaim_stale_delivering(home: &Path) {
                             })
                             .unwrap_or(true); // unparseable timestamp → reclaim (fail-safe)
                         if stale {
-                            msg.delivering_at = None; // → unread (re-deliverable)
+                            if known_fire_and_forget_kind(&msg) {
+                                msg.read_at = Some(now.to_rfc3339());
+                            } else {
+                                msg.delivering_at = None; // → unread (re-deliverable)
+                                reverted.push(msg.clone());
+                            }
                             changed = true;
-                            // Collect the full reverted row: Phase 2 reads `id` (dedup
-                            // forget) + `kind`/`task_id`/`correlation_id` (re-nudge gate).
-                            reverted.push(msg.clone());
                         }
                     }
                 }

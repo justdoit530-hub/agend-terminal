@@ -834,8 +834,6 @@ fn test_drain_marks_delivering_then_implicit_ack_keeps_message() {
     fs::remove_dir_all(&home).ok();
 }
 
-<<<<<<< HEAD
-=======
 #[test]
 fn drain_auto_acks_daemon_notifications() {
     for (kind, from, body) in [
