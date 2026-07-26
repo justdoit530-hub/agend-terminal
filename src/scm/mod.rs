@@ -41,6 +41,7 @@ pub(crate) struct PrSummary {
     pub author_login: Option<String>,
     pub head_ref: Option<String>,
     pub head_ref_oid: Option<String>,
+    pub base_ref_oid: Option<String>,
     /// #1750-B4: GitHub's `isCrossRepository` — true when the PR's head branch
     /// lives in a FORK, not the base repo. A cross-repo head_ref can collide
     /// with a base-repo branch name, so remote-orphan GC must never treat it as
@@ -316,6 +317,7 @@ fn parse_pr_summary(v: &Value) -> PrSummary {
         author_login: v["author"]["login"].as_str().map(String::from),
         head_ref: v["headRefName"].as_str().map(String::from),
         head_ref_oid: v["headRefOid"].as_str().map(String::from),
+        base_ref_oid: v["baseRefOid"].as_str().map(String::from),
         is_cross_repository: v["isCrossRepository"].as_bool(),
         is_draft: v["isDraft"].as_bool(),
         merged_at: nonempty("mergedAt"),

@@ -1595,7 +1595,7 @@ fn log_bypass_mutating_op(home: &str, agent: &str, args: &[String]) {
 /// committer identity the heartbeat commit will carry. Invokes the real git
 /// (AGEND_REAL_GIT) to avoid recursing through this shim.
 fn effective_git_email(cwd: &str) -> Option<String> {
-    let real_git = env::var("AGEND_REAL_GIT").unwrap_or_else(|_| "git".to_string());
+    let real_git = resolve_real_git();
     let out = std::process::Command::new(real_git)
         .args(["-C", cwd, "config", "user.email"])
         .output()
@@ -2206,6 +2206,16 @@ fn resolve_real_git() -> String {
     if let Ok(path) = env::var("AGEND_REAL_GIT") {
         if !path.is_empty() && std::path::Path::new(&path).exists() {
             return path;
+        }
+    }
+    if let Ok(path) = env::var("AGENTIC_GIT_REAL_GIT") {
+        if !path.is_empty() && std::path::Path::new(&path).exists() {
+            return path;
+        }
+    }
+    for known in &["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"] {
+        if std::path::Path::new(known).exists() {
+            return (*known).to_string();
         }
     }
     // Priority 2: which excluding $AGEND_HOME/bin/ (the shim dir).

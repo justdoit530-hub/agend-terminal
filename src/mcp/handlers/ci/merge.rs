@@ -156,7 +156,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // head+base it INTENDS; if either can't be read, fail closed (never merge a
     // head/base we cannot identify). `force` relaxes only the CI/verdict/freshness
     // POLICY below, never this acquisition nor the pre-merge identity recheck.
-    let (gated_head, gated_base, pr_branch, gated_merge_state) = match acquire_head_base(
+    let (gated_head, gated_base, _pr_branch, gated_merge_state) = match acquire_head_base(
         &repo, pr, true,
     ) {
         Some(hb) => hb,
