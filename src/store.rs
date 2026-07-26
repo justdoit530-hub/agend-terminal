@@ -695,7 +695,10 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(acquired, "second exclusive lock must succeed after first is dropped");
+        assert!(
+            acquired,
+            "second exclusive lock must succeed after first is dropped"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
