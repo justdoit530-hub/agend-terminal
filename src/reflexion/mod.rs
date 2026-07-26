@@ -2665,6 +2665,8 @@ mod tests {
                 obsidian_md_path.exists(),
                 "initial solidify should write Obsidian rule"
             );
+            let obsidian_after_initial = std::fs::read_to_string(&obsidian_md_path)
+                .expect("read Obsidian rule after initial");
             // Ensure initial spawn_mem0_sync thread completes before updating override URL.
             std::thread::sleep(std::time::Duration::from_millis(100));
 
