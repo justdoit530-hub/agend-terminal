@@ -7,6 +7,39 @@
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-07-26
+
+### Changed
+
+- **移除已過期的環境變數別名** — watchdog 拓樸現在只讀 `fleet.yaml` 的 `watchdog:` 區塊；worktree 封存 fallback 只讀 `AGEND_WORKTREE_ARCHIVE_FALLBACK`；decisions retention 只讀 `AGEND_RETENTION_DECISIONS_CUTOVER`。
+- **熱路徑不再重複做同一件事** — 通知、派工、分支掃描、watchdog、checkout、merge 與訊息路徑，現在會重用先前每筆或每次呼叫都重做一遍的掃描、client 或 metadata 讀取（#2967、#2975–#2979、#2990、#2991、#2999、#3001、#3005、#3022、#3023、#3026、#3031）。
+
+### Removed
+
+- **移除已過期的公開介面別名** — `agend list --legacy-json` 以及 MCP 參數別名 `command`、`repository`、`kind` 在棄用週期結束後已移除；請改用 `--json`、`backend`、`repository_path` 與 `request_kind`（#2960、#2961）。
+
+### Fixed
+
+- **`agentic-git` 受控 git 的正確性** — 指向其他 repository 的 `sparse-checkout`／`config` 寫入會被路由到它所指名的 repository，而不是直接拒絕；`snapshots restore --yes` 在多個 snapshot 共用同一秒時，也會取到真正最新的那個（#2950、#3069、#3070）。
+- **Shift+Tab 會送進 pane** — TUI 現在會把 `BackTab` 轉發給 pane PTY，不再吞掉（#2933）。
+- **`waiting_on` 逾時提醒不再重複發送或送錯地方** — 提醒會送到該 instance 在設定中的名稱（因此進得了 agent 的 inbox，也到得了團隊 orchestrator），而不是寫進一個沒有任何人讀取、以 id 命名的檔案；它會遵守 30 分鐘的重發間隔，而不是每 5 分鐘掃描就發一次；已不在 fleet 運行的 instance 所遺留的 metadata 則會被略過。
+
+## [0.11.2] — 2026-07-23
+
+### Changed
+
+- **Monorepo 整併** — `agentic-git-core` 與 `agentic-git` 原始碼現在內嵌於主倉庫；release workflow 按依賴順序發布 crate（core → shim → root），並帶 index 傳播重試（#2929）。
+- **既有 source checkout 若 `vendor/agentic-git` submodule 已初始化** — 先確認 submodule worktree 是乾淨的（先保存任何 local WIP），再執行 `git submodule deinit -f vendor/agentic-git`，接著 `git pull --ff-only`，切換到 repository 內建 workspace。
+
+## [0.11.1] — 2026-07-23
+
+### Fixed
+
+- **Release archive 驗證** — Unix release packaging 改為直接檢查每個預期 binary，避免跨平台建置成功後因 `pipefail`／SIGPIPE 被誤判為失敗。
+
+## [0.11.0] — 2026-07-23
+
+自 0.10.0 起共 212 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
 ### Added
 
 - **per-role MCP 工具子集(#2344、#2367)** — 新增 per-role MCP capability registry(#2344),加上 `fleet.yaml` 中型別化、由 operator 宣告的 `role_kind`(七種變體)驅動它(#2367),裁切 agent 對外公告的工具面。先前用自由文字 `role:` 比對,永遠對不上真實的散文角色名,所以每個 agent 都看到全部工具;唯讀角色(reviewer/planner/explorer)現在拿到 report/read 子集,且 exhaustive match 強制每個新角色都要明確決定。opt-in、預設全工具(#2300)。
