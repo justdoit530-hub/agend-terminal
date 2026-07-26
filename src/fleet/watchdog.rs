@@ -142,7 +142,6 @@ pub fn resolve_task_stall_recipients(home: &Path) -> Vec<String> {
     static WARNED: AtomicBool = AtomicBool::new(false);
     drop_ghost_recipients(home, base, "task_stall", &WARNED)
 }
-}
 
 /// Recipients for helper-staleness alerts. Default `[general, lead]`. No env
 /// fallback — the env layer is deprecated and this field is new.
