@@ -1314,13 +1314,11 @@ impl StateTracker {
     /// only. Readings older than [`CONTEXT_FRESH`] are dropped rather than
     /// trusted — `None` = honestly unknown, no alert.
     ///
-    /// #1945-disable (operator decision, 2026-06-10): the transcript-estimate
-    /// fallback ("transcript" source) is DISABLED — its first live minute
-    /// produced a triple false 100% alert (window misjudge: transcript model
-    /// ids carry no `[1m]` suffix → 1M sessions resolved against 200k). The
-    /// corrected estimator + its root-cause record live on in
-    /// `token_cost::estimate_context_pct` (tested, uncalled); re-enable ONLY
-    /// after validating its readings against statusline ground truth.
+    /// fallback was retired after its first live minute produced a triple
+    /// false 100% alert (window misjudge: transcript model ids carry no
+    /// `[1m]` suffix → 1M sessions resolved against 200k). Context remains
+    /// intentionally statusline-pattern-only until a separately validated
+    /// replacement is approved.
     #[cfg(test)]
     pub fn set_context_pct_for_test(&mut self, pct: f32) {
         self.context_pct = Some((pct, std::time::Instant::now()));
@@ -1356,10 +1354,6 @@ impl StateTracker {
                             }
                         }
                     }
-                } else if let Some(pct) =
-                    crate::token_cost::estimate_context_pct(home_path, &self.instance_name)
-                {
-                    return Some((pct, self.context_provider));
                 }
             }
         }
