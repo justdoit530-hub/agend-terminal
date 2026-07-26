@@ -85,7 +85,8 @@ pub(crate) fn def_send() -> Value {
             "next_after_ci": {"type": "string", "description": "#931 Fix 2 (H5a): when dispatching kind=task with a `branch`, set this to the agent that should receive `[ci-ready-for-action]` after CI passes on that branch. The daemon's auto-armed ci-watch carries the chain target so the handoff fires without a manual follow-up `ci action=watch next_after_ci=…`. Example: lead dispatches dev with `next_after_ci=reviewer` — reviewer is auto-notified when dev's PR goes green."},
             "terminal": {"type": "boolean", "description": "Set true on kind=report to signal task completion. When correlation_id matches a task and reporter is the assignee, the task is auto-closed. Default false — progress reports and review verdicts do not trigger auto-close."},
             "no_report_expected": {"type": "boolean", "description": "#2099: set true on a fire-and-forget kind=task dispatch that intentionally expects NO kind=report back. The dispatch is recorded with a terminal-like status so the 30-min dispatch-stuck sweep never false-fires a 'dispatch stuck check' for it (the audit row is kept). Default false — every normal dispatch stays stuck-tracked. Distinct from `terminal`, which is the report-side auto-close signal."},
-            "ack_inbox": {"type": "boolean", "description": "Set true on kind=report with correlation_id to auto-settle the sender's DELIVERING inbox messages whose task_id matches the correlation_id. Eliminates the need for a separate `inbox action=ack` call after sending a report — the daemon settles the dispatch message(s) atomically with the send. Only fires when the send succeeds. Default false (existing two-step flow still works)."}
+            "ack_inbox": {"type": "boolean", "description": "Set true on kind=report with correlation_id to auto-settle the sender's DELIVERING inbox messages whose task_id matches the correlation_id. Eliminates the need for a separate `inbox action=ack` call after sending a report — the daemon settles the dispatch message(s) atomically with the send. Only fires when the send succeeds. Default false (existing two-step flow still works)."},
+            "triaged": {"type": "object", "description": "#2537/#2524 P6 PR-1: optional discharge-ledger record on kind=update/report — {head, job, reason?}. `head` and `job` must both be non-empty (or both omitted); `reason` is optional free-text context. Persists to a disk-backed ledger keyed by head_sha, recording that this notification obligation was explicitly triaged. PR-1 is data-layer only — no notification path reads the ledger yet (that's PR-2)."}
         }, "required": [], "anyOf": [{"required": ["message"]}, {"required": ["message_from_file"]}]}})
 }
 
@@ -923,6 +924,7 @@ mod tests {
             ("send", "terminal", "messaging.rs msg.terminal → auto_close_on_report"),
             ("send", "no_report_expected", "comms.rs track step → DispatchEntry status=no_report_expected (skips sweep_stuck/sweep_orphans) + messaging.rs track_dispatch skips the dispatch_idle sidecar record"),
             ("send", "ack_inbox", "comms.rs ack_inbox=true on kind=report → inbox::ack_by_correlation settles the sender's DELIVERING rows whose task_id==correlation_id"),
+            ("send", "triaged", "comms.rs discharge-ledger record on kind=update/report (#2537)"),
             // ── task (all fields consumed per action; #1933 audit) ──
             ("task", "action", "tasks/handler.rs action routing"),
             ("task", "title", "tasks/handler.rs handle_create"),
