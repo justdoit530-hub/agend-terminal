@@ -2629,7 +2629,7 @@ mod tests {
                             let request = read_http_request(&mut stream);
                             use std::io::Write;
                             stream
-                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                                 .expect("failed to write response");
                             return Some(request);
                         }
