@@ -200,6 +200,7 @@ impl AppState {
                 let attach_tx = attach_tx.clone();
                 let registry = std::sync::Arc::clone(registry);
                 let home = home.clone();
+                // fire-and-forget: parallel attach worker thread; JoinHandle stored in attach_workers for join.
                 let handle = std::thread::Builder::new()
                     .name(format!("attach_worker_{w}"))
                     .spawn(move || {
