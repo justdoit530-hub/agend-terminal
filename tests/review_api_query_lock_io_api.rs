@@ -37,7 +37,11 @@ fn target_source() -> PathBuf {
     if agent_ops.exists() {
         agent_ops
     } else {
-        manifest.join("src").join("api").join("handlers").join("query.rs")
+        manifest
+            .join("src")
+            .join("api")
+            .join("handlers")
+            .join("query.rs")
     }
 }
 
