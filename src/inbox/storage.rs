@@ -501,6 +501,7 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                     all_messages.push(msg);
                     continue;
                 }
+                budget_used += sz;
                 if auto_ack_on_drain_kind(&msg) {
                     msg.read_at = Some(now.clone());
                 } else {

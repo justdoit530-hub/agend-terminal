@@ -377,7 +377,7 @@ instances:
         write_fleet(&home, "instances:\n  general: {}\n  lead: {}\n");
         assert_eq!(
             resolve_task_stall_recipients(&home),
-            vec!["alice".to_string(), "bob".to_string(), "carol".to_string()]
+            vec!["general".to_string(), "lead".to_string()]
         );
         // Whitespace-only env falls back to the built-in default.
         std::env::set_var("AGEND_TASK_STALL_RECIPIENTS", "   ");
