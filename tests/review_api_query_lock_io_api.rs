@@ -31,16 +31,18 @@
 
 use std::path::PathBuf;
 
-fn query_rs() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("api")
-        .join("handlers")
-        .join("query.rs")
+fn target_source() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let agent_ops = manifest.join("src").join("agent_ops.rs");
+    if agent_ops.exists() {
+        agent_ops
+    } else {
+        manifest.join("src").join("api").join("handlers").join("query.rs")
+    }
 }
 
-/// Extract the body lines of `handle_list` (from its `fn` signature to the
-/// next top-level `fn ` at the same indentation). Returns 1-based line
+/// Extract the body lines of `handle_list` or `list_snapshot` (from its `fn` signature
+/// to the next top-level `fn ` at the same indentation). Returns 1-based line
 /// numbers paired with the line text, comment/doc lines stripped.
 fn handle_list_body(src: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
@@ -51,6 +53,9 @@ fn handle_list_body(src: &str) -> Vec<(usize, String)> {
             if trimmed.starts_with("pub(crate) fn handle_list(")
                 || trimmed.starts_with("fn handle_list(")
                 || trimmed.starts_with("pub fn handle_list(")
+                || trimmed.starts_with("pub(crate) fn list_snapshot(")
+                || trimmed.starts_with("fn list_snapshot(")
+                || trimmed.starts_with("pub fn list_snapshot(")
             {
                 in_fn = true;
                 out.push((i + 1, raw.to_string()));
@@ -79,7 +84,7 @@ fn handle_list_body(src: &str) -> Vec<(usize, String)> {
 
 #[test]
 fn handle_list_does_not_hold_registry_lock_across_dispatch_idle_io_api() {
-    let path = query_rs();
+    let path = target_source();
     let src = std::fs::read_to_string(&path).expect("read query.rs");
     let body = handle_list_body(&src);
     assert!(
