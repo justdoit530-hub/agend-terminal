@@ -181,14 +181,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(_orig_err) = std::fs::rename(&tmp, path) {
         #[cfg(windows)]
         {
             let _ = std::fs::remove_file(path);
             std::fs::rename(&tmp, path)?;
         }
         #[cfg(not(windows))]
-        return Err(e.into());
+        return Err(_orig_err.into());
     }
     guard.disarm();
     // Durability: fsync the parent directory after the rename so the new
