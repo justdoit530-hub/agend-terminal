@@ -37,6 +37,60 @@ use serde_json::{json, Value};
 #[cfg(test)]
 use crate::agent_ops::{cleanup_working_dir, merge_metadata};
 
+pub(super) const MAX_MESSAGE_FILE_BYTES: u64 = 1_048_576; // 1 MB
+
+/// Read a text file for message_from_file, with size limit.
+/// Opens the file once and reads through a bounded reader — TOCTOU-safe
+/// against both path swap (single fd) and concurrent append/growth
+/// (`.take(MAX + 1)` enforces the cap on actual bytes transferred).
+/// Rejects relative paths (non-deterministic cwd), non-regular files,
+/// empty files, oversized content, and non-UTF-8 content.
+pub(super) fn read_message_file(path: &str) -> Result<String, String> {
+    use std::io::Read;
+
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return Err("message_from_file requires an absolute path".into());
+    }
+    // Stat before open: reject non-regular files (FIFO, socket, device)
+    // without blocking on open. The fd-based metadata() after open is kept
+    // as a TOCTOU guard against path-swap attacks.
+    let pre_meta = path
+        .metadata()
+        .map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    if !pre_meta.file_type().is_file() {
+        return Err("message_from_file: path is not a regular file".into());
+    }
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err("message_from_file: path is not a regular file".into());
+    }
+    // Read bounded bytes first, then check size — avoids splitting a UTF-8
+    // code point and reporting a false encoding error for oversized content.
+    let limit = (MAX_MESSAGE_FILE_BYTES + 1) as usize;
+    let mut bytes = Vec::with_capacity((meta.len() as usize).min(limit));
+    file.take(limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read message_from_file: {e}"))?;
+    if bytes.len() > MAX_MESSAGE_FILE_BYTES as usize {
+        return Err(format!(
+            "message_from_file exceeds size limit ({} > {} bytes)",
+            bytes.len(),
+            MAX_MESSAGE_FILE_BYTES
+        ));
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|e| format!("failed to read message_from_file: invalid UTF-8: {e}"))?;
+    if content.is_empty() {
+        return Err("message_from_file: file is empty".into());
+    }
+    Ok(content)
+}
+
 /// True iff the MCP handler output should be treated as a success for
 /// `FleetEvent` emission purposes. Handlers that wrap `send_to` return
 /// `{"target": …}` (API path) or `{"target": …, "note": …}` (fallback

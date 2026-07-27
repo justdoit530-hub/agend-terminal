@@ -26,7 +26,8 @@ pub fn tool_definitions_for_role(role_kind: Option<crate::fleet::RoleKind>) -> V
 pub(crate) fn def_reply() -> Value {
     json!({"name": "reply", "description": "Reply to the user via the active channel. Requires daemon API. Sprint 59 Wave 1 PR-4 ((B) decision default with timeout): when both `default_action` and `timeout_secs` are set, the daemon records a pending operator decision sidecar and auto-fires the default after the timeout window. Subsequent reply calls without `default_action` resolve the pending decision (operator override / explicit answer arrived).",
         "inputSchema": {"type": "object", "properties": {
-            "message": {"type": "string", "description": "The reply text to send to the user."},
+            "message": {"type": "string", "description": "The reply text to send to the user. Required unless message_from_file is provided."},
+            "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the reply. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
             "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."},
             "message_id": {"type": "string", "description": "#2622 PR-3: target an original inbox message by id. When set, routes by THAT message's own channel (instead of the process-global reply_to_channel prefer-chain) and, on send success, settles that row so it stops redelivering. Omit for the default prefer-chain behavior."},
@@ -45,7 +46,7 @@ pub(crate) fn def_reply() -> Value {
                     }
                 }
             }
-        }, "required": ["message"]}})
+        }, "required": [], "anyOf": [{"required": ["message"]}, {"required": ["message_from_file"]}]}})
 }
 
 pub(crate) fn def_download_attachment() -> Value {
@@ -60,7 +61,8 @@ pub(crate) fn def_send() -> Value {
             "instances": {"type": "array", "items": {"type": "string"}, "description": "Names of existing instances to broadcast to (broadcast mode)"},
             "team": {"type": "string", "description": "Team name (broadcast to team)"},
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
-            "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query)"},
+            "message": {"type": "string", "description": "Message text (or 'task' for delegate, 'summary' for report, 'question' for query). Required unless message_from_file is provided."},
+            "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the message. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
             "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
             "success_criteria": {"type": "string", "description": "For task delegation"},
             "context": {"type": "string"},
@@ -84,7 +86,7 @@ pub(crate) fn def_send() -> Value {
             "terminal": {"type": "boolean", "description": "Set true on kind=report to signal task completion. When correlation_id matches a task and reporter is the assignee, the task is auto-closed. Default false — progress reports and review verdicts do not trigger auto-close."},
             "no_report_expected": {"type": "boolean", "description": "#2099: set true on a fire-and-forget kind=task dispatch that intentionally expects NO kind=report back. The dispatch is recorded with a terminal-like status so the 30-min dispatch-stuck sweep never false-fires a 'dispatch stuck check' for it (the audit row is kept). Default false — every normal dispatch stays stuck-tracked. Distinct from `terminal`, which is the report-side auto-close signal."},
             "ack_inbox": {"type": "boolean", "description": "Set true on kind=report with correlation_id to auto-settle the sender's DELIVERING inbox messages whose task_id matches the correlation_id. Eliminates the need for a separate `inbox action=ack` call after sending a report — the daemon settles the dispatch message(s) atomically with the send. Only fires when the send succeeds. Default false (existing two-step flow still works)."}
-        }, "required": ["message"]}})
+        }, "required": [], "anyOf": [{"required": ["message"]}, {"required": ["message_from_file"]}]}})
 }
 
 pub(crate) fn def_inbox() -> Value {

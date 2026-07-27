@@ -21,6 +21,16 @@ pub(super) fn handle_unified_send(
     if let Some(err) = enforce_send_invariants(home, &args, sender) {
         return err;
     }
+    // #3084: message_from_file → message. AFTER invariants (no I/O on invalid
+    // dispatches), BEFORE broadcast/routing so all paths see the body.
+    if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
+        match super::read_message_file(path) {
+            Ok(content) => {
+                args["message"] = json!(content);
+            }
+            Err(e) => return json!({"error": e}),
+        }
+    }
 
     fn lift_message(args: &mut Value, dst: &str) {
         if args.get(dst).is_none() {
