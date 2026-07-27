@@ -2546,10 +2546,119 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn changed_review_class_reconciles_pr_gate_without_replaying_ci_3114() {
+    let home = watch_test_home("review-class-change-pr-gate");
+    let args = serde_json::json!({"repository": "o/r", "branch": "feat/x"});
+    super::handle_watch_ci(&home, &args, "dev-1");
+    let path = watch_path_for(&home, "o/r", "feat/x");
+    let gen_before = seed_notify_cursors(&path);
+    let head = "f".repeat(40);
+    let mut state = crate::daemon::pr_state::new_for_branch(
+        "o/r",
+        "feat/x",
+        &head,
+        crate::daemon::pr_state::ReviewClass::Unresolved,
+    );
+    state.pr_number = 3114;
+    state.ci_state = crate::daemon::pr_state::CiState::Green {
+        sha: head.clone(),
+        observed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    state
+        .validated_review_receipts
+        .push(crate::review_receipt::ReviewReceiptSummary {
+            receipt_id: "review-receipt:3114-positive".into(),
+            source_id: "3114-positive".into(),
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: crate::types::InstanceId::new(),
+            reviewer_name: "reviewer".into(),
+            repo: "o/r".into(),
+            pr_number: 3114,
+            branch: "feat/x".into(),
+            task_id: "t-3114-positive".into(),
+            reviewed_head: head.clone(),
+            review_class: crate::daemon::pr_state::ReviewClass::Single,
+            slot: crate::review_receipt::ReviewSlot::Primary,
+            verdict: crate::review_receipt::ReviewVerdict::Verified,
+        });
+    state.diagnostic_emitted_for_sha = Some(head);
+    crate::daemon::pr_state::save(&home, &state).unwrap();
+
+    let result = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/x",
+            "review_class": "single",
+        }),
+        "dev-1",
+    );
+    assert!(result.get("error").is_none(), "{result}");
+
+    let v = read_watch(&path);
+    assert_eq!(v["last_run_id"].as_u64(), Some(100));
+    assert!(
+        v["last_notified_by_workflow"]["#run:100"].is_object(),
+        "resolving review_class must not replay an already-delivered CI run: {v}"
+    );
+    assert_eq!(
+        v["generation_id"].as_str(),
+        Some(gen_before.as_str()),
+        "resolving review_class must preserve the notification epoch: {v}"
+    );
+    assert_eq!(v["review_class"], "single");
+    let reconciled = crate::daemon::pr_state::load(&home, "o/r", "feat/x").unwrap();
+    assert_eq!(
+        reconciled.review_class,
+        crate::daemon::pr_state::ReviewClass::Single
+    );
+    assert_eq!(
+        reconciled.merge_state,
+        crate::daemon::pr_state::MergeState::MergeReady,
+        "resolving the class must recompute the already-green, already-reviewed PR gate"
+    );
+    assert!(
+        reconciled.diagnostic_emitted_for_sha.is_none(),
+        "resolving the PR gate must clear the unresolved-class diagnostic debounce"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn unchanged_review_class_preserves_notification_epoch_3114() {
+    let home = watch_test_home("review-class-unchanged-epoch");
+    let args = serde_json::json!({
+        "repository": "o/r",
+        "branch": "feat/x",
+        "review_class": "single",
+    });
+    super::handle_watch_ci(&home, &args, "dev-1");
+    let path = watch_path_for(&home, "o/r", "feat/x");
+    let gen_before = seed_notify_cursors(&path);
+
+    super::handle_watch_ci(&home, &args, "dev-1");
+
+    let v = read_watch(&path);
+    assert_eq!(v["last_run_id"].as_u64(), Some(100));
+    assert!(
+        v["last_notified_by_workflow"]["#run:100"].is_object(),
+        "an unchanged review_class must not redeliver a terminal run: {v}"
+    );
+    assert_eq!(
+        v["generation_id"].as_str(),
+        Some(gen_before.as_str()),
+        "an unchanged review_class must preserve the notification epoch: {v}"
+    );
+    assert_eq!(v["review_class"], "single");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// The complement of the test above, and the regression risk of the reset: an
 /// ORDINARY resubscribe (no tombstone — the watch still has a live subscriber)
-/// must NOT touch the notification cursors or the generation. Only the
-/// zero-subscriber tombstone path starts a new epoch.
+/// with no review-class change must NOT touch the notification cursors or the
+/// generation.
 #[test]
 fn ordinary_resubscribe_preserves_notify_cursors_and_generation() {
     let home = watch_test_home("ordinary-resubscribe-epoch");

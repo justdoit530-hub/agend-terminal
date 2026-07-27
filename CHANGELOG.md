@@ -7,6 +7,12 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fleet.yaml` mutations no longer erase operator comments** — team and instance updates retain comment text in its original order; because semantic YAML serialization still normalizes presentation, retained comments are emitted as a document header rather than preserving their original indentation or key attachment (#3111).
+- **Removed the unused transcript context estimator** — deleted its uncalled implementation and tests; statusline-based context reporting and alerts are unchanged (#3100 Phase A).
+- **Resolving a CI watch's review class no longer leaves the merge gate stuck** — an explicit class now repairs an existing unresolved PR state directly, without replaying an already-delivered CI result or `ci-ready` handoff (#3114).
+
 ## [0.11.3] — 2026-07-26
 
 ### Changed
