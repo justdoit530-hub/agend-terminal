@@ -388,7 +388,6 @@ pub(super) fn handle_delegate_task(
             task_id,
         }));
     }
-    let mut result = result;
     if let Some(tid) = auto_created_task_id {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("auto_created_task_id".into(), json!(tid));

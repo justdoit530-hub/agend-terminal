@@ -3623,6 +3623,25 @@ fn dispatch_reuse_bind_failure_does_not_remove_live_worktree_2158() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "seed", "review_class": class}),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
+
+fn minimal_runtime() -> crate::mcp::handlers::dispatch::RuntimeContext {
+    crate::mcp::handlers::dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        notifier: None,
+    }
+}
+
 /// F7 RED: when the ci-watch arm fails during a branch dispatch, the caller
 /// must receive a typed degraded result — not silent success. Injection:
 /// pre-create `<home>/ci-watches` as a regular file so `handle_watch_ci`

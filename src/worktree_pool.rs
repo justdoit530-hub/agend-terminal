@@ -35,6 +35,53 @@ pub struct WorktreeLease {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReleaseTestPhase {
+    AfterBindingSnapshot,
+    BeforeWorktreeRemove,
+    BeforeNoticeEmit,
+    CheckoutBoundBeforeCommit,
+}
+
+#[cfg(test)]
+pub(crate) mod release_test_seam {
+    use super::ReleaseTestPhase;
+    use std::cell::RefCell;
+
+    type ReleaseHook = Box<dyn Fn(ReleaseTestPhase)>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<ReleaseHook>> = RefCell::new(None);
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(crate) fn install(hook: impl Fn(ReleaseTestPhase) + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(crate) fn hit(phase: ReleaseTestPhase) {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow().as_ref() {
+                hook(phase);
+            }
+        });
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) mod release_test_seam {
+    use super::ReleaseTestPhase;
+    pub(crate) fn hit(_phase: ReleaseTestPhase) {}
+}
+
 /// Typed failure modes of [`lease`] (arch-review finding D+H): replaces the
 /// stringly error + the silent `Ok`-on-bind-failure. The dispatch boundary
 /// matches these variants instead of `msg.contains("E4.5")`.

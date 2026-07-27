@@ -324,7 +324,11 @@ pub(super) fn update_watch_state_with_notify(
 /// Merge-safe: starts from the on-disk state (preserving all
 /// control-plane fields) and only applies poll-owned deltas from
 /// the in-memory snapshot.
-pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::WatchState) {
+pub(crate) fn flush_watch_state(
+    watch_path: &Path,
+    state: &super::watch_state::WatchState,
+    expected_generation: Option<&str>,
+) {
     let lock_path = watch_path.with_extension("lock");
     let _lock = match crate::store::acquire_file_lock(&lock_path) {
         Ok(l) => l,
@@ -340,6 +344,22 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
         Some(c) => c,
         None => return, // file deleted by concurrent unwatch — respect deletion
     };
+    if let Some(expected) = expected_generation {
+        if !expected.is_empty() {
+            let disk_gen = merged.generation_id.as_deref().unwrap_or("");
+            if disk_gen.is_empty() {
+                merged.generation_id = Some(expected.to_string());
+            } else if disk_gen != expected {
+                tracing::info!(
+                    path = %watch_path.display(),
+                    disk = %disk_gen,
+                    expected = %expected,
+                    "flush_watch_state: generation_id mismatch — skipping stale flush"
+                );
+                return;
+            }
+        }
+    }
     // Apply only poll-owned fields from in-memory state.
     merged.last_run_id = state.last_run_id;
     merged.head_sha = state.head_sha.clone();
@@ -461,7 +481,7 @@ mod tests {
         }]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
@@ -613,7 +633,7 @@ mod tests {
 
         // File does not exist (concurrent unwatch deleted it).
         assert!(!watch_path.exists());
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
         assert!(
             !watch_path.exists(),
             "flush must not resurrect a deleted watch file"
@@ -650,7 +670,7 @@ mod tests {
         updated.required_checks = Some(vec!["build".into()]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&updated).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();

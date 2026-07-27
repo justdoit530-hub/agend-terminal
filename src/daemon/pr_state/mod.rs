@@ -85,6 +85,8 @@ pub struct PrState {
     /// re-emit until head_sha changes.
     #[serde(default)]
     pub ready_emitted_for_sha: Option<String>,
+    #[serde(default)]
+    pub diagnostic_emitted_for_sha: Option<String>,
     /// #973 cross-audit Pushback C: tracks whether implementer armed
     /// `gh pr merge --auto` against the current head. Cleared on
     /// head_sha advance (force-push cancels GitHub's auto-merge).
@@ -592,6 +594,7 @@ where
 /// `with_pr_state_or_create` does the CAS afterwards. On a concurrent
 /// creator the CAS converges: if the file already exists with matching
 /// identity, the caller gets the existing state; a mismatch fails closed.
+#[allow(dead_code)]
 pub fn ensure_from_scm(
     home: &std::path::Path,
     repo: &str,
@@ -660,6 +663,17 @@ pub fn ensure_from_scm(
     }
     Ok(state)
 }
+
+#[allow(dead_code)]
+pub(crate) fn reconcile_review_class(persisted: ReviewClass, watch: ReviewClass) -> ReviewClass {
+    match (persisted, watch) {
+        (ReviewClass::Dual, _) => ReviewClass::Dual,
+        (ReviewClass::Unresolved, w) => w,
+        (ReviewClass::Single, ReviewClass::Unresolved) => ReviewClass::Unresolved,
+        (ReviewClass::Single, w) => w,
+    }
+}
+
 /// Remove the per-PR file. Used by the per-tick scanner after a
 /// terminal state (Merged / ClosedUnmerged) is observed and the
 /// `[pr-merged]` / `[pr-closed-unmerged]` events have been emitted.
@@ -909,6 +923,7 @@ pub fn new_for_branch(
         draft_state: DraftState::Ready,
         review_class,
         ready_emitted_for_sha: None,
+        diagnostic_emitted_for_sha: None,
         auto_armed: false,
         auto_armed_for_sha: None,
         auto_armed_at: None,
@@ -1437,6 +1452,7 @@ mod tests {
             draft_state: DraftState::Ready,
             review_class: class,
             ready_emitted_for_sha: None,
+            diagnostic_emitted_for_sha: None,
             auto_armed: false,
             auto_armed_for_sha: None,
             auto_armed_at: None,
