@@ -2592,6 +2592,7 @@ fn ordinary_resubscribe_preserves_notify_cursors_and_generation() {
 // Arch-14 item 10: repo release canonical delegation (real dispatch entry)
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn release_guard_tmp(tag: &str) -> std::path::PathBuf {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let d = manifest.parent().unwrap_or(manifest).join(format!(

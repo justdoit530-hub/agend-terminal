@@ -3623,6 +3623,7 @@ fn dispatch_reuse_bind_failure_does_not_remove_live_worktree_2158() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+#[allow(dead_code)]
 fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
     let created = crate::tasks::handle(
         home,
@@ -3632,6 +3633,7 @@ fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
     created["id"].as_str().expect("created task id").to_string()
 }
 
+#[allow(dead_code)]
 fn minimal_runtime() -> crate::mcp::handlers::dispatch::RuntimeContext {
     crate::mcp::handlers::dispatch::RuntimeContext {
         registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
