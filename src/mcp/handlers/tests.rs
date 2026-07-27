@@ -4305,3 +4305,495 @@ fn test_handle_tool_does_not_emit_hook_intercept_evidence() {
     std::env::remove_var("AGEND_SHADOW_OBSERVER");
     std::fs::remove_dir_all(&home).ok();
 }
+
+// --- read_message_file tests ---
+
+#[test]
+fn read_message_file_ok() {
+    let dir = tmp_home("read_msg_file_ok");
+    let path = dir.join("test.txt");
+    std::fs::write(&path, b"hello world").unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    assert_eq!(result.unwrap(), "hello world");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_missing() {
+    let dir = tmp_home("read_msg_file_missing");
+    let path = dir.join("xyz.txt");
+    let result = read_message_file(path.to_str().unwrap());
+    assert!(result
+        .unwrap_err()
+        .contains("failed to read message_from_file"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_empty_rejected() {
+    let dir = tmp_home("read_msg_file_empty");
+    let path = dir.join("empty.txt");
+    std::fs::write(&path, b"").unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    let err = result.unwrap_err();
+    assert!(err.contains("empty"), "error: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_relative_path_rejected() {
+    let result = read_message_file("relative/path.txt");
+    let err = result.unwrap_err();
+    assert!(err.contains("absolute path"), "error: {err}");
+}
+
+#[test]
+fn read_message_file_oversized() {
+    let dir = tmp_home("read_msg_file_big");
+    let path = dir.join("big.txt");
+    let content = vec![b'x'; (MAX_MESSAGE_FILE_BYTES + 1) as usize];
+    std::fs::write(&path, &content).unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    let err = result.unwrap_err();
+    assert!(err.contains("exceeds size limit"), "error: {err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn read_message_file_non_utf8() {
+    let dir = tmp_home("read_msg_file_utf8");
+    let path = dir.join("binary.bin");
+    std::fs::write(&path, [0xFF, 0xFE, 0x00]).unwrap();
+    let result = read_message_file(path.to_str().unwrap());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("invalid UTF-8") || err.contains("message_from_file"),
+        "error: {err}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn read_message_file_non_regular_rejected() {
+    let sock_path =
+        std::path::PathBuf::from(format!("/tmp/agend-message-{}.sock", std::process::id()));
+    std::fs::remove_file(&sock_path).ok();
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("create test socket");
+    let result = read_message_file(sock_path.to_str().unwrap());
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("not a regular file"),
+        "must reject socket pre-open, got: {err}"
+    );
+    drop(listener);
+    std::fs::remove_file(&sock_path).ok();
+}
+
+fn minimal_test_runtime() -> super::dispatch::RuntimeContext {
+    super::dispatch::RuntimeContext {
+        registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        configs: Default::default(),
+        externals: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+        notifier: None,
+    }
+}
+
+#[test]
+fn send_message_from_file_delivers_content() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("send-msg-file-deliver");
+    let file_path = home.join("draft.txt");
+    std::fs::write(&file_path, b"hello from file").unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  sender-agent:\n    backend: claude\n  target-agent:\n    backend: claude\n",
+    )
+    .unwrap();
+    let sender = crate::identity::Sender::new("sender-agent").expect("valid sender name");
+    let rt = minimal_test_runtime();
+    let args = json!({
+        "instance": "target-agent",
+        "message_from_file": file_path.to_str().unwrap(),
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), Some(&rt));
+    assert!(
+        result.get("error").is_none(),
+        "send should succeed: {result}"
+    );
+    let msgs = crate::inbox::drain(&home, "target-agent");
+    assert_eq!(msgs.len(), 1, "target should have 1 message");
+    assert_eq!(msgs[0].text, "hello from file", "content must match file");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn unified_send_message_wins_over_routed_fields_3079() {
+    let _g = fleet_test_guard();
+    let cases = [
+        (
+            "task",
+            "task",
+            "canonical task",
+            "canonical task",
+            "stale task",
+            "task",
+            "t-3079-task",
+        ),
+        (
+            "query",
+            "query",
+            "canonical query",
+            "canonical query",
+            "stale question",
+            "question",
+            "",
+        ),
+        (
+            "report",
+            "report",
+            "canonical report",
+            "canonical report",
+            "stale summary",
+            "summary",
+            "",
+        ),
+        (
+            "report-file",
+            "report",
+            "inline message loses",
+            "canonical report from file",
+            "stale summary",
+            "summary",
+            "",
+        ),
+    ];
+
+    for (label, kind, message, expected, stale, routed_field, task_id) in cases {
+        let home = tmp_home(&format!("send-canonical-{kind}"));
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  sender-agent:\n    backend: claude\n  target-agent:\n    backend: claude\n",
+        )
+        .unwrap();
+        let sender = crate::identity::Sender::new("sender-agent").unwrap();
+        let mut args = json!({
+            "instance": "target-agent",
+            "message": message,
+            "request_kind": kind,
+        });
+        args[routed_field] = json!(stale);
+        if !task_id.is_empty() {
+            args["task_id"] = json!(task_id);
+        }
+        if label == "report-file" {
+            let file_path = home.join("canonical-report.txt");
+            std::fs::write(&file_path, expected).unwrap();
+            args["message_from_file"] = json!(file_path);
+        }
+
+        let result = super::comms::handle_unified_send(
+            &home,
+            &args,
+            &Some(sender),
+            Some(&minimal_test_runtime()),
+        );
+        assert!(is_ok_result(&result), "{label} send failed: {result}");
+        let messages = crate::inbox::drain(&home, "target-agent");
+        assert_eq!(messages.len(), 1, "{label} must deliver one message");
+        assert!(
+            messages[0].text.contains(expected),
+            "{label} must deliver canonical message body: {:?}",
+            messages[0].text
+        );
+        assert!(
+            !messages[0].text.contains(stale),
+            "{label} must not deliver stale routed field: {:?}",
+            messages[0].text
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[test]
+fn unified_send_typed_code_review_scans_canonical_message_3079() {
+    let _g = fleet_test_guard();
+    const HEAD: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let home = tmp_home("send-canonical-code-review");
+    let reviewer_id = crate::types::InstanceId::new();
+    let lead_id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  sender-agent:\n    backend: claude\n    id: {}\n  target-agent:\n    backend: claude\n    id: {}\nteams:\n  archfix:\n    members: [sender-agent, target-agent]\n    orchestrator: target-agent\n",
+            reviewer_id.full(),
+            lead_id.full(),
+        ),
+    )
+    .unwrap();
+    crate::daemon::pr_state::record_ci_result(
+        &home,
+        "owner/repo",
+        "fix/typed",
+        HEAD,
+        crate::daemon::pr_state::CiConclusion::Green,
+        vec!["target-agent".into()],
+        crate::daemon::pr_state::ReviewClass::Single,
+    );
+    crate::daemon::pr_state::with_pr_state(&home, "owner/repo", "fix/typed", |state| {
+        state.pr_number = 3079;
+    })
+    .unwrap();
+    let assignment = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        "owner/repo",
+        "fix/typed",
+        "sender-agent",
+        reviewer_id,
+        3079,
+        HEAD,
+        crate::review_receipt::ReviewSlot::Primary,
+        "target-agent",
+        "t-3079-review",
+        crate::daemon::pr_state::ReviewClass::Single,
+        crate::mcp::handlers::comms_gates::ReviewAuthor::External("octocat".into()),
+        "review exact head",
+        None,
+        None,
+        "2026-07-26T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
+
+    let sender = crate::identity::Sender::new("sender-agent").unwrap();
+    let result = super::comms::handle_unified_send(
+        &home,
+        &json!({
+            "instance": "target-agent",
+            "message": "VERIFIED — canonical review\n\n### Evidence\nran: cargo test → passed",
+            "summary": "VERIFIED — stale review without evidence",
+            "request_kind": "report",
+            "report_purpose": "code_review",
+            "correlation_id": "t-3079-review",
+            "code_review": {
+                "assignment_id": assignment.assignment_id,
+                "verdict": "verified",
+                "evidence_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        }),
+        &Some(sender),
+        Some(&minimal_test_runtime()),
+    );
+    assert!(
+        is_ok_result(&result),
+        "typed code review must deliver: {result}"
+    );
+    let messages = crate::inbox::drain(&home, "target-agent");
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].text.contains("### Evidence"));
+    // Fork may not yet surface validated_code_review on InboxMessage;
+    // pin that the canonical body (not the stale summary) was delivered.
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn send_message_from_file_missing() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("send-msg-file-missing");
+    let missing_path = home.join("missing.txt");
+    let sender = crate::identity::Sender::new("test-agent").expect("valid sender name");
+    let args = json!({
+        "instance": "target",
+        "message_from_file": missing_path.to_str().unwrap(),
+    });
+    let result = super::comms::handle_unified_send(&home, &args, &Some(sender), None);
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("message_from_file"),
+        "must report file read error, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_message_from_file_ok() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-msg-file-ok");
+    let file_path = home.join("reply.txt");
+    std::fs::write(&file_path, b"reply from file").unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+
+    struct RecordingChannel {
+        replies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        caps: crate::channel::ChannelCapabilities,
+    }
+    impl crate::channel::Channel for RecordingChannel {
+        fn kind(&self) -> &'static str {
+            "recording"
+        }
+        fn caps(&self) -> &crate::channel::ChannelCapabilities {
+            &self.caps
+        }
+        fn poll_event(&self) -> Option<crate::channel::ChannelEvent> {
+            None
+        }
+        fn send_from_agent(
+            &self,
+            _agent: &str,
+            op: crate::channel::AgentOutboundOp,
+        ) -> std::result::Result<crate::channel::MsgRef, crate::channel::ChannelError> {
+            if let crate::channel::AgentOutboundOp::Reply { text, .. } = op {
+                self.replies.lock().unwrap().push(text.to_string());
+            }
+            Ok(crate::channel::MsgRef {
+                id: "m-recording-1".into(),
+                binding: crate::channel::BindingRef::new(
+                    "recording",
+                    Some("TG#recording".into()),
+                    (),
+                ),
+            })
+        }
+        fn outbound_authorized(&self) -> bool {
+            true
+        }
+        fn send(
+            &self,
+            _: &crate::channel::BindingRef,
+            _: crate::channel::OutMsg,
+        ) -> anyhow::Result<crate::channel::MsgRef> {
+            anyhow::bail!("mock")
+        }
+        fn edit(
+            &self,
+            _: &crate::channel::MsgRef,
+            _: crate::channel::OutMsg,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn delete(&self, _: &crate::channel::MsgRef) -> anyhow::Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn create_binding(
+            &self,
+            _: &str,
+            _: crate::channel::BindingOpts,
+        ) -> anyhow::Result<crate::channel::BindingRef> {
+            anyhow::bail!("mock")
+        }
+        fn remove_binding(&self, _: &crate::channel::BindingRef) -> anyhow::Result<()> {
+            anyhow::bail!("mock")
+        }
+        fn has_binding(&self, _: &str) -> bool {
+            false
+        }
+        fn record_binding(&self, _: &str, _: crate::channel::BindingRef, _: String) {}
+        fn take_binding(&self, _: &str) -> Option<crate::channel::BindingRef> {
+            None
+        }
+        fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+        fn notify(
+            &self,
+            _: &str,
+            _: crate::channel::NotifySeverity,
+            _: &str,
+            _: bool,
+        ) -> std::result::Result<(), crate::channel::ChannelError> {
+            Ok(())
+        }
+    }
+
+    let replies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec = std::sync::Arc::new(RecordingChannel {
+        replies: replies.clone(),
+        caps: crate::channel::ChannelCapabilities::default(),
+    });
+    crate::channel::register_active_channel(rec);
+    crate::daemon::heartbeat_pair::update_with("alpha", |p| {
+        p.reply_to_channel = None;
+    });
+
+    let result = super::channel::handle_reply(
+        &home,
+        &json!({"message_from_file": file_path.to_str().unwrap()}),
+        "alpha",
+    );
+    assert!(
+        result.get("error").is_none(),
+        "reply should succeed when channel is active, got: {result}"
+    );
+    let delivered = replies.lock().unwrap();
+    assert_eq!(delivered.len(), 1, "one reply should have been sent");
+    assert_eq!(
+        delivered[0], "reply from file",
+        "delivered reply text must equal file content"
+    );
+    crate::channel::reset_active_channel_for_test();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_message_from_file_missing() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-msg-file-missing");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+    let result = super::channel::handle_reply(
+        &home,
+        &json!({"message_from_file": "/nonexistent/reply.txt"}),
+        "alpha",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("message_from_file"),
+        "must report file read error in reply path, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_message_from_file_empty() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-msg-file-empty");
+    let file_path = home.join("empty.txt");
+    std::fs::write(&file_path, b"").unwrap();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+    let result = super::channel::handle_reply(
+        &home,
+        &json!({"message_from_file": file_path.to_str().unwrap()}),
+        "alpha",
+    );
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("empty"),
+        "must reject empty file in reply path, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reply_no_message_nor_file() {
+    let _g = fleet_test_guard();
+    let home = tmp_home("reply-no-msg-file");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        "instances:\n  alpha:\n    backend: claude\n",
+    )
+    .unwrap();
+    let result = super::channel::handle_reply(&home, &json!({}), "alpha");
+    let err = result["error"].as_str().unwrap_or("");
+    assert!(
+        err.contains("message"),
+        "must report missing message/file, got: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}

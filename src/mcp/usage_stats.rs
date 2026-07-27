@@ -243,7 +243,8 @@ mod tests {
 
     /// `optional_params` derives `properties − required` from the live registry:
     /// `task` (required `action`) keeps `branch`/`priority` as optional and drops
-    /// `action`; `send` (required `message`) drops `message`.
+    /// `action`; `send` has conditional message/message_from_file alternatives,
+    /// so both message fields are optional in the top-level schema.
     #[test]
     fn optional_set_excludes_required_2055() {
         let opt = optional_params();
@@ -255,7 +256,10 @@ mod tests {
             "action is required → excluded from the optional set"
         );
         let send = opt.get("send").expect("send tool registered");
-        assert!(!send.contains("message"), "message is required → excluded");
+        assert!(
+            send.contains("message"),
+            "message is conditionally optional → included"
+        );
         assert!(send.contains("branch"), "branch is an optional send param");
     }
 
@@ -300,8 +304,8 @@ mod tests {
             .collect();
         assert!(params.contains(&"instance") && params.contains(&"branch"));
         assert!(
-            !params.contains(&"message"),
-            "message is required → excluded"
+            params.contains(&"message"),
+            "message is conditionally optional → recorded"
         );
     }
 

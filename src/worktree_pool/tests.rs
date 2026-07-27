@@ -3740,3 +3740,135 @@ fn expected_head_drift_fail_closed() {
     );
     std::fs::remove_dir_all(&repo).ok();
 }
+
+/// Seed a LIVE (non-terminal) task that owns `branch`, so
+/// `task_active_for_branch` resolves to `Some(true)`.
+fn seed_active_task_for_branch(home: &Path, task_id: &str, branch: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    std::fs::create_dir_all(&board).ok();
+    let _ = crate::task_events::append(
+        &board,
+        &InstanceName::from("test"),
+        TaskEvent::Created {
+            task_id: TaskId(task_id.to_string()),
+            title: "live review".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            tags: Vec::new(),
+            owner: None,
+            depends_on: Vec::new(),
+            parent_id: None,
+            branch: Some(branch.to_string()),
+            due_at: None,
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+        },
+    );
+}
+
+/// RED #3090: a managed-review branch preserved ONLY because its task is still
+/// live records no cleanup intent, so `reconcile_terminal_review_intents` — the
+/// sweep that already exists to settle exactly this residue once the task goes
+/// terminal — never learns the branch exists. The release-time attempt is the
+/// only automatic one, and it fires at the one moment the evidence cannot be
+/// terminal, so the branch leaks forever.
+#[test]
+fn live_task_review_branch_records_retry_intent_3090() {
+    let home = tmp_home("3090-retry-home");
+    let repo = tmp_repo("3090-retry");
+    let branch = "review/retry-3090";
+    let tip = make_review_branch(&repo, branch);
+    seed_active_task_for_branch(&home, "T-3090", branch);
+
+    let mut binding = binding_with_lease(
+        branch,
+        &repo.display().to_string(),
+        Some("review"),
+        Some("assign-uuid-3090"),
+        Some(&tip),
+    );
+    binding["task_id"] = serde_json::json!("T-3090");
+
+    let mut out = ReleaseOutcome::default();
+    resolve_branch_cleanup(&home, &binding, true, false, false, false, &mut out);
+
+    // The live task still preserves the branch — that part is correct and stays.
+    assert!(
+        !out.branch_deleted,
+        "a live task must still preserve the branch at release time"
+    );
+    assert!(
+        branch_exists(&repo, branch),
+        "branch must survive while its task is live"
+    );
+    // …but the retry must be recorded, and recorded where the sweep that has to
+    // consume it can see it. A DRY-RUN reconcile is the sweep's own view:
+    // the branch must appear as a candidate, still preserved because the task
+    // is live.
+    let seen = crate::cleanup_intents::reconcile_terminal_review_intents(&home, true);
+    assert!(
+        seen.candidates.iter().any(|c| c.branch == branch),
+        "a branch preserved only because its task is live must record a cleanup \
+         intent visible to the terminal reconcile sweep: {seen:?} / {:?}",
+        out.branch_cleanup_skipped_reason
+    );
+    assert_eq!(
+        seen.settled, 0,
+        "a live task must not settle anything yet: {seen:?}"
+    );
+
+    // Second half — the intent must be CONSUMABLE, not merely present. Drive
+    // the REAL existing path: task goes terminal, the reconcile sweep runs.
+    seed_task_done(&home, "T-3090");
+    let result = crate::cleanup_intents::reconcile_terminal_review_intents(&home, false);
+    assert!(
+        result.settled >= 1,
+        "a terminal task must let the recorded intent settle: {result:?}"
+    );
+    assert!(
+        !branch_exists(&repo, branch),
+        "the exact review branch must be deleted once its task is terminal: {result:?}"
+    );
+    // The recovery ref must protect the exact tip that was deleted. Scanned at
+    // `refs/agend/recovery/` — the common root of both namespaces, since the
+    // reconcile path and `branch_sweep::prepare_branch_recovery` nest differently.
+    let recovery_tips = crate::git_helpers::git_cmd(
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/agend/recovery/",
+        ],
+    )
+    .expect("list recovery refs");
+    assert!(
+        recovery_tips.lines().any(|line| line.trim() == tip),
+        "a recovery ref must protect the exact deleted tip {tip}, got: {recovery_tips:?}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Transition a seeded task to Done — the terminal state
+/// `reconcile_terminal_review_intents` requires. Cancelled is deliberately not
+/// used here: its semantics are unchanged by this fix.
+fn seed_task_done(home: &Path, task_id: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    let emitter = InstanceName::from("test");
+    let _ = crate::task_events::append(
+        &board,
+        &emitter,
+        TaskEvent::Done {
+            task_id: TaskId(task_id.to_string()),
+            by: emitter.clone(),
+            source: crate::task_events::DoneSource::ReportAutoClose {
+                report_summary: "review complete".into(),
+                closed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        },
+    );
+}

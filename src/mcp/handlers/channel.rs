@@ -4,11 +4,25 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Value {
-    // #1602: the reply content param is `message` (was `text`) — now consistent
-    // with `send`/`schedule`. The MCP dispatch validator rejects a missing
-    // `message` with a clear named error, so a mis-named param no longer
-    // silently becomes an empty reply.
-    let text = args["message"].as_str().unwrap_or("").to_string();
+    // #1602: the reply content param is `message` (was `text`) — consistent with
+    // `send`/`schedule`. #3084: `message_from_file` overrides `message` when set.
+    let text = if let Some(path) = args["message_from_file"].as_str().filter(|s| !s.is_empty()) {
+        match super::read_message_file(path) {
+            Ok(content) => content,
+            Err(e) => {
+                crate::reply_ledger::record_reply_outcome(instance_name, false);
+                return json!({"error": e});
+            }
+        }
+    } else {
+        match args["message"].as_str() {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => {
+                crate::reply_ledger::record_reply_outcome(instance_name, false);
+                return json!({"error": "missing 'message' or 'message_from_file'"});
+            }
+        }
+    };
     let buttons: Option<Vec<Vec<crate::channel::ButtonDef>>> = if let Some(v) = args.get("buttons")
     {
         if v.is_null() {
@@ -24,7 +38,7 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
     } else {
         None
     };
-    tracing::info!(from = %instance_name, %text, ?buttons, "reply");
+    tracing::info!(from = %instance_name, text_len = %text.len(), ?buttons, "reply");
 
     // Sprint 59 Wave 1 PR-4 ((B) decision default with timeout):
     // dual-purpose hook on every reply call.

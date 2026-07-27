@@ -104,13 +104,16 @@ pub fn run(
     std::fs::create_dir_all(&daemon_home)?;
 
     // #1441: spawn_agent fail-fasts for managed (home-bearing) spawns when the
-    // instance is absent from fleet.yaml. Seed authoritative UUIDs for the two
-    // daemon test agents so they spawn and resolve to a stable registry key.
+    // instance is absent from fleet.yaml. Seed authoritative UUIDs for the daemon
+    // test agents so they spawn and resolve to a stable registry key. That includes
+    // `verify-dynamic`, which `test_create_delete` spawns through the API — without
+    // a seeded ID its spawn rolls back and the check reports `found=false`.
     std::fs::write(
         crate::fleet::fleet_yaml_path(&daemon_home),
         "instances:\n  \
          test-a:\n    id: 11111111-1111-4111-8111-111111111111\n  \
-         test-b:\n    id: 22222222-2222-4222-8222-222222222222\n",
+         test-b:\n    id: 22222222-2222-4222-8222-222222222222\n  \
+         verify-dynamic:\n    id: 33333333-3333-4333-8333-333333333333\n",
     )?;
 
     let registry: agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -248,6 +251,9 @@ fn finalize_results(
                 "tests": items,
             }))?
         );
+        if failed > 0 {
+            std::process::exit(1);
+        }
     } else {
         println!("\n{:=<50}", "= AgEnD Terminal Verify ");
         for r in &results {
@@ -428,13 +434,19 @@ fn test_send(home: &Path) -> TestResult {
 }
 
 fn test_create_delete(home: &Path) -> TestResult {
-    if api::call(
+    match api::call(
         home,
         &json!({"method": api::method::SPAWN, "params": {"name": "verify-dynamic", "backend": crate::default_shell()}}),
-    )
-    .is_err()
-    {
-        return TestResult::fail("create_delete", "spawn failed");
+    ) {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => {}
+        // A rolled-back spawn answers `ok:false` over a HEALTHY transport, so the
+        // former `is_err()`-only check passed it through and the failure surfaced
+        // downstream as a bare `found=false` — the API's own reason was dropped.
+        Ok(resp) => {
+            let why = resp["error"].as_str().unwrap_or("no error reported");
+            return TestResult::fail("create_delete", format!("spawn rejected: {why}"));
+        }
+        Err(e) => return TestResult::fail("create_delete", format!("spawn failed: {e}")),
     }
     std::thread::sleep(std::time::Duration::from_secs(1));
 
@@ -446,19 +458,29 @@ fn test_create_delete(home: &Path) -> TestResult {
             .unwrap_or(false)
     };
     let found = has_agent("verify-dynamic");
-    let _ = api::call(
+    // KILL deliberately KEEPS the managed registry entry (crash disposition /
+    // respawn), so it can never satisfy the removal half this check is named for.
+    // DELETE is the terminal removal transaction; its envelope is checked too.
+    let delete_err = match api::call(
         home,
-        &json!({"method": api::method::KILL, "params": {"name": "verify-dynamic"}}),
-    );
+        &json!({"method": api::method::DELETE, "params": {"name": "verify-dynamic"}}),
+    ) {
+        Ok(resp) if resp["ok"].as_bool() == Some(true) => None,
+        Ok(resp) => Some(resp["error"].as_str().unwrap_or("no error reported").into()),
+        Err(e) => Some(e.to_string()),
+    };
     std::thread::sleep(std::time::Duration::from_millis(500));
     let removed = !has_agent("verify-dynamic");
 
-    let ok = found && removed;
+    let ok = found && delete_err.is_none() && removed;
     TestResult::from_bool(
         "create_delete",
         ok,
-        "spawn → found in list → kill → reaped",
-        format!("found={found} removed={removed}"),
+        "spawn → found in list → delete → reaped",
+        match delete_err {
+            Some(e) => format!("found={found} delete rejected: {e}"),
+            None => format!("found={found} removed={removed}"),
+        },
     )
 }
 
@@ -780,5 +802,39 @@ mod tests {
         let r = test_inbox(&home);
         assert!(r.passed, "inbox: {}", r.detail);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn json_failure_preserves_envelope_and_exits_nonzero() {
+        if std::env::var_os("AGEND_VERIFY_JSON_EXIT_CHILD").is_some() {
+            let home =
+                std::env::temp_dir().join(format!("verify-json-exit-child-{}", std::process::id()));
+            finalize_results(
+                &home,
+                vec![TestResult::fail("injected", "deterministic failure")],
+                true,
+            )
+            .unwrap();
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "verify::tests::json_failure_preserves_envelope_and_exits_nonzero",
+                "--nocapture",
+            ])
+            .env("AGEND_VERIFY_JSON_EXIT_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "child status: {}", output.status);
+
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let start = stdout.find("{\n").unwrap();
+        let end = stdout[start..].find("\n}\n").unwrap();
+        let envelope: serde_json::Value =
+            serde_json::from_str(&stdout[start..start + end + 2]).unwrap();
+        assert_eq!(envelope["failed"], 1);
+        assert_eq!(envelope["tests"][0]["passed"], false);
     }
 }

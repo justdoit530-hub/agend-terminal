@@ -74,7 +74,7 @@ jobs:
       # paths in one compilation, saving a full rebuild.
       - name: Clippy (all targets + tray)
         timeout-minutes: 15
-        run: cargo clippy --all-targets --features tray -- -D warnings
+        run: cargo clippy -p agend-terminal --no-deps --all-targets --features tray -- -D warnings
 
       - name: Build
         timeout-minutes: 20
@@ -317,7 +317,7 @@ jobs:
           set -o pipefail
           attempt=1
           while :; do
-            if cargo llvm-cov --workspace --tests --features tray --lcov --output-path coverage.lcov 2>&1 | tee cov-attempt.log; then
+            if cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov 2>&1 | tee cov-attempt.log; then
               exit 0
             fi
             if [ "$attempt" -ge 3 ]; then

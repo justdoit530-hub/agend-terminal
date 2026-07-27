@@ -68,26 +68,26 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             "code": "needs_identity"
         });
     }
-    // Windows-safe path mangling: also collapse `\` (path separator) and
-    // `:` (drive letter) so a source like `C:\Users\runner\...` doesn't
-    // produce a worktree path with mid-name colons (rejected by NTFS).
-    // Pre-existing tests didn't exercise Windows-built happy-path until
-    // #778's new bind:true coverage.
-    let worktree_dir = home.join("worktrees").join(format!(
-        "{}-{}",
-        instance_name,
-        source.replace(['/', '\\', ':'], "_").replace('~', "")
-    ));
-    std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     // #2158 PR1: resolve + validate the source repo path fail-closed (absolute or
     // known agent name only; canonicalize; reject system dirs). Extracted to
     // `source_resolve` — keeps this oversized handler under the file_size ceiling
     // (t-61 split debt) and isolates the security-sensitive resolution for review.
+    // d-20260726055029475978-81 (#3078): normalize linked worktrees / subdirs to the
+    // owning canonical repo root at this single admission point.
     let (source_path, source_canonical) =
         match super::source_resolve::resolve_checkout_source_path(home, source) {
             Ok(pair) => pair,
             Err(e) => return e,
         };
+    // Windows-safe path mangling of the RESOLVED source (separators + drive colons).
+    // Must use the post-normalize `source_path`, not the raw argument, so a linked
+    // worktree of R and R itself produce the same managed target directory.
+    let worktree_dir = home.join("worktrees").join(format!(
+        "{}-{}",
+        instance_name,
+        source_path.replace(['/', '\\', ':'], "_").replace('~', "")
+    ));
+    std::fs::create_dir_all(worktree_dir.parent().unwrap_or(home)).ok();
     // #780: auto-create branch from `from_ref` when bind:true + branch
     // missing locally. #781 Piece 6 extracts the decision tree into
     // `dispatch_hook::ensure_branch_exists` so the same logic services
