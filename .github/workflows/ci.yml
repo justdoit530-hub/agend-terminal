@@ -153,7 +153,7 @@ jobs:
               echo "daemon ready (iter $i)"
               break
             fi
-            if ! kill -0 $DAEMON_PID 2>/dev/null; then
+            if [ "$RUNNER_OS" != "Windows" ] && ! kill -0 $DAEMON_PID 2>/dev/null; then
               echo "daemon died during startup"
               cat daemon.log
               exit 1
@@ -190,7 +190,7 @@ jobs:
           # Wait up to 20s for daemon to exit (saw ~10s on a local macOS run;
           # Windows runners are slower, leave headroom).
           for i in $(seq 1 40); do
-            if ! kill -0 $DAEMON_PID 2>/dev/null; then
+            if [ "$RUNNER_OS" = "Windows" ] || ! kill -0 $DAEMON_PID 2>/dev/null; then
               echo "daemon exited cleanly"
               break
             fi
