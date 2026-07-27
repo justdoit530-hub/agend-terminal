@@ -802,6 +802,10 @@ fn release_absent_binding_legacy(home: &Path, agent: &str, dry_run: bool) -> Rel
         }
         match worktree_head_branch(&path) {
             Ok(head) if head == mk_branch => {}
+            // #3087/#2878: detached legacy worktrees (HEAD) are admitted when
+            // Git linkage was already verified above — the marker branch names
+            // the intended subject, not necessarily the checked-out ref.
+            Ok(head) if head == "HEAD" => {}
             Ok(head) => {
                 out.error = Some(format!(
                     "legacy marker branch '{mk_branch}' does not match checked-out branch '{head}' — refusing"
