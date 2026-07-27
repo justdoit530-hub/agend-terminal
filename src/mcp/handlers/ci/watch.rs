@@ -488,7 +488,6 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
 }
 
 /// #813: build the default `CiProvider` for a repo URL. Mirrors
-<<<<<<< HEAD
 /// `watcher.rs::check_ci_watches`'s factory but with the canonical
 /// host URLs (no per-watch URL override) — sufficient for the
 /// on-watch-start mergeable check at dispatch time. GitHub fully
@@ -516,9 +515,6 @@ fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch:
     };
     provider
 }
-
-=======
->>>>>>> 07cd906b (fix(ci-watch): start a fresh notification epoch on tombstone re-arm (#3067))
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
