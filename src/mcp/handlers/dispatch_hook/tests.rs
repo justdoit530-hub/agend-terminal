@@ -3632,7 +3632,6 @@ fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
     created["id"].as_str().expect("created task id").to_string()
 }
 
-
 fn minimal_runtime() -> crate::mcp::handlers::dispatch::RuntimeContext {
     crate::mcp::handlers::dispatch::RuntimeContext {
         registry: std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
