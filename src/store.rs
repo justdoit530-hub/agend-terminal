@@ -181,7 +181,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        #[cfg(windows)]
+        {
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path)?;
+        }
+        #[cfg(not(windows))]
+        return Err(e.into());
+    }
     guard.disarm();
     // Durability: fsync the parent directory after the rename so the new
     // directory entry is flushed. The temp file's contents are already synced
