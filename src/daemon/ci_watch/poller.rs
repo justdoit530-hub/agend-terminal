@@ -1312,6 +1312,40 @@ struct NotifyOutcome {
 /// Single-load-per-tick entry point: receives the pre-loaded `WatchState`
 /// from the caller, passes `&mut` to sub-functions, and flushes once at
 /// the end when state has changed.
+/// S1 exact-head one-shot terminal-clear. An exact-head watch fires ONE post-merge
+/// notification for its pinned SHA, then must disappear. Once EVERY run at the
+/// target SHA has concluded successfully (aggregate success), remove the watch.
+/// No-op for a non-exact-head watch or a runless, pending, or non-success target
+/// (which stays armed). Returns true when it removed the watch — the caller must
+/// then NOT flush/refresh the now-deleted file.
+fn maybe_clear_exact_head_terminal(
+    ctx: &CiCheckCtx<'_>,
+    state: &WatchState,
+    pr: &PollResult,
+) -> bool {
+    if state.target_head_sha.is_none() {
+        return false;
+    }
+    if aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha) != Some("success") {
+        // Runless, pending, and non-success targets remain armed for reruns.
+        return false;
+    }
+    super::remove_watch(
+        ctx.home,
+        ctx.watch_path,
+        &ctx.subscribers.join(","),
+        ctx.repo,
+        ctx.branch,
+        "exact_head_terminal",
+    );
+    tracing::info!(
+        repo = ctx.repo,
+        branch = ctx.branch,
+        sha = %pr.current_sha,
+        "ci_watch removed (exact-head post-merge check complete)"
+    );
+    true
+}
 async fn ci_check_repo(
     home: &Path,
     watch_path: &Path,
