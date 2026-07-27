@@ -193,6 +193,11 @@ pub struct ReleaseOutcome {
     pub dry_run_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// #3092: set when a cleanup intent for a preserved review branch failed to
+    /// persist (so the operator can see the leak risk). `None` on success or when
+    /// no intent was attempted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent_persist_error: Option<String>,
 }
 
 /// Delete the local branch ref after worktree release, IFF:
@@ -588,6 +593,13 @@ fn resolve_branch_cleanup(
                 lifecycle,
                 crate::worktree::disposition::BranchLifecycleDisposition::Delete
             ) {
+                // #3092/#3090: a LIVE task is a temporary blocker — record a cleanup
+                // intent so the terminal-review reconcile sweep can settle later.
+                if task_active == Some(true) && !dry_run {
+                    out.intent_persist_error = crate::cleanup_intents::persist_release_intent(
+                        home, sr_str, branch, task_id,
+                    );
+                }
                 out.branch_cleanup_skipped_reason = Some(format!(
                     "authority-proven review branch '{branch}' lifecycle evidence is not terminal — preserved (fail-closed)"
                 ));
