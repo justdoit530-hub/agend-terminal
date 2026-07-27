@@ -5,6 +5,16 @@
 
 use std::path::{Path, PathBuf};
 
+mod legacy_release;
+use legacy_release::{
+    absent_release_outcome, legacy_flat_target_path, registered_detached_target,
+    require_clean_legacy_target,
+};
+
+pub(crate) struct NestedDirtDiscard<'a> {
+    pub expected_digest: &'a str,
+    pub audit_reason: &'a str,
+}
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReleaseTestPhase {
@@ -1084,7 +1094,7 @@ fn release_full_guarded(
 
     let (snapshot, fingerprint) = match crate::binding::snapshot_guarded_binding(home, agent) {
         Err(e) => return opaque_release(e),
-        Ok(GuardedBinding::Absent) => return idempotent_absent(),
+        Ok(GuardedBinding::Absent) => return absent_release_outcome(home, agent),
         Ok(GuardedBinding::Opaque(reason)) => return opaque_release(reason),
         Ok(GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
     };
@@ -1115,7 +1125,7 @@ fn release_full_guarded(
         Err(e) => return opaque_release(e),
     };
     let current = match crate::binding::guarded_binding_disk_fresh(home, agent) {
-        GuardedBinding::Absent => return idempotent_absent(),
+        GuardedBinding::Absent => return absent_release_outcome(home, agent),
         GuardedBinding::Opaque(reason) => return opaque_release(reason),
         GuardedBinding::Known {
             value,
