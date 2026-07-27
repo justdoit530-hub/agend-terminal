@@ -834,6 +834,123 @@ fn test_drain_marks_delivering_then_implicit_ack_keeps_message() {
     fs::remove_dir_all(&home).ok();
 }
 
+#[test]
+fn drain_auto_acks_daemon_notifications() {
+    for (kind, from, body) in [
+        (
+            "pr-merged",
+            "system:pr-state",
+            "[pr-merged] owner/repo@branch",
+        ),
+        ("ci-watch", "system:ci", "[ci-pass] owner/repo@branch"),
+        // #2506: the pr-state FYI class — terminal (`pr-closed-unmerged`) and
+        // ready/verdict notifications are fire-and-forget like `pr-merged`; they
+        // were omitted from the #2493 allow-list and so kept nagging poll-reminder
+        // for an already-merged PR until a manual ack.
+        (
+            "pr-ready-for-merge",
+            "system:pr-state",
+            "[pr-ready-for-merge] owner/repo@branch",
+        ),
+        (
+            "pr-closed-unmerged",
+            "system:pr-state",
+            "[pr-closed-unmerged] owner/repo@branch",
+        ),
+        (
+            "review-verdict",
+            "system:pr-state",
+            "[review-verdict] owner/repo@branch: VERIFIED",
+        ),
+        // #2412 follow-up (kind-taxonomy audit): the live bug sample — a
+        // dispatcher drains a "still active, just long" confirm, never
+        // explicitly acks it (there is nothing to act on), and the reclaim-TTL
+        // then reverted it to unread, re-nagging poll-reminder every cycle
+        // until a manual `inbox action=ack`. Both dispatch_idle subtypes are
+        // one-shot-by-design at the source (team_nudge's `nudge_sent_at` /
+        // dispatch_idle's `long_running_escalated` latch never re-fire the
+        // same notice), so seeing it once via drain is sufficient closure.
+        (
+            "dispatch_idle_long_running",
+            "system:dispatch_idle",
+            "[dispatch_idle_long_running] dispatch d-1 from 'lead' -> 'dev' - \
+             Long run EXPECTED -> no action; it resolves when the report arrives.",
+        ),
+        // #78445-2: the quota-wedge subtype — same one-shot daemon FYI shape as
+        // dispatch_idle_long_running; must auto-ack on drain like its sibling.
+        (
+            "dispatch_idle_quota_wedged",
+            "system:dispatch_idle",
+            "[dispatch_idle_quota_wedged] dispatch d-1 from 'lead' -> 'dev' is \
+             QUOTA-WEDGED (usage_limit) - expected silent until the quota resets.",
+        ),
+        (
+            "dispatch_idle_nudge",
+            "system:dispatch-watchdog",
+            "[team-watchdog] FYI: 'lead' dispatch has been quiet 900s. No \
+             action needed if you're mid-task.",
+        ),
+        // #2622 PR-2: the self-discharge operator notice must be fire-and-forget
+        // from birth (else it re-creates the loop it reports on — fb2461).
+        (
+            "channel-reply-discharged",
+            "system:channel-reply-discharge",
+            "[channel-reply-discharged] general closed m-125 without a reply — \
+             reason: stale, operator no longer needs an answer.",
+        ),
+        // t-…-11 (2026-07-23 live sample): the stale-helper alert is a one-shot
+        // daemon FYI whose remedy is operator-side (reinstall helpers); the
+        // recipient has nothing to ack. Un-listed it looped: drain → delivering
+        // → reclaim-TTL (drains spaced past the TTL, so implicit ack never
+        // fired) → unread → poll-reminder re-nag, forever.
+        (
+            "helper_staleness_watchdog",
+            "system:helper_staleness_watchdog",
+            "[helper_staleness_watchdog] helper 'agend-mcp-bridge' is older \
+             than the daemon binary. Run `cargo install --path . --force` \
+             then restart the daemon.",
+        ),
+    ] {
+        let home = tmp_home(&format!("drain-{kind}-auto-ack"));
+        let id = format!("m-{kind}");
+        enqueue(
+            &home,
+            "agent1",
+            msg().sender(from).text(body).kind(kind).id(&id).build(),
+        )
+        .ok();
+
+        let msgs = drain(&home, "agent1");
+        assert_eq!(msgs.len(), 1, "{kind} still surfaces to the agent");
+        assert_eq!(msgs[0].id.as_deref(), Some(id.as_str()));
+        assert!(
+            msgs[0].read_at.is_some(),
+            "fire-and-forget {kind} must be processed on first drain"
+        );
+        assert!(
+            msgs[0].delivering_at.is_none(),
+            "{kind} must not wait in delivering for a later ack"
+        );
+
+        let content = fs::read_to_string(inbox_path(&home, "agent1")).unwrap();
+        let persisted: InboxMessage =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert!(persisted.read_at.is_some());
+        assert!(persisted.delivering_at.is_none());
+        assert_eq!(
+            unread_count(&home, "agent1").0,
+            0,
+            "auto-acked notification must not drive poll-reminder unread count"
+        );
+
+        let second = drain(&home, "agent1");
+        assert!(
+            second.is_empty(),
+            "auto-acked {kind} must not be returned again"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+}
 // ─────────────────────────────────────────────────────────────────────────
 // #2299 three-state delivery: unread → delivering → processed + reclaim-TTL.
 // ─────────────────────────────────────────────────────────────────────────
@@ -875,6 +992,173 @@ fn reclaim_redelivers_after_turn_death() {
     assert_eq!(redelivered[0].id.as_deref(), Some("m-stale"));
     assert!(redelivered[0].delivering_at.is_some());
     assert!(redelivered[0].read_at.is_none());
+    fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reclaim_settles_legacy_stale_pr_merged_delivering_row() {
+    let home = tmp_home("reclaim-pr-merged-settle");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("system:pr-state")
+            .text("[pr-merged] owner/repo@branch")
+            .kind("pr-merged")
+            .id("m-pr-merged-stale")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    let post = drain(&home, "a");
+    assert!(
+        post.is_empty(),
+        "stale pr-merged notification must be settled, not re-delivered"
+    );
+    let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+    let persisted: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(persisted.read_at.is_some());
+    assert!(
+        persisted.delivering_at.is_some(),
+        "settle stamps read_at; delivering_at may remain as historical audit"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #2412 follow-up (kind-taxonomy audit): reclaim-level consistency for the
+/// kinds this task adds to `known_fire_and_forget_kind`. In normal operation
+/// these never actually reach a stale-`delivering` row — `auto_ack_on_drain_kind`
+/// already settles them on first drain (see `drain_auto_acks_daemon_notifications`),
+/// and `pr-ready-for-merge`/`pr-closed-unmerged`/`review-verdict` were already
+/// covered by `auto_ack_on_drain_kind` alone (#2506) even before this task —
+/// but a row written by an OLDER daemon build (pre-fix, still `delivering`) or
+/// any other path that leaves one of these kinds in `delivering` must still be
+/// settled by reclaim rather than looping forever. Belt-and-suspenders: proves
+/// `known_fire_and_forget_kind` (not just `auto_ack_on_drain_kind`) now also
+/// recognises the full pr-state FYI class plus the two new dispatch_idle kinds.
+#[test]
+fn reclaim_settles_stale_delivering_for_newly_audited_fire_and_forget_kinds() {
+    for kind in [
+        "dispatch_idle_long_running",
+        // #78445-2: the quota-wedge subtype — same one-shot daemon FYI class.
+        "dispatch_idle_quota_wedged",
+        "dispatch_idle_nudge",
+        "pr-ready-for-merge",
+        "pr-closed-unmerged",
+        "review-verdict",
+        // #2622 PR-2: the self-discharge operator notice — reclaim-level
+        // consistency (in both #2636 lists from birth).
+        "channel-reply-discharged",
+        // t-…-11: stale-helper alert — a pre-fix daemon left exactly such a
+        // row in `delivering`; reclaim must settle it, not re-deliver.
+        "helper_staleness_watchdog",
+    ] {
+        let home = tmp_home(&format!("reclaim-faf-{kind}"));
+        enqueue(
+            &home,
+            "a",
+            msg()
+                .sender("system:test")
+                .text_owned(format!("[{kind}] legacy stale delivering row"))
+                .kind(kind)
+                .id(&format!("m-{kind}-stale"))
+                .delivering_at(&secs_ago(660))
+                .build(),
+        )
+        .unwrap();
+
+        reclaim_stale_delivering(&home);
+
+        assert!(
+            drain(&home, "a").is_empty(),
+            "{kind}: stale delivering row must be settled, not re-delivered"
+        );
+        let content = fs::read_to_string(inbox_path(&home, "a")).unwrap();
+        let persisted: InboxMessage =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert!(
+            persisted.read_at.is_some(),
+            "{kind}: reclaim must settle (stamp read_at), not revert to unread"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// #2412 follow-up (kind-taxonomy audit) — control/regression guard: a kind
+/// this audit deliberately did NOT reclassify (genuinely actionable, per its
+/// own message text — "Handling is NOT automated... consider a handoff") must
+/// keep the pre-audit conservative behavior: a stale delivering row reverts to
+/// unread and is re-delivered, exactly like an unrecognised kind. Guards
+/// against over-broadening `known_fire_and_forget_kind` while auditing it.
+#[test]
+fn reclaim_still_redelivers_context_alert_conservatively() {
+    let home = tmp_home("reclaim-context-alert-conservative");
+    enqueue(
+        &home,
+        "a",
+        msg()
+            .sender("system:context_alert")
+            .text("[context_alert] agent at 92% context — consider a handoff + restart")
+            .kind("context_alert")
+            .id("m-context-alert-stale")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    let redelivered = drain(&home, "a");
+    assert_eq!(
+        redelivered.len(),
+        1,
+        "context_alert is a genuine action item and must still be re-delivered \
+         after reclaim, not silently settled"
+    );
+    assert_eq!(redelivered[0].id.as_deref(), Some("m-context-alert-stale"));
+    fs::remove_dir_all(&home).ok();
+}
+
+/// #35896-11 ④: a `ci-ready-for-action` handoff left STALE in `delivering` (the
+/// reviewer drained it but hasn't acted) must be SETTLED by reclaim, not reverted
+/// to unread. Reverting reopens a SECOND, uncoordinated poll-reminder stream for
+/// the same event on top of the ci_handoff_track renudge watchdog (the single
+/// intended ci-ready renudge, decoupled from inbox read-state and unaffected by
+/// this settle). Pre-④ ci-ready was outside `known_fire_and_forget_kind`, so
+/// `kind_is_unknown` → reclaim reverted it to unread (this test would drain it
+/// back). ci-ready is deliberately kept OUT of `auto_ack_on_drain_kind`, so it
+/// still survives the FIRST drain as `delivering` for the reviewer to see.
+#[test]
+fn reclaim_settles_stale_delivering_ci_ready_for_action_35896_11() {
+    let home = tmp_home("reclaim-ci-ready-35896");
+    enqueue(
+        &home,
+        "reviewer",
+        msg()
+            .sender("system:ci")
+            .text("[ci-ready-for-action] o/r@feat: CI passed, your turn.")
+            .kind("ci-ready-for-action")
+            .id("m-ciready-stale")
+            .delivering_at(&secs_ago(660))
+            .build(),
+    )
+    .unwrap();
+
+    reclaim_stale_delivering(&home);
+
+    assert!(
+        drain(&home, "reviewer").is_empty(),
+        "a stale delivering ci-ready row must be settled by reclaim, not re-delivered (kills the 2nd poll stream)"
+    );
+    let content = fs::read_to_string(inbox_path(&home, "reviewer")).unwrap();
+    let persisted: InboxMessage = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        persisted.read_at.is_some(),
+        "reclaim must stamp read_at on the stale ci-ready row (settle), not revert to unread"
+    );
     fs::remove_dir_all(&home).ok();
 }
 

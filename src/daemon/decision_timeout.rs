@@ -360,6 +360,21 @@ fn deliver_timeout(
         default_action,
     );
     let recipient = crate::fleet::watchdog::resolve_decision_timeout_recipient(home);
+    // Ghost-inbox guard (t-20260724035332273132-42380-3): don't enqueue to a
+    // recipient with no fleet.yaml instance — nobody would ever drain it.
+    // Missing fleet.yaml stays permissive.
+    if !crate::fleet::watchdog::recipient_has_instance(home, &recipient) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                recipient,
+                decision_id,
+                "decision-timeout alert dropped — recipient has no fleet.yaml \
+                 instance (ghost-inbox guard)"
+            );
+        }
+        return;
+    }
     if let Err(e) = crate::inbox::notify_system(
         home,
         &recipient,
@@ -751,7 +766,7 @@ mod tests {
         let home = tmp_home("fleet-dec-route");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "watchdog:\n  decision_timeout_recipient: arbiter\ninstances: {}\n",
+            "watchdog:\n  decision_timeout_recipient: arbiter\ninstances:\n  arbiter: {}\n",
         )
         .unwrap();
         let bus = crate::daemon::event_bus::EventBus::new();
@@ -1106,6 +1121,28 @@ mod tests {
         assert!(
             !drained_payloads(&home, &recipient).is_empty(),
             "#event-bus Option A: gate-off must deliver via the legacy path (no regression)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Ghost-inbox guard rollout (t-20260724035332273132-42380-3): a
+    /// decision-timeout alert whose resolved recipient has no fleet.yaml
+    /// instance must be dropped at the deliver seam, not enqueued into a
+    /// ghost inbox nobody drains.
+    #[test]
+    fn deliver_timeout_skips_ghost_recipient() {
+        let _g = env_lock();
+        let home = tmp_home("ghost-recipient");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker: {}\n",
+        )
+        .unwrap();
+        deliver_timeout(&home, "d-ghost", "worker", 2000, 1800, "proceed");
+        assert!(
+            drained_payloads(&home, "general").is_empty(),
+            "default recipient `general` has no instance — alert must be dropped \
+             (ghost-inbox guard)"
         );
         std::fs::remove_dir_all(&home).ok();
     }

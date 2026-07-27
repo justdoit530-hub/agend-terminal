@@ -152,10 +152,11 @@ mod tests {
         assert!(is_invariant_input("src/mcp/handlers/dispatch_hook/mod.rs"));
         assert!(is_invariant_input("tests/file_size_invariant.rs"));
         assert!(is_invariant_input("tests/git_subprocess_invariant.rs"));
+        assert!(is_invariant_input("src/mcp/handlers/comms.rs"));
         // Not invariant inputs.
         assert!(!is_invariant_input("src/daemon/pr_state/scanner.rs"));
         assert!(!is_invariant_input("tests/integration.rs"));
-        assert!(!is_invariant_input("src/mcp/handlers/comms.rs"));
+        assert!(!is_invariant_input("src/mcp/handlers/decision.rs"));
     }
 
     // ── §3.10 (d): up-to-date → Fresh (even if it touches an invariant input) ──

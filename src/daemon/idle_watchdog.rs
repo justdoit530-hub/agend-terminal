@@ -752,6 +752,22 @@ fn route_idle_alert(
     text: &str,
     correlation_agent: Option<&str>,
 ) {
+    // Ghost-inbox guard (t-20260724035332273132-42380-3): a recipient with no
+    // fleet.yaml instance would accumulate alerts in an inbox nobody drains.
+    // One seam covers BOTH the dev and fleet vantages. Missing fleet.yaml
+    // stays permissive.
+    if !crate::fleet::watchdog::recipient_has_instance(home, recipient) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                recipient,
+                kind,
+                "idle alert dropped — recipient has no fleet.yaml instance \
+                 (ghost-inbox guard)"
+            );
+        }
+        return;
+    }
     // #event-bus Step 2 (legacy-zero): the bus is the sole delivery path. The
     // recipient is already resolved by the caller and carried on the event.
     crate::daemon::event_bus::global().emit(
@@ -1251,7 +1267,8 @@ mod tests {
         let home = tmp_home("fleet-dev-route");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "watchdog:\n  idle_watchdog_agent: dev\n  dev_recipient: custom-arbiter\ninstances: {}\n",
+            "watchdog:\n  idle_watchdog_agent: dev\n  dev_recipient: custom-arbiter\n\
+             instances:\n  custom-arbiter: {}\n",
         )
         .unwrap();
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
@@ -1803,7 +1820,7 @@ mod tests {
         let home = tmp_home("per-agent-override");
         write_fleet_yaml(
             &home,
-            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n",
+            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n  lead:\n    backend: claude\n",
         );
         let stale = chrono::Utc::now() - chrono::Duration::seconds(400);
         write_activity_at(&home, "fast-reviewer", stale);
@@ -1831,7 +1848,7 @@ mod tests {
         let home = tmp_home("per-agent-within");
         write_fleet_yaml(
             &home,
-            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n",
+            "instances:\n  fast-reviewer:\n    backend: claude\n    timeout_secs: 300\n  lead:\n    backend: claude\n",
         );
         let recent = chrono::Utc::now() - chrono::Duration::seconds(200);
         write_activity_at(&home, "fast-reviewer", recent);
@@ -1851,7 +1868,10 @@ mod tests {
         std::env::remove_var("AGEND_IDLE_WATCHDOG_AGENT");
         std::env::remove_var("AGEND_IDLE_WATCHDOG_DEV_RECIPIENT");
         let home = tmp_home("per-agent-fallback");
-        write_fleet_yaml(&home, "instances:\n  slow-dev:\n    backend: claude\n");
+        write_fleet_yaml(
+            &home,
+            "instances:\n  slow-dev:\n    backend: claude\n  lead:\n    backend: claude\n",
+        );
         // Stale beyond global threshold (3600s default)
         let stale = chrono::Utc::now() - chrono::Duration::seconds(dev_idle_threshold_secs() + 60);
         write_activity_at(&home, "slow-dev", stale);
@@ -1874,7 +1894,7 @@ mod tests {
         let home = tmp_home("per-agent-task-info");
         write_fleet_yaml(
             &home,
-            "instances:\n  dev:\n    backend: claude\n    timeout_secs: 300\n",
+            "instances:\n  dev:\n    backend: claude\n    timeout_secs: 300\n  lead:\n    backend: claude\n",
         );
         // Create an in-progress task owned by "dev"
         let event = crate::task_events::TaskEvent::Created {
@@ -1977,6 +1997,71 @@ mod tests {
         let alerts = alert_payloads(&home, "general");
         assert_eq!(alerts.len(), 1, "gate-off must deliver via legacy path");
         assert_eq!(alerts[0].1.as_deref(), Some("fleet_idle_watchdog"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // Ghost-inbox guard rollout (t-20260724035332273132-42380-3): an idle
+    // alert whose recipient has no fleet.yaml instance must be dropped at the
+    // route seam, not enqueued into a ghost inbox nobody drains (the archived
+    // lead.jsonl held 4 idle-watchdog entries). A missing fleet.yaml stays
+    // permissive — `route_idle_alert_delivers_via_bus` above covers that.
+    #[test]
+    fn route_idle_alert_skips_ghost_recipient() {
+        let home = tmp_home("ghost-recipient");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  general: {}\n",
+        )
+        .unwrap();
+        route_idle_alert(&home, "lead", "dev_idle_watchdog", "idle 1800s", None);
+        assert!(
+            alert_payloads(&home, "lead").is_empty(),
+            "lead has no fleet.yaml instance — alert must be dropped (ghost-inbox guard)"
+        );
+        // A recipient that DOES have an instance keeps working on the same home.
+        route_idle_alert(&home, "general", "dev_idle_watchdog", "idle 1800s", None);
+        assert_eq!(
+            alert_payloads(&home, "general").len(),
+            1,
+            "existing-instance recipient must still be alerted"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // Contract pins (#3007 primary review): the ghost guard applies equally
+    // to an EXPLICITLY configured non-roster recipient, and a malformed
+    // fleet.yaml is fail-open at the same emit seam.
+    #[test]
+    fn route_idle_alert_pins_explicit_non_roster_and_malformed_fleet() {
+        // Explicitly configured non-roster recipient: dropped.
+        let home = tmp_home("explicit-non-roster");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "watchdog:\n  dev_recipient: ops-bot\ninstances:\n  general: {}\n",
+        )
+        .unwrap();
+        route_idle_alert(&home, "ops-bot", "dev_idle_watchdog", "idle 1800s", None);
+        assert!(
+            alert_payloads(&home, "ops-bot").is_empty(),
+            "an explicitly configured non-roster recipient must be dropped \
+             (every watchdog recipient must name a fleet instance)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+
+        // Malformed fleet.yaml (an unclosed flow mapping — a genuine parse
+        // error): fail-open — the alert still delivers.
+        let home = tmp_home("malformed-fleet");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "{ definitely-not-yaml\n",
+        )
+        .unwrap();
+        route_idle_alert(&home, "lead", "dev_idle_watchdog", "idle 1800s", None);
+        assert_eq!(
+            alert_payloads(&home, "lead").len(),
+            1,
+            "unparseable fleet.yaml must be fail-open (deliver)"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -2629,7 +2629,7 @@ mod tests {
                             let request = read_http_request(&mut stream);
                             use std::io::Write;
                             stream
-                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                                 .expect("failed to write response");
                             return Some(request);
                         }
@@ -2667,6 +2667,8 @@ mod tests {
             );
             let obsidian_after_initial = std::fs::read_to_string(&obsidian_md_path)
                 .expect("read Obsidian rule after initial");
+            // Ensure initial spawn_mem0_sync thread completes before updating override URL.
+            std::thread::sleep(std::time::Duration::from_millis(2000));
 
             let mem0_listener = std::net::TcpListener::bind("127.0.0.1:0")
                 .expect("failed to bind second Mem0 sync test listener");

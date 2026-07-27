@@ -502,11 +502,15 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
                     continue;
                 }
                 budget_used += sz;
-                // #2299: unread → DELIVERING (not processed). read_at stays None
-                // until the agent acks (explicit `inbox ack` / implicit next-drain)
-                // or the reclaim-TTL resets it. A turn dying after this drain leaves
-                // the row `delivering` → reclaimed → re-delivered (no silent loss).
-                msg.delivering_at = Some(now.clone());
+                if auto_ack_on_drain_kind(&msg) {
+                    msg.read_at = Some(now.clone());
+                } else {
+                    // #2299: unread → DELIVERING (not processed). read_at stays None
+                    // until the agent acks (explicit `inbox ack` / implicit next-drain)
+                    // or the reclaim-TTL resets it. A turn dying after this drain leaves
+                    // the row `delivering` → reclaimed → re-delivered (no silent loss).
+                    msg.delivering_at = Some(now.clone());
+                }
                 changed = true;
                 // #1888: a `ci-ready-for-action` handoff just transitioned to
                 // DELIVERING on this drain (#2299: was "read" pre-3-state). Phase-1
@@ -1254,11 +1258,131 @@ fn reclaim_renudge_worthy(home: &Path, msg: &InboxMessage) -> bool {
 fn kind_is_unknown(msg: &InboxMessage) -> bool {
     match msg.kind.as_deref() {
         None => false, // a plain message is a recognised non-obligation
-        Some(k) => !matches!(
-            k,
-            "query" | "task" | "report" | "update" | "ci-watch" | "poll"
-        ),
+        Some("query" | "task") => false,
+        Some(_) => !known_fire_and_forget_kind(msg),
     }
+}
+
+/// Recognised fire-and-forget *kinds* have no outstanding obligation once they
+/// were delivered once. Reclaim uses this for rows left in `delivering`;
+/// otherwise old `report`/`update`/`pr-merged` rows can loop forever through
+/// poll-reminder (#2482 / ghost pr-merged).
+///
+/// Plain `kind=None` rows intentionally stay outside this set: #2299's core
+/// anti-silent-loss guarantee still redelivers generic messages after a dead turn.
+fn known_fire_and_forget_kind(msg: &InboxMessage) -> bool {
+    matches!(
+        msg.kind.as_deref(),
+        Some(
+            "report"
+                | "update"
+                | "ci-watch"
+                | "ci-watch-stalled"
+                | "ci-watch-resumed"
+                | "poll"
+                | "pr-merged"
+                // t-…-11: stale-helper alert — paired with its
+                // `auto_ack_on_drain_kind` entry so a row an older daemon left
+                // in `delivering` is settled by reclaim, not re-delivered.
+                | "helper_staleness_watchdog"
+                // #2412 follow-up (kind-taxonomy audit): the rest of the
+                // pr-state FYI class (already fire-and-forget in
+                // `auto_ack_on_drain_kind` since #2506, but missing here —
+                // an inconsistency with no live impact today since
+                // `auto_ack_on_drain_kind` settles them before reclaim ever
+                // sees a stale `delivering` row of these kinds, but a
+                // legacy/older-daemon-written row could still reach this
+                // check) plus the two dispatch_idle notification subtypes
+                // (one-shot-by-design at the source — team_nudge's
+                // `nudge_sent_at` / dispatch_idle's `long_running_escalated`
+                // latch never re-fire the same notice — see
+                // `auto_ack_on_drain_kind` below for the primary fix).
+                | "pr-closed-unmerged"
+                | "pr-ready-for-merge"
+                | "review-verdict"
+                | "dispatch_idle_long_running"
+                // #78445-2: the quota-wedge escalation subtype — same one-shot daemon
+                // FYI shape as dispatch_idle_long_running (its source-side
+                // `quota_escalated` latch never re-fires the same notice). MUST be
+                // registered or reclaim classifies it unknown → renudge re-delivers it,
+                // defeating the source one-shot (reviewer4 #2678 F1).
+                | "dispatch_idle_quota_wedged"
+                | "dispatch_idle_nudge"
+                // #2622 PR-2: the operator-facing notice emitted when an agent
+                // self-discharges a channel-reply obligation. Pure FYI — no
+                // reply owed, no actor blocked (same fire-and-forget shape as
+                // dispatch_idle_long_running). Classified fire-and-forget FROM
+                // BIRTH so this "an obligation was closed" notice can never
+                // itself become a nagging un-dischargeable obligation and
+                // regenerate the loop it reports on (the fb2461 lesson).
+                | "channel-reply-discharged"
+                // #35896-11 ④: a `ci-ready-for-action` handoff left in `delivering`
+                // (the reviewer drained but hasn't acted) must NOT be reverted to
+                // unread by reclaim — that reopens a SECOND, uncoordinated poll-
+                // reminder stream for the same event on top of the ci_handoff_track
+                // renudge watchdog (the single intended ci-ready renudge, which is
+                // decoupled from inbox read-state per #1888 and NOT affected by this
+                // settle). Terminally settling the reclaimed row leaves the watchdog
+                // as the one renudge source. NOTE: ci-ready is deliberately kept OUT
+                // of `auto_ack_on_drain_kind` — it must survive the FIRST drain as
+                // `delivering` so the reviewer sees it; only a STALE past-cap
+                // delivering row is settled here.
+                | "ci-ready-for-action"
+        )
+    )
+}
+
+/// Daemon-originated notification kinds that are safe to settle on first drain.
+/// This is narrower than [`known_fire_and_forget_kind`]: peer `report`/`update`
+/// messages keep #2299's delivering/ack behavior on first drain, while pure
+/// daemon notifications avoid the restart/reclaim loop entirely.
+fn auto_ack_on_drain_kind(msg: &InboxMessage) -> bool {
+    matches!(
+        msg.kind.as_deref(),
+        Some(
+            "ci-watch"
+                | "ci-watch-stalled"
+                | "ci-watch-resumed"
+                | "poll"
+                // #2506: the rest of the pr-state FYI class. `pr-merged` was the
+                // only one #2493 listed; its siblings (terminal `pr-closed-unmerged`,
+                // plus `pr-ready-for-merge` / `review-verdict`) are the same
+                // fire-and-forget shape — once drained there is nothing to
+                // re-deliver — and were nagging poll-reminder for merged PRs.
+                | "pr-merged"
+                | "pr-closed-unmerged"
+                | "pr-ready-for-merge"
+                | "review-verdict"
+                // #2412 follow-up: primary fix for the live 58-minute
+                // poll-reminder loop sample — both kinds are one-shot
+                // daemon-generated FYI with no recipient action expected
+                // (dispatch_idle_long_running: "Long run EXPECTED -> no
+                // action"; dispatch_idle_nudge: "No action needed if
+                // you're mid-task"). Settling on first drain, same as the
+                // ci-watch/pr-state pure-daemon-notification precedent
+                // above, means the row never enters `delivering` limbo
+                // long enough to race the reclaim-TTL in the first place.
+                | "dispatch_idle_long_running"
+                // #78445-2: the quota-wedge subtype — same one-shot daemon FYI; settle
+                // on first drain like its `dispatch_idle_long_running` sibling.
+                | "dispatch_idle_quota_wedged"
+                | "dispatch_idle_nudge"
+                // #2622 PR-2: the self-discharge operator notice — settle on
+                // first drain (same pure-daemon-notification shape). Paired
+                // with the `known_fire_and_forget_kind` entry above so the
+                // notice is inert on BOTH the drain-settle and reclaim paths.
+                | "channel-reply-discharged"
+                // t-…-11 (2026-07-23 live sample m-20260723071523456845-43):
+                // the stale-helper alert is a one-shot daemon FYI (the remedy
+                // is an operator-side reinstall; the recipient agent has no
+                // ack-worthy action). Left out of this list it looped forever:
+                // drain → delivering → reclaim-TTL (drains arrive ~20 min
+                // apart, past the TTL, so the implicit next-drain ack never
+                // fired) → unread → poll-reminder re-nag. Third recurrence of
+                // the #2412/#2506 kind-taxonomy class.
+                | "helper_staleness_watchdog"
+        )
+    )
 }
 
 /// Sweep expired messages from all inbox files (#inbox-gc part b).
@@ -1457,11 +1581,13 @@ pub fn reclaim_stale_delivering(home: &Path) {
                             })
                             .unwrap_or(true); // unparseable timestamp → reclaim (fail-safe)
                         if stale {
-                            msg.delivering_at = None; // → unread (re-deliverable)
+                            if known_fire_and_forget_kind(&msg) {
+                                msg.read_at = Some(now.to_rfc3339());
+                            } else {
+                                msg.delivering_at = None; // → unread (re-deliverable)
+                                reverted.push(msg.clone());
+                            }
                             changed = true;
-                            // Collect the full reverted row: Phase 2 reads `id` (dedup
-                            // forget) + `kind`/`task_id`/`correlation_id` (re-nudge gate).
-                            reverted.push(msg.clone());
                         }
                     }
                 }

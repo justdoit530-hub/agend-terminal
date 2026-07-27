@@ -204,6 +204,13 @@ anti-stall／decision-timeout 通知。這些是 agent／接收者**名稱**
 
 **`watchdog:` 值 > `AGEND_*` env var（已棄用，僅警告一次）> 內建預設值。**
 
+**鬼魂收件匣防護（ghost-inbox guard）**：所有 watchdog 收件人 —— 無論是
+明確設定或內建預設 —— 都必須是 `instances:` map 裡的名稱。沒有對應
+instance 的收件人會在發送時被略過（每個 process 警告一次）：對它 enqueue
+只會讓 `~/.agend/inbox/<name>.jsonl` 無限累積、永遠沒有人 drain。
+`fleet.yaml` 缺失或無法解析時完全跳過過濾（fail-open —— 沒有 fleet 就
+沒有限制）。
+
 ```yaml
 watchdog:
   # Legacy SINGLE-AGENT mode for the dev-vantage idle watchdog. When set, the
@@ -218,6 +225,10 @@ watchdog:
   fleet_recipient: lead
   # Recipients for task-stall warnings. Default: [general, lead].
   task_stall_recipients:
+    - general
+    - lead
+  # Recipients for helper-staleness alerts. Default: [general, lead].
+  helper_staleness_recipients:
     - general
     - lead
   # Recipient for the decision-timeout auto-default (operator-proceed) emission.

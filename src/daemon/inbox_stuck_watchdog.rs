@@ -64,6 +64,25 @@ pub(crate) fn scan_and_emit(
         if recipient == *agent {
             continue;
         }
+        // Ghost-inbox guard (t-20260724035332273132-42380-3): a recipient with
+        // no instance (a team-less fleet's `lead` fallback, or a team whose
+        // orchestrator was removed) would accumulate alerts nobody drains —
+        // the single largest source in the archived ghost inbox (68/101).
+        // `fleet` is already loaded here, so check it directly; dedup state is
+        // deliberately NOT stamped (nothing was delivered).
+        if !fleet.instances.contains_key(&recipient) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    %agent,
+                    %recipient,
+                    "inbox_stuck alert dropped — recipient has no fleet.yaml \
+                     instance (ghost-inbox guard)"
+                );
+            }
+            continue;
+        }
         let text = format!(
             "[inbox_stuck_watchdog] agent '{agent}' has {unread} unread inbox messages, \
              oldest {age_min}min old (thresholds: {MIN_UNREAD} msgs / {STUCK_AFTER_MINS}min). \
@@ -166,6 +185,31 @@ mod tests {
         assert!(
             last.contains_key("worker"),
             "dedup state must record the alert"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// Ghost-inbox guard rollout (t-20260724035332273132-42380-3): a stuck
+    /// alert must not be enqueued to a recipient with no fleet.yaml instance —
+    /// pre-fix the team-less `FALLBACK_RECIPIENT` ("lead") grew
+    /// `~/.agend/inbox/lead.jsonl` forever (68 of the 101 archived ghost
+    /// entries on the reporting fleet were inbox_stuck alerts).
+    #[test]
+    fn skips_alert_when_fallback_recipient_has_no_instance() {
+        let home = tmp_home("ghost-fallback");
+        // No teams and no `lead` instance → the fallback recipient is a ghost.
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  worker:\n    backend: claude\n",
+        )
+        .unwrap();
+        seed_unread(&home, "worker", 4, 45);
+        let now = chrono::Utc::now();
+        let mut last = HashMap::new();
+        scan_and_emit(&home, &now, &mut last);
+        assert!(
+            crate::inbox::drain(&home, "lead").is_empty(),
+            "lead has no fleet.yaml instance — alert must be dropped (ghost-inbox guard)"
         );
         std::fs::remove_dir_all(home).ok();
     }

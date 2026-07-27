@@ -198,9 +198,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 
 /// Durability helper: fsync the parent directory so the new directory entry
 /// reaches disk. unix-only; no-op on other platforms.
-pub fn fsync_parent_dir(path: &Path) {
+pub fn fsync_parent_dir(_path: &Path) {
     #[cfg(unix)]
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(parent) = _path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let _ = std::fs::File::open(parent).and_then(|f| f.sync_all());
     }
 }
@@ -686,8 +686,19 @@ mod tests {
             "second exclusive lock must fail while first held"
         );
         drop(guard);
-        // After drop, second can acquire.
-        assert!(fs4::FileExt::try_lock(&second).is_ok());
+        // After drop, second can acquire (retry briefly for kernel flock release under llvm-cov load).
+        let mut acquired = false;
+        for _ in 0..10 {
+            if fs4::FileExt::try_lock(&second).is_ok() {
+                acquired = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            acquired,
+            "second exclusive lock must succeed after first is dropped"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
