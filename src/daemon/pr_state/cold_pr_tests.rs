@@ -89,9 +89,11 @@ fn tmp_home(name: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(
         "agend-cold-pr-{name}-{}-{}",
         std::process::id(),
-        line!()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
-    let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).expect("mkdir");
     p
 }
