@@ -17,6 +17,9 @@ pub struct WatchState {
     pub interval_secs: u64,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci_provider_url: Option<String>,

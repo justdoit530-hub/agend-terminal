@@ -7,6 +7,39 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-07-26
+
+### Changed
+
+- **Expired environment aliases removed** — watchdog topology now reads only the `fleet.yaml` `watchdog:` block, worktree archive fallback reads only `AGEND_WORKTREE_ARCHIVE_FALLBACK`, and decisions retention reads only `AGEND_RETENTION_DECISIONS_CUTOVER`.
+- **Hot paths repeat less work** — notification, dispatch, branch-sweep, watchdog, checkout, merge, and messaging paths now reuse a scan, client, or metadata read they previously repeated per item or per call (#2967, #2975–#2979, #2990, #2991, #2999, #3001, #3005, #3022, #3023, #3026, #3031).
+
+### Removed
+
+- **Expired public-surface aliases** — `agend list --legacy-json` and the MCP argument aliases `command`, `repository`, and `kind` are gone after their deprecation cycle; use `--json`, `backend`, `repository_path`, and `request_kind` (#2960, #2961).
+
+### Fixed
+
+- **`agentic-git` guarded-git correctness** — a foreign-cwd `sparse-checkout`/`config` write is routed to the repository it names instead of being denied, and `snapshots restore --yes` now returns the genuinely newest snapshot when several share one second (#2950, #3069, #3070).
+- **Shift+Tab reaches the pane** — the TUI forwards `BackTab` to the pane PTY instead of swallowing it (#2933).
+- **`waiting_on` stale alerts no longer repeat or misroute** — the alert is delivered to the instance's configured name (so it reaches the agent's inbox and its team orchestrator) instead of an id-named file nothing reads, it respects the 30-minute re-alert interval instead of firing every 5-minute scan, and metadata left behind by an instance the fleet no longer runs is skipped.
+
+## [0.11.2] — 2026-07-23
+
+### Changed
+
+- **Monorepo consolidation** — `agentic-git-core` and `agentic-git` sources are now vendored inside the main repository; the release workflow publishes crates in dependency order (core → shim → root) with index-propagation retries (#2929).
+- **Existing source checkouts with an initialized `vendor/agentic-git` submodule** — confirm that the submodule worktree is clean (preserve any local WIP first), then run `git submodule deinit -f vendor/agentic-git` followed by `git pull --ff-only` to switch to the in-tree workspace.
+
+## [0.11.1] — 2026-07-23
+
+### Fixed
+
+- **Release archive validation** — Unix release packaging now checks each expected binary directly, avoiding a `pipefail`/SIGPIPE false failure after successful cross-platform builds.
+
+## [0.11.0] — 2026-07-23
+
+212 commits since 0.10.0. This release focuses on reliable development-workflow handoffs, safer worktree lifecycle management, and backend/runtime parity.
 ### Added
 
 - **Per-role MCP tool subsetting (#2344, #2367)** — a per-role MCP capability registry (#2344) plus a typed, operator-declared `role_kind` in `fleet.yaml` (seven variants) that drives it (#2367), trimming the tool surface an agent advertises. The previous free-text `role:` match never matched real prose roles, so every agent saw all tools; read-only roles (reviewer/planner/explorer) now get report/read subsets, while an exhaustive match forces a deliberate decision for each new role. Opt-in, default all tools (#2300).

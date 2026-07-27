@@ -233,6 +233,7 @@ pub(super) fn handle_delegate_task(
     };
 
     // Sprint 53 P0-1+P0-2: lease + watch_ci gate BEFORE send (Q2 ordering fix).
+    let mut ci_watch_arm_failed = false;
     if let Some(branch) = args["branch"].as_str() {
         let task_id_val = args["task_id"].as_str().unwrap_or("");
         if dispatch_should_skip_auto_bind(args) {
@@ -242,7 +243,7 @@ pub(super) fn handle_delegate_task(
             );
         } else {
             // #1877: second_reviewer → review_class="dual" on the auto-armed watch.
-            if let Err(e) = super::dispatch_hook::dispatch_auto_bind_lease_with_chain(
+            match super::dispatch_hook::dispatch_auto_bind_lease_with_chain(
                 home,
                 target,
                 task_id_val,
@@ -251,7 +252,8 @@ pub(super) fn handle_delegate_task(
                 args["next_after_ci"].as_str(),
                 if second_reviewer { Some("dual") } else { None },
             ) {
-                return json!({"ok": false, "error": format!("dispatch rejected: {e}")});
+                Ok(outcome) => ci_watch_arm_failed = outcome.ci_watch_arm_failed,
+                Err(e) => return json!({"ok": false, "error": format!("dispatch rejected: {e}")}),
             }
         }
     }
@@ -323,8 +325,21 @@ pub(super) fn handle_delegate_task(
         ..SendEnvelope::directives_from_args(args)
     };
     // #2454 Slice 2: in-process SEND (no socket loopback / inbox_fallback).
-    let result =
+    let mut result =
         super::runtime_bridge::send_in_process(home, runtime, &env.to_send_params(), target);
+    if ci_watch_arm_failed && is_ok_result(&result) {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert("degraded".into(), json!(true));
+            obj.insert(
+                "warning".into(),
+                json!({
+                    "code": "ci_watch_arm_failed",
+                    "remediation": "CI watch could not be armed for this dispatch; \
+                        run `ci action=watch` manually to enable CI-ready notifications",
+                }),
+            );
+        }
+    }
     if is_ok_result(&result) {
         let task_id = task_id_str.map(str::to_string);
         // #2099: a fire-and-forget dispatch (`no_report_expected`) is recorded
@@ -373,7 +388,6 @@ pub(super) fn handle_delegate_task(
             task_id,
         }));
     }
-    let mut result = result;
     if let Some(tid) = auto_created_task_id {
         if let Some(obj) = result.as_object_mut() {
             obj.insert("auto_created_task_id".into(), json!(tid));

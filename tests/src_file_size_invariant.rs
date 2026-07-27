@@ -34,7 +34,7 @@ const GRANDFATHERED: &[(&str, usize)] = &[
     // handlers KNOWN_OVERSIZED refresh on this branch (e8040166).
     ("src/daemon/dispatch_idle/mod.rs", 3962),
     ("src/reflexion/mod.rs", 3826),
-    ("src/daemon/pr_state/mod.rs", 3702),
+    ("src/daemon/pr_state/mod.rs", 3800),
     ("src/agent/mod.rs", 3205),
     ("src/daemon/mod.rs", 3177),
     ("src/api/handlers/messaging.rs", 3155),

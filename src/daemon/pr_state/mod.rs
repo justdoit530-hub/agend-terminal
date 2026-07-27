@@ -85,6 +85,8 @@ pub struct PrState {
     /// re-emit until head_sha changes.
     #[serde(default)]
     pub ready_emitted_for_sha: Option<String>,
+    #[serde(default)]
+    pub diagnostic_emitted_for_sha: Option<String>,
     /// #973 cross-audit Pushback C: tracks whether implementer armed
     /// `gh pr merge --auto` against the current head. Cleared on
     /// head_sha advance (force-push cancels GitHub's auto-merge).
@@ -584,6 +586,94 @@ where
     crate::store::with_json_state_or_create(&data_path, default_fn, mutate)
 }
 
+/// #2800: ensure a PrState exists for a cold PR whose CI has not yet
+/// reached terminal. Two-phase: (1) check local file; (2) if missing,
+/// confirm PR identity against the SCM provider, then CAS-create with
+/// `CiState::Pending`. The pr-state/file lock is NOT held across the
+/// network call — the provider query runs unlocked, and
+/// `with_pr_state_or_create` does the CAS afterwards. On a concurrent
+/// creator the CAS converges: if the file already exists with matching
+/// identity, the caller gets the existing state; a mismatch fails closed.
+#[allow(dead_code)]
+pub fn ensure_from_scm(
+    home: &std::path::Path,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+    expected_head: &str,
+    review_class: ReviewClass,
+) -> anyhow::Result<PrState> {
+    // Phase 1: fast path — file already exists. Reconcile review_class
+    // under flock (#3040: persisted Unresolved must adopt resolved class).
+    if let Some(reconciled) = with_pr_state(home, repo, branch, |state| {
+        let was_unresolved = matches!(state.review_class, ReviewClass::Unresolved);
+        state.review_class = reconcile_review_class(state.review_class, review_class);
+        if was_unresolved && !matches!(state.review_class, ReviewClass::Unresolved) {
+            state.diagnostic_emitted_for_sha = None;
+        }
+        state.clone()
+    })? {
+        return Ok(reconciled);
+    }
+
+    // Phase 2: no local file — confirm identity against SCM provider.
+    let provider = crate::scm::make_scm_provider(repo, None);
+    let pr = provider
+        .pr_view(repo, pr_number, &["number", "headRefOid", "headRefName"])
+        .map_err(|e| anyhow::anyhow!("SCM pr_view failed for PR #{pr_number}: {e}"))?;
+    let scm_head = pr
+        .head_ref_oid
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("SCM returned no headRefOid for PR #{pr_number}"))?;
+    if !scm_head.eq_ignore_ascii_case(expected_head) {
+        anyhow::bail!(
+            "SCM head mismatch for PR #{pr_number}: expected {expected_head}, SCM reports {scm_head}"
+        );
+    }
+    let scm_branch = pr
+        .head_ref
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("SCM returned no headRefName for PR #{pr_number}"))?;
+    if scm_branch != branch {
+        anyhow::bail!(
+            "SCM branch mismatch for PR #{pr_number}: expected {branch}, SCM reports {scm_branch}"
+        );
+    }
+
+    // Phase 3: CAS-create with Pending CI.
+    let state = with_pr_state_or_create(
+        home,
+        repo,
+        branch,
+        || {
+            let mut s = new_for_branch(repo, branch, expected_head, review_class);
+            s.pr_number = pr_number;
+            s.pr_author = pr.author_login.unwrap_or_default();
+            s
+        },
+        |s| s.clone(),
+    )?;
+    if state.head_sha != expected_head || state.pr_number != pr_number {
+        anyhow::bail!(
+            "concurrent pr-state creator wrote mismatching identity \
+             (head={}, pr={}); expected head={expected_head}, pr={pr_number}",
+            state.head_sha,
+            state.pr_number
+        );
+    }
+    Ok(state)
+}
+
+#[allow(dead_code)]
+pub(crate) fn reconcile_review_class(persisted: ReviewClass, watch: ReviewClass) -> ReviewClass {
+    match (persisted, watch) {
+        (ReviewClass::Dual, _) => ReviewClass::Dual,
+        (ReviewClass::Unresolved, w) => w,
+        (ReviewClass::Single, ReviewClass::Unresolved) => ReviewClass::Unresolved,
+        (ReviewClass::Single, w) => w,
+    }
+}
+
 /// Remove the per-PR file. Used by the per-tick scanner after a
 /// terminal state (Merged / ClosedUnmerged) is observed and the
 /// `[pr-merged]` / `[pr-closed-unmerged]` events have been emitted.
@@ -833,6 +923,7 @@ pub fn new_for_branch(
         draft_state: DraftState::Ready,
         review_class,
         ready_emitted_for_sha: None,
+        diagnostic_emitted_for_sha: None,
         auto_armed: false,
         auto_armed_for_sha: None,
         auto_armed_at: None,
@@ -1361,6 +1452,7 @@ mod tests {
             draft_state: DraftState::Ready,
             review_class: class,
             ready_emitted_for_sha: None,
+            diagnostic_emitted_for_sha: None,
             auto_armed: false,
             auto_armed_for_sha: None,
             auto_armed_at: None,
@@ -3700,3 +3792,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+mod cold_pr_tests;

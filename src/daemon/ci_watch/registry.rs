@@ -324,7 +324,11 @@ pub(super) fn update_watch_state_with_notify(
 /// Merge-safe: starts from the on-disk state (preserving all
 /// control-plane fields) and only applies poll-owned deltas from
 /// the in-memory snapshot.
-pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::WatchState) {
+pub(crate) fn flush_watch_state(
+    watch_path: &Path,
+    state: &super::watch_state::WatchState,
+    expected_generation: Option<&str>,
+) {
     let lock_path = watch_path.with_extension("lock");
     let _lock = match crate::store::acquire_file_lock(&lock_path) {
         Ok(l) => l,
@@ -340,6 +344,22 @@ pub(super) fn flush_watch_state(watch_path: &Path, state: &super::watch_state::W
         Some(c) => c,
         None => return, // file deleted by concurrent unwatch — respect deletion
     };
+    if let Some(expected) = expected_generation {
+        if !expected.is_empty() {
+            let disk_gen = merged.generation_id.as_deref().unwrap_or("");
+            if disk_gen.is_empty() {
+                merged.generation_id = Some(expected.to_string());
+            } else if disk_gen != expected {
+                tracing::info!(
+                    path = %watch_path.display(),
+                    disk = %disk_gen,
+                    expected = %expected,
+                    "flush_watch_state: generation_id mismatch — skipping stale flush"
+                );
+                return;
+            }
+        }
+    }
     // Apply only poll-owned fields from in-memory state.
     merged.last_run_id = state.last_run_id;
     merged.head_sha = state.head_sha.clone();
@@ -461,7 +481,7 @@ mod tests {
         }]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
@@ -613,7 +633,7 @@ mod tests {
 
         // File does not exist (concurrent unwatch deleted it).
         assert!(!watch_path.exists());
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
         assert!(
             !watch_path.exists(),
             "flush must not resurrect a deleted watch file"
@@ -650,7 +670,7 @@ mod tests {
         updated.required_checks = Some(vec!["build".into()]);
         std::fs::write(&watch_path, serde_json::to_string_pretty(&updated).unwrap()).unwrap();
 
-        flush_watch_state(&watch_path, &stale);
+        flush_watch_state(&watch_path, &stale, Some("gen-meta"));
 
         let result: super::super::watch_state::WatchState =
             serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
@@ -671,6 +691,54 @@ mod tests {
             Some(&["build".to_string()][..]),
             "concurrent required_checks update must survive flush"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// d-20260725074908427354-47: the rotation half of the tombstone-re-arm fix
+    /// only protects anything if a mismatched generation is actually rejected —
+    /// an in-flight OLD-generation poll must NOT be able to restore the
+    /// notification cursors the re-arm cleared.
+    #[test]
+    fn flush_rejects_stale_generation_and_preserves_cleared_cursors() {
+        let dir = std::env::temp_dir().join(format!("agend-flush-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let watch_path = dir.join("gen.json");
+
+        // On disk: the re-armed watch, new generation, cursors cleared.
+        let rearmed = super::super::watch_state::WatchState {
+            repo: "o/r".into(),
+            branch: "feat".into(),
+            generation_id: Some("gen-new".to_string()),
+            ..Default::default()
+        };
+        std::fs::write(&watch_path, serde_json::to_string_pretty(&rearmed).unwrap()).unwrap();
+
+        // In flight: a poll that started in the PREVIOUS generation and carries
+        // the cursors that generation had already notified.
+        let mut old_epoch = rearmed.clone();
+        old_epoch.generation_id = Some("gen-old".to_string());
+        old_epoch.last_run_id = Some(100);
+        old_epoch.last_notified_head_sha = Some("abc".into());
+        old_epoch.last_notified_conclusion = Some("success".into());
+        old_epoch.terminal_since = Some("2026-07-25T00:00:00+00:00".into());
+
+        flush_watch_state(&watch_path, &old_epoch, Some("gen-old"));
+
+        let result: super::super::watch_state::WatchState =
+            serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+        assert_eq!(
+            result.generation_id.as_deref(),
+            Some("gen-new"),
+            "the re-armed generation must stand"
+        );
+        assert_eq!(
+            result.last_run_id, None,
+            "a stale-generation flush must not restore the cleared cursors"
+        );
+        assert_eq!(result.last_notified_head_sha, None);
+        assert_eq!(result.last_notified_conclusion, None);
+        assert_eq!(result.terminal_since, None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
