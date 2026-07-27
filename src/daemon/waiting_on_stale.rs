@@ -527,6 +527,7 @@ mod tests {
 
     /// One live agent. Returns its `InstanceId`, which is ALSO its metadata
     /// stem in production — the distinction this defect turns on.
+    #[cfg(unix)]
     fn registry_with_live() -> (AgentRegistry, crate::types::InstanceId) {
         let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let id = crate::types::InstanceId::new();
@@ -539,6 +540,7 @@ mod tests {
     /// stay silent for at least `REALERT_INTERVAL_SECS`. Today the per-tick
     /// prune drops its dedup entry, so every 5-minute scan re-emits it.
     #[test]
+    #[cfg(unix)]
     fn ghost_metadata_must_not_realert_after_boot_seed() {
         let home = tmp_home("ghost-realert");
         std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
@@ -583,6 +585,7 @@ mod tests {
     /// also the over-fix lock: filtering stems by live agent NAMES alone
     /// silences the live agent entirely and both counts read 0.
     #[test]
+    #[cfg(unix)]
     fn live_agent_id_stem_alerts_once_to_the_agent_and_orchestrator() {
         let home = tmp_home("live-id-stem");
         std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
@@ -630,6 +633,7 @@ mod tests {
     /// swallows the first cadence for every stem, live or abandoned — so the
     /// repeats the RED above counts provably come from later scans, not boot.
     #[test]
+    #[cfg(unix)]
     fn boot_seed_cadence_emits_for_neither_stem() {
         let home = tmp_home("boot-latch-both");
         std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
@@ -669,6 +673,7 @@ mod tests {
     /// would start re-alerting these every scan — this pins that both stem
     /// shapes stay retained.
     #[test]
+    #[cfg(unix)]
     fn legacy_name_stem_alerts_once_then_stays_suppressed() {
         let home = tmp_home("legacy-name-stem");
         std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
@@ -702,6 +707,7 @@ mod tests {
     /// and id entries second, so B's own `metadata/<B_id>.json` deterministically
     /// reaches B and team-B, never A.
     #[test]
+    #[cfg(unix)]
     fn id_stem_colliding_with_another_agents_name_routes_to_the_id_owner() {
         let home = tmp_home("stem-collision");
         std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
@@ -771,6 +777,7 @@ mod tests {
     /// agent's single authoritative stem is what makes that fail closed, since
     /// A's own stem is its configured id, not its name.
     #[test]
+    #[cfg(unix)]
     fn orphaned_id_stem_never_falls_back_to_a_live_agent_named_that_uuid() {
         let home = tmp_home("orphan-no-fallback");
         std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
