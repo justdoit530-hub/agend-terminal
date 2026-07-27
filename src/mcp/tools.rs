@@ -902,6 +902,7 @@ mod tests {
             ("send", "team", "comms.rs handle_broadcast → teams::get_members"),
             ("send", "tags", "comms.rs broadcast MODE; kind=task + tags filters candidates for context-aware single-worker routing"),
             ("send", "message", "comms.rs task body / lift_message for kind=report|query"),
+            ("send", "message_from_file", "comms.rs handle_unified_send → read_message_file into message (#3084)"),
             ("send", "request_kind", "comms.rs handler routing + auto_close kind gate"),
             ("send", "success_criteria", "comms.rs appended to delivered message body"),
             ("send", "context", "comms.rs appended to delivered message body"),
