@@ -33,10 +33,10 @@ pub(super) fn handle_unified_send(
     }
 
     fn lift_message(args: &mut Value, dst: &str) {
-        if args.get(dst).is_none() {
-            if let Some(msg) = args.get("message").cloned() {
-                args[dst] = msg;
-            }
+        // #3093: `message` is canonical — always overwrite dst (task/summary/question)
+        // so a stale specialized field cannot shadow the unified body.
+        if let Some(msg) = args.get("message").cloned() {
+            args[dst] = msg;
         }
     }
 
