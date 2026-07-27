@@ -245,16 +245,16 @@ mod tests {
 
     fn write_metadata(home: &Path, agent: &str, waiting_on: &str, since: &str) {
         let dir = home.join("metadata");
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("mkdir metadata");
         let meta = serde_json::json!({
             "waiting_on": waiting_on,
             "waiting_on_since": since,
         });
         std::fs::write(
             dir.join(format!("{agent}.json")),
-            serde_json::to_string_pretty(&meta).unwrap(),
+            serde_json::to_string_pretty(&meta).expect("ser"),
         )
-        .unwrap();
+        .expect("write metadata");
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
         let home = tmp_home("detect");
         let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
         write_metadata(&home, "dev-1", "review from reviewer", &since);
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let mut last_alerted = HashMap::new();
         scan_and_emit(
@@ -275,7 +275,7 @@ mod tests {
         assert!(last_alerted.contains_key("dev-1"));
         let inbox_file = home.join("inbox").join("dev-1.jsonl");
         assert!(inbox_file.exists(), "inbox file should exist");
-        let content = std::fs::read_to_string(&inbox_file).unwrap();
+        let content = std::fs::read_to_string(&inbox_file).expect("read inbox");
         assert!(content.contains("waiting_on_stale"));
         assert!(content.contains("review from reviewer"));
 
@@ -291,7 +291,7 @@ mod tests {
         let home = tmp_home("bootseed");
         let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
         write_metadata(&home, "dev-bs", "review from reviewer", &since);
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let mut last_alerted = HashMap::new();
         // seeding scan: record the existing stale waiter, but do NOT emit.
@@ -347,7 +347,7 @@ mod tests {
         let home = tmp_home("dedup");
         let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
         write_metadata(&home, "dev-3", "task from lead", &since);
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let mut last_alerted = HashMap::new();
         scan_and_emit(
@@ -414,12 +414,12 @@ mod tests {
 
         // Legacy direct deliver (the gate-OFF path).
         let home_legacy = tmp_home("parity-legacy");
-        std::fs::create_dir_all(home_legacy.join("inbox")).unwrap();
+        std::fs::create_dir_all(home_legacy.join("inbox")).expect("mkdir inbox");
         deliver_stale_alert(&home_legacy, agent, condition, elapsed_min);
 
         // Bus emit→subscriber (the gate-ON path) — real fan-out via a test bus.
         let home_bus = tmp_home("parity-bus");
-        std::fs::create_dir_all(home_bus.join("inbox")).unwrap();
+        std::fs::create_dir_all(home_bus.join("inbox")).expect("mkdir inbox");
         let bus = crate::daemon::event_bus::EventBus::new();
         bus.subscribe(handle_event);
         bus.emit(
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn scan_delivers_via_bus() {
         let home = tmp_home("via-bus");
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
         let since = (chrono::Utc::now() - chrono::Duration::minutes(20)).to_rfc3339();
         write_metadata(&home, "dev-gateoff", "blocker", &since);
         let mut last_alerted = HashMap::new();
@@ -522,7 +522,7 @@ mod tests {
             }
         }
         y.push_str(teams);
-        std::fs::write(home.join("fleet.yaml"), y).unwrap();
+        std::fs::write(home.join("fleet.yaml"), y).expect("write fleet");
     }
 
     /// One live agent. Returns its `InstanceId`, which is ALSO its metadata
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn ghost_metadata_must_not_realert_after_boot_seed() {
         let home = tmp_home("ghost-realert");
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
         write_metadata(&home, GHOST_STEM, "operator direction", &stale_since(20));
 
         let (registry, _id) = registry_with_live();
@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn live_agent_id_stem_alerts_once_to_the_agent_and_orchestrator() {
         let home = tmp_home("live-id-stem");
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let (registry, id) = registry_with_live();
         // Configured id ⇒ id-shaped stem; team wiring so the orchestrator copy
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn boot_seed_cadence_emits_for_neither_stem() {
         let home = tmp_home("boot-latch-both");
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let (registry, id) = registry_with_live();
         let live_stem = id.full();
@@ -671,7 +671,7 @@ mod tests {
     #[test]
     fn legacy_name_stem_alerts_once_then_stays_suppressed() {
         let home = tmp_home("legacy-name-stem");
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let (registry, _id) = registry_with_live();
         let externals: ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -704,7 +704,7 @@ mod tests {
     #[test]
     fn id_stem_colliding_with_another_agents_name_routes_to_the_id_owner() {
         let home = tmp_home("stem-collision");
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let id_b = crate::types::InstanceId::new();
         let colliding_name = id_b.full(); // agent A is NAMED B's InstanceId
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn orphaned_id_stem_never_falls_back_to_a_live_agent_named_that_uuid() {
         let home = tmp_home("orphan-no-fallback");
-        std::fs::create_dir_all(home.join("inbox")).unwrap();
+        std::fs::create_dir_all(home.join("inbox")).expect("mkdir inbox");
 
         let departed_b = crate::types::InstanceId::new(); // B: no registry entry
         let colliding_name = departed_b.full(); // A is NAMED B's id
