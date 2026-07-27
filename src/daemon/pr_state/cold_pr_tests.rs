@@ -92,7 +92,7 @@ fn tmp_home(name: &str) -> std::path::PathBuf {
         line!()
     ));
     let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
+    std::fs::create_dir_all(&p).expect("mkdir");
     p
 }
 
@@ -151,7 +151,7 @@ fn cold_pr_wrong_head_fails_closed() {
     assert!(result.is_err(), "head mismatch must fail closed");
     assert!(
         result
-            .unwrap_err()
+            .expect_err("head mismatch must fail closed")
             .to_string()
             .contains("SCM head mismatch"),
         "error must mention head mismatch"
@@ -197,7 +197,7 @@ fn existing_pr_state_is_noop() {
         sha: head.clone(),
         observed_at: "2026-07-15T00:00:00Z".into(),
     };
-    save(&home, &s).unwrap();
+    save(&home, &s).expect("save initial state");
 
     // No mock needed — should hit fast path without SCM call.
     let state = ensure_from_scm(&home, "o/r", "feat/x", 10, &head, ReviewClass::Single)
@@ -222,8 +222,10 @@ fn cold_pr_ensure_idempotent() {
         author: "dev".into(),
     }));
 
-    let s1 = ensure_from_scm(&home, "o/r", "feat/x", 7, &head, ReviewClass::Dual).unwrap();
-    let s2 = ensure_from_scm(&home, "o/r", "feat/x", 7, &head, ReviewClass::Dual).unwrap();
+    let s1 =
+        ensure_from_scm(&home, "o/r", "feat/x", 7, &head, ReviewClass::Dual).expect("ensure 1");
+    let s2 =
+        ensure_from_scm(&home, "o/r", "feat/x", 7, &head, ReviewClass::Dual).expect("ensure 2");
 
     assert_eq!(s1.head_sha, s2.head_sha);
     assert_eq!(s1.pr_number, s2.pr_number);
@@ -284,7 +286,7 @@ fn cold_pr_wrong_branch_fails_closed() {
     assert!(result.is_err(), "branch mismatch must fail closed");
     assert!(
         result
-            .unwrap_err()
+            .expect_err("branch mismatch must fail closed")
             .to_string()
             .contains("SCM branch mismatch"),
         "error must mention branch mismatch"
@@ -312,7 +314,7 @@ fn ensure_reconciles_existing_unresolved() {
         observed_at: "2026-07-15T00:00:00Z".into(),
     };
     s.diagnostic_emitted_for_sha = Some(head.clone());
-    save(&home, &s).unwrap();
+    save(&home, &s).expect("save unresolved state");
 
     // No mock — fast path must not call SCM (would fail without a mock).
     let state = ensure_from_scm(&home, "o/r", "feat/x", 10, &head, ReviewClass::Single)
@@ -360,7 +362,7 @@ fn ensure_preserves_dual_floor() {
 
     let mut s = new_for_branch("o/r", "feat/x", &head, ReviewClass::Dual);
     s.pr_number = 10;
-    save(&home, &s).unwrap();
+    save(&home, &s).expect("save dual state");
 
     let state = ensure_from_scm(&home, "o/r", "feat/x", 10, &head, ReviewClass::Single)
         .expect("existing state must succeed");
