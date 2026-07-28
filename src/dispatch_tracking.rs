@@ -52,6 +52,22 @@ pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
     );
 }
 
+/// Remove all dispatch tracking entries matching a task_id.
+pub fn remove_all_for_task(home: &Path, task_id: &str) {
+    if task_id.is_empty() {
+        return;
+    }
+    persist_or_log!(
+        crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            store
+                .entries
+                .retain(|e| e.task_id.as_deref() != Some(task_id));
+            Ok(())
+        }),
+        "dispatch_remove_all_for_task"
+    );
+}
+
 /// Mark a dispatch as completed (matched by task_id or to-instance).
 pub fn mark_completed(home: &Path, correlation_id: Option<&str>, _to: &str) {
     let cid = match correlation_id {
