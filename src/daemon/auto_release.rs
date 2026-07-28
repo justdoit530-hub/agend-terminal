@@ -579,10 +579,23 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         tracing::debug!(task_id = %intent.task_id, event, "auto_release: task missing / no assignee — dropping intent");
         return IntentOutcome::Done;
     };
-    let Some(binding) = crate::binding::read(home, &assignee) else {
-        // Already released / never bound → nothing to do (idempotent).
-        tracing::debug!(agent = %assignee, task_id = %intent.task_id, event, "auto_release: agent unbound — dropping intent");
-        return IntentOutcome::Done;
+    let (binding, binding_fingerprint) = match crate::binding::snapshot_guarded_binding(
+        home, &assignee,
+    ) {
+        Ok(crate::binding::GuardedBinding::Absent) => {
+            // Already released / never bound → nothing to do (idempotent).
+            tracing::debug!(agent = %assignee, task_id = %intent.task_id, event, "auto_release: agent unbound — dropping intent");
+            return IntentOutcome::Done;
+        }
+        Ok(crate::binding::GuardedBinding::Opaque(reason)) => {
+            tracing::warn!(agent = %assignee, %reason, "auto_release: opaque binding state — retaining for retry");
+            return IntentOutcome::Retry;
+        }
+        Ok(crate::binding::GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
+        Err(e) => {
+            tracing::warn!(agent = %assignee, error = %e, "auto_release: binding snapshot failed — retaining for retry");
+            return IntentOutcome::Retry;
+        }
     };
 
     // ── must-fix #5: eligibility — only dispatch leases get invariant-release.
@@ -657,40 +670,19 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         .map(|w| !is_worktree_clean(Path::new(w)));
     match decide_release(task.as_ref(), Some(&binding), worktree_dirty) {
         ReleaseDecision::Release => {
-            // codex gap ②: CAS+release must be ONE atomic critical section under
-            // `.binding.json.lock` — the same lock `bind_full` holds (binding.rs:67)
-            // and the GC path uses (worktree_pool.rs:717). The pre-lock CAS above is
-            // only a cheap early-out; a concurrent bind_full from ANOTHER thread
-            // (MCP handler) could interleave between it and the release. So re-read
-            // + re-validate the FULL lease identity under the lock, then release in
-            // the same section. (`release_full` → `unbind` does NOT take this lock —
-            // binding.rs:119 just removes the file — so no deadlock, mirroring the
-            // pre-PR-1 merge path.)
-            let lock_path = crate::paths::runtime_dir(home)
-                .join(&assignee)
-                .join(".binding.json.lock");
-            let _lock = match crate::store::acquire_file_lock(&lock_path) {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(agent = %assignee, error = %e, "auto_release: binding lock failed — retaining for retry");
-                    return IntentOutcome::Retry;
-                }
-            };
-            let Some(live) = crate::binding::read(home, &assignee) else {
-                // Unbound under the lock → already released. Nothing to do.
-                return IntentOutcome::Done;
-            };
-            if let Some(snap) = intent.lease.as_ref() {
-                if &LeaseIdentity::from_binding(&assignee, &live) != snap {
-                    tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: lease identity changed under lock (re-leased) — skip (TOCTOU CAS)");
-                    return IntentOutcome::Done;
-                }
+            let outcome =
+                crate::worktree_pool::release_full_exact(home, &assignee, &binding_fingerprint);
+            if outcome.released {
+                tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
+                IntentOutcome::Done
+            } else if outcome.stale_fingerprint {
+                tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: exact binding fingerprint moved — dropping stale intent");
+                IntentOutcome::Done
+            } else {
+                tracing::warn!(agent = %assignee, task_id = %intent.task_id, error = ?outcome.error, "auto_release: release_full did not release (fail-closed) — retaining for retry");
+                IntentOutcome::Retry
             }
-            let outcome = crate::worktree_pool::release_full(home, &assignee, false);
-            tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
-            IntentOutcome::Done
         }
-        // Dirty is transient (operator commits / stashes later) → retry.
         ReleaseDecision::SkipDirtyWorktree => {
             tracing::warn!(agent = %assignee, repo = %repo, branch = %branch, "auto_release: worktree dirty — retaining for retry (operator WIP protection)");
             IntentOutcome::Retry

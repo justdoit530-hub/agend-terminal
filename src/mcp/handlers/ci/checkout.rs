@@ -272,6 +272,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         "branch": branch,
                     });
                 }
+                #[cfg(test)]
+                crate::worktree_pool::release_test_seam::hit(
+                    crate::worktree_pool::ReleaseTestPhase::CheckoutBoundBeforeCommit,
+                );
                 // #2158 GR1 (operator-approved): a self-claimed `repo action=checkout
                 // bind=true` no longer SILENTLY arms a ci_watch — neither here (this
                 // inline arm is removed) NOR via the shared dispatch_hook path
