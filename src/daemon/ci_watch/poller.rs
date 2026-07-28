@@ -1429,6 +1429,11 @@ async fn ci_check_repo(
         tracking.last_notified_run_conclusion,
     );
     if to_notify.is_empty() {
+        // S1 exact-head one-shot: a terminal target with nothing new to notify
+        // (already notified on a prior poll) is complete — remove and stop.
+        if maybe_clear_exact_head_terminal(&ctx, &state, &pr) {
+            return Ok(());
+        }
         // #1991: did anything actually change this cycle? A branch whose runs
         // are all terminal and all already-notified produces an UNCHANGED
         // quiet poll — pre-#1991 it still re-stamped `last_terminal_seen_at`
@@ -1468,7 +1473,15 @@ async fn ci_check_repo(
     );
     let outcome =
         fan_out_notifications(&ctx, &state, &pr, &deduped, &tracking, registry, provider).await;
-    let _settled = persist_watch_state(&ctx, &pr, &outcome, &mut state);
+    let settled = persist_watch_state(&ctx, &pr, &outcome, &mut state);
+    // S1 exact-head one-shot: the pinned target SHA reached terminal and we've
+    // just notified — remove the watch instead of persisting/refreshing it.
+    // arch14: gated on SETTLEMENT — an unsettled exact-head watch (delivery
+    // failure held the cursors) is the only retry source and must stay armed;
+    // the quiet/already-notified removal path below is unchanged.
+    if settled && maybe_clear_exact_head_terminal(&ctx, &state, &pr) {
+        return Ok(());
+    }
     if state != snapshot {
         flush_watch_state(watch_path, &state, snapshot.generation_id.as_deref());
     }
