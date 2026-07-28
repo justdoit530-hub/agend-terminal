@@ -1331,10 +1331,13 @@ fn maybe_clear_exact_head_terminal(
     state: &WatchState,
     pr: &PollResult,
 ) -> bool {
-    if state.target_head_sha.is_none() {
-        return false;
-    }
-    if aggregate_conclusion_for_sha(&pr.runs, &pr.current_sha) != Some("success") {
+    let target_sha = match &state.target_head_sha {
+        Some(sha) => sha.as_str(),
+        None => return false,
+    };
+    // For exact-head watches poll_ci_runs populates pr with SHA-specific runs
+    // (current_sha == target_sha). Use target_sha directly to be explicit.
+    if aggregate_conclusion_for_sha(&pr.runs, target_sha) != Some("success") {
         // Runless, pending, and non-success targets remain armed for reruns.
         return false;
     }
@@ -1349,7 +1352,7 @@ fn maybe_clear_exact_head_terminal(
     tracing::info!(
         repo = ctx.repo,
         branch = ctx.branch,
-        sha = %pr.current_sha,
+        sha = %target_sha,
         "ci_watch removed (exact-head post-merge check complete)"
     );
     true
@@ -1622,6 +1625,44 @@ async fn poll_ci_runs(
     state: &mut WatchState,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<Option<PollResult>> {
+    // S1 exact-head: resolve the pinned target SHA via poll_runs_for_sha instead
+    // of the branch page. The branch page shows the CURRENT HEAD (which has
+    // advanced past the target after merge), so it can never prove the target
+    // SHA passed or failed — only the by-SHA query does.
+    if let Some(ref target_sha) = state.target_head_sha.clone() {
+        let sha_result = provider.poll_runs_for_sha(ctx.repo, target_sha).await?;
+        return match sha_result {
+            CiPollResult::ApiError {
+                status, message, ..
+            } => Err(anyhow::anyhow!("{status}: {message}")),
+            CiPollResult::Runs {
+                runs,
+                rate_limit_remaining,
+                rate_limit_limit,
+            } => {
+                if let Some(r) = rate_limit_remaining {
+                    state.rate_limit_remaining = Some(r);
+                }
+                if let Some(l) = rate_limit_limit {
+                    state.rate_limit_limit = Some(l);
+                }
+                clear_stall_state(state, ctx.home, ctx.repo, ctx.branch, ctx.subscribers);
+                if runs.is_empty() {
+                    return Ok(None);
+                }
+                let effective = effective_last_run_id(
+                    tracking.prev_head_sha,
+                    target_sha,
+                    tracking.last_run_id,
+                );
+                Ok(Some(PollResult {
+                    runs,
+                    current_sha: target_sha.clone(),
+                    effective_last_run_id: effective,
+                }))
+            }
+        };
+    }
     let poll_result = provider.poll_runs(ctx.repo, ctx.branch).await?;
     match poll_result {
         CiPollResult::ApiError {
