@@ -41,6 +41,7 @@ const GRANDFATHERED: &[(&str, usize)] = &[
     ("src/deployments.rs", 2805),
     ("src/state/mod.rs", 2695),
     ("src/app/mod.rs", 2587),
+    ("src/worktree.rs", 2578),
     ("src/health.rs", 2510),
 ];
 

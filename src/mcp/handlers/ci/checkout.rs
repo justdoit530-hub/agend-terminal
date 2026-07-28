@@ -245,7 +245,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     "branch": branch,
                 });
             }
-            let mut bound_fingerprint = None;
             if bind {
                 if let Err(e) = crate::binding::bind_full(
                     home,
@@ -273,32 +272,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         "branch": branch,
                     });
                 }
-                bound_fingerprint =
-                    match crate::binding::snapshot_guarded_binding(home, instance_name) {
-                        Ok(crate::binding::GuardedBinding::Known { fingerprint, .. }) => {
-                            Some(fingerprint)
-                        }
-                        other => {
-                            // Binding bytes exist but their exact destructive identity
-                            // cannot be proven. Arm retained rollback intent and leave
-                            // both binding + worktree in place for recovery.
-                            let outcome = super::checkout_txn::rollback_failed(
-                                home,
-                                &mangled,
-                                &mut journal,
-                                txn_now,
-                                || false,
-                                || {},
-                            );
-                            return rollback_response(
-                                outcome,
-                                &format!("could not snapshot committed binding: {other:?}"),
-                                "binding_snapshot",
-                                "bind_full",
-                                branch,
-                            );
-                        }
-                    };
                 #[cfg(test)]
                 crate::worktree_pool::release_test_seam::hit(
                     crate::worktree_pool::ReleaseTestPhase::CheckoutBoundBeforeCommit,
@@ -318,45 +291,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["auto_created_branch"] = json!(auto_created_branch);
                 resp["fetch_attempted"] = json!(fetch_attempted);
             }
-            // #2755 Committed: the durable linearization point. Success is returned
-            // ONLY after this journal write lands; a store::atomic_write failure
-            // aborts into rollback (worktree + binding), never a half-visible
-            // provision.
-            journal.advance(super::checkout_txn::Phase::Committed);
-            if journal.save(home, &mangled).is_err() {
-                let fingerprint = bound_fingerprint.as_ref();
-                let outcome = super::checkout_txn::rollback_failed(
-                    home,
-                    &mangled,
-                    &mut journal,
-                    txn_now,
-                    || {
-                        if let Some(fingerprint) = fingerprint {
-                            let released =
-                                crate::worktree_pool::release_bound_target_exact_under_branch_lock(
-                                    home,
-                                    instance_name,
-                                    fingerprint,
-                                    &worktree_dir,
-                                    &source_canonical,
-                                );
-                            released.released
-                        } else {
-                            remove_worktree()
-                        }
-                    },
-                    || {},
-                );
-                return rollback_response(
-                    outcome,
-                    "commit journal write failed",
-                    "commit_failed",
-                    "committed",
-                    branch,
-                );
-            }
-            // Committed durable ⇒ transaction resolved; drop the journal tombstone.
-            super::checkout_txn::Journal::clear(home, &mangled);
             resp
         }
         Ok(o) => {

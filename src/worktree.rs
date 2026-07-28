@@ -740,6 +740,7 @@ impl WipPreservation {
 ///    `git stash create` this captures untracked files; unlike `git stash push` it
 ///    never touches the shared `refs/stash` stack, so two concurrent dirty releases
 ///    can't cross-contaminate.
+#[allow(dead_code)]
 pub(crate) fn preserve_dirty_worktree(
     home: &Path,
     agent: &str,
@@ -993,6 +994,30 @@ pub(crate) fn prune_recovery_refs(git_dir: &Path, branch: &str) {
             }
         }
     }
+}
+
+/// Enumerate active recovery refs for `branch` in `git_dir` sorted newest-first.
+#[allow(dead_code)]
+pub(crate) fn recovery_refs(git_dir: &Path, branch: &str) -> Vec<String> {
+    let pattern = format!("{RECOVERY_REF_PREFIX}/{branch}/");
+    let listing = match crate::git_helpers::git_cmd(
+        git_dir,
+        &[
+            "for-each-ref",
+            "--sort=-refname",
+            "--format=%(refname)",
+            &pattern,
+        ],
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// Parse the trailing `YYYYMMDDTHHMMSSZ` segment of a recovery ref and report
@@ -1495,7 +1520,6 @@ pub(crate) fn clear_nested_refusal_marker(home: &Path, wt_path: &Path) {
                 "clear nested refusal marker: could not open lock — leaving marker untouched (fail-safe)");
         }
     }
->>>>>>> 6a584839 (fix: serialize exact binding release transactions (#2778))
 }
 
 /// #2234 Phase 2: resolve the worktree dir to remove for `(agent, branch)`,

@@ -668,52 +668,32 @@ fn process_intent(home: &Path, intent: &AutoReleaseIntent) -> IntentOutcome {
         .get("worktree")
         .and_then(|v| v.as_str())
         .map(|w| !is_worktree_clean(Path::new(w)));
-    let decision = decide_release(Some(&task), Some(&binding), worktree_dirty);
-    // #P1b (t-…24962-1): on a RELEASABLE branch (PR-terminal, or no-PR + all tasks
-    // done), a dirty worktree is stale build/handoff artifacts — a gitignored
-    // SESSION-HANDOFF, a build-dirtied submodule — that never self-clears. The old
-    // dirty→refuse-retry immortalized the worktree (retry every sweep, dirt stays,
-    // never releases). Treat releasable-dirty like Release: `release_full`
-    // WIP-preserves the dirty tree to a durable recovery ref (fail-closed, #2672)
-    // AND notifies (wip_notice_recipient → team orchestrator, #2696) before
-    // removing, so no WIP is lost. A NON-releasable dirty worktree (open PR /
-    // Unknown / reviewer-bypass) still retains — that WIP may be active work.
-    // PR-D · D2 (#2711): delegate this gate to the unified `terminal_disposition`
-    // classifier instead of the inline boolean. `reviewer_bypassed` carries the
-    // #2010 clean-reviewer release the classifier can't encode (releasable=false by
-    // construction). Byte-identical — `should_release_now` + its equivalence pin.
-    let release_now = should_release_now(&decision, releasable, reviewer_bypassed);
-    if release_now {
-        let dirty = worktree_dirty.unwrap_or(false);
-        // S1: auto-release no longer carries a caller-held binding flock into the
-        // mechanism. It supplies the exact disk generation evaluated above; the
-        // shared release transaction owns A→L→A and the final raw fingerprint CAS.
-        let outcome =
-            crate::worktree_pool::release_full_exact(home, &assignee, &binding_fingerprint);
-        if outcome.released {
-            tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, dirty, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
-            IntentOutcome::Done
-        } else if outcome.stale_fingerprint {
-            tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: exact binding fingerprint moved — dropping stale intent");
-            IntentOutcome::Done
-        } else {
-            // #P1b: release_full is FAIL-CLOSED — dirty WIP that could not be
-            // snapshotted (e.g. a contended index.lock) leaves the binding intact
-            // (#2672). Retain the intent so a later sweep retries rather than
-            // dropping it and leaking the worktree.
-            tracing::warn!(agent = %assignee, task_id = %intent.task_id, error = ?outcome.error, "auto_release: release_full did not release (fail-closed) — retaining for retry");
+    match decide_release(task.as_ref(), Some(&binding), worktree_dirty) {
+        ReleaseDecision::Release => {
+            let outcome =
+                crate::worktree_pool::release_full_exact(home, &assignee, &binding_fingerprint);
+            if outcome.released {
+                tracing::info!(agent = %assignee, task_id = %intent.task_id, event, ?confidence, outcome = ?outcome, "auto_release: released worktree (release invariant satisfied)");
+                IntentOutcome::Done
+            } else if outcome.stale_fingerprint {
+                tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: exact binding fingerprint moved — dropping stale intent");
+                IntentOutcome::Done
+            } else {
+                tracing::warn!(agent = %assignee, task_id = %intent.task_id, error = ?outcome.error, "auto_release: release_full did not release (fail-closed) — retaining for retry");
+                IntentOutcome::Retry
+            }
+        }
+        ReleaseDecision::SkipDirtyWorktree => {
+            tracing::warn!(agent = %assignee, repo = %repo, branch = %branch, "auto_release: worktree dirty — retaining for retry (operator WIP protection)");
             IntentOutcome::Retry
         }
-    } else {
-        match decision {
-            ReleaseDecision::SkipOptOut => {
-                tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: opted out (auto_release_on_verdict=false) — dropping intent");
-                IntentOutcome::Done
-            }
-            other => {
-                tracing::debug!(agent = %assignee, task_id = %intent.task_id, decision = ?other, "auto_release: terminal skip — dropping intent");
-                IntentOutcome::Done
-            }
+        ReleaseDecision::SkipOptOut => {
+            tracing::info!(agent = %assignee, task_id = %intent.task_id, "auto_release: opted out (auto_release_on_verdict=false) — dropping intent");
+            IntentOutcome::Done
+        }
+        other => {
+            tracing::debug!(agent = %assignee, task_id = %intent.task_id, decision = ?other, "auto_release: terminal skip — dropping intent");
+            IntentOutcome::Done
         }
     }
 }

@@ -1138,10 +1138,12 @@ fn release_full_guarded(
     }
     if locked.finish_full_release {
         resolve_branch_cleanup(
+            home,
             &current,
             locked.managed_verified,
             locked.worktree_absent,
             dry_run,
+            false,
             &mut locked.out,
         );
         crate::event_log::log(

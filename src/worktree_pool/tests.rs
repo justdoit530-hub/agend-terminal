@@ -1,4 +1,5 @@
 use super::*;
+use crate::worktree::recovery_refs;
 
 fn tmp_home(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
