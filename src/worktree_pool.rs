@@ -5,6 +5,39 @@
 
 use std::path::{Path, PathBuf};
 
+mod legacy_release;
+use legacy_release::absent_release_outcome;
+
+pub(crate) struct NestedDirtDiscard<'a> {
+    pub expected_digest: &'a str,
+    pub audit_reason: &'a str,
+}
+
+pub(super) fn marker_source_repo(target: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(target.join(MANAGED_MARKER)).ok()?;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("source_repo=") {
+            let s = v.trim();
+            if !s.is_empty() {
+                return Some(PathBuf::from(s));
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn target_source_repo_matches(target: &Path, source_repo: &Path) -> bool {
+    let Ok(common) = source_from_git_common_dir(target) else {
+        return false;
+    };
+    let Ok(common_canon) = std::fs::canonicalize(common) else {
+        return false;
+    };
+    let Ok(source_canon) = std::fs::canonicalize(source_repo) else {
+        return false;
+    };
+    common_canon == source_canon
+}
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReleaseTestPhase {
@@ -1084,7 +1117,7 @@ fn release_full_guarded(
 
     let (snapshot, fingerprint) = match crate::binding::snapshot_guarded_binding(home, agent) {
         Err(e) => return opaque_release(e),
-        Ok(GuardedBinding::Absent) => return idempotent_absent(),
+        Ok(GuardedBinding::Absent) => return absent_release_outcome(home, agent),
         Ok(GuardedBinding::Opaque(reason)) => return opaque_release(reason),
         Ok(GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
     };
@@ -1115,7 +1148,7 @@ fn release_full_guarded(
         Err(e) => return opaque_release(e),
     };
     let current = match crate::binding::guarded_binding_disk_fresh(home, agent) {
-        GuardedBinding::Absent => return idempotent_absent(),
+        GuardedBinding::Absent => return absent_release_outcome(home, agent),
         GuardedBinding::Opaque(reason) => return opaque_release(reason),
         GuardedBinding::Known {
             value,
