@@ -6661,8 +6661,6 @@ fn quiet_terminal_poll_does_not_refresh_expires_1991() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
-<<<<<<< HEAD
-=======
 
 // ─────────────────────────────────────────────────────────────────────────
 // S1 exact-head watch — poller freshness (test-first).
@@ -7736,4 +7734,3 @@ fn action_required_skips_creator_when_already_subscriber() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
->>>>>>> cb70ae9a (fix: retain exact-head watch after CI failure (#3123))
