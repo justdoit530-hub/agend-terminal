@@ -6661,3 +6661,738 @@ fn quiet_terminal_poll_does_not_refresh_expires_1991() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// S1 exact-head watch — poller freshness (test-first).
+//
+// An exact-head watch (pinned `target_head_sha`) MUST resolve the target SHA via
+// `poll_runs_for_sha` and IGNORE newer/unrelated branch runs, so a later main
+// push can't falsely complete the wrong post-merge check. `ExactHeadMock` returns
+// DIFFERENT runs for the two provider paths to prove which one drives resolution.
+// ─────────────────────────────────────────────────────────────────────────
+
+struct ExactHeadMock {
+    branch_result: Mutex<CiPollResult>,
+    sha_result: Mutex<CiPollResult>,
+}
+
+impl ExactHeadMock {
+    fn runs(runs: Vec<CiRun>) -> CiPollResult {
+        CiPollResult::Runs {
+            runs,
+            rate_limit_remaining: None,
+            rate_limit_limit: None,
+        }
+    }
+    fn new(branch_runs: Vec<CiRun>, sha_runs: Vec<CiRun>) -> Self {
+        Self {
+            branch_result: Mutex::new(Self::runs(branch_runs)),
+            sha_result: Mutex::new(Self::runs(sha_runs)),
+        }
+    }
+    fn with_sha_api_error(branch_runs: Vec<CiRun>) -> Self {
+        Self {
+            branch_result: Mutex::new(Self::runs(branch_runs)),
+            sha_result: Mutex::new(CiPollResult::ApiError {
+                status: 502,
+                message: "upstream error".to_string(),
+                rate_limit_reset: None,
+            }),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CiProvider for ExactHeadMock {
+    async fn poll_runs(&self, _repo: &str, _branch: &str) -> anyhow::Result<CiPollResult> {
+        Ok(self.branch_result.lock().clone())
+    }
+    async fn poll_runs_for_sha(&self, _repo: &str, _sha: &str) -> anyhow::Result<CiPollResult> {
+        Ok(self.sha_result.lock().clone())
+    }
+    async fn check_pr_terminal(&self, _repo: &str, _branch: &str) -> PrState {
+        PrState::Open // an exact-head main watch has no PR
+    }
+    async fn fetch_failure_summary(&self, _repo: &str, _run_id: u64) -> String {
+        "Build / Test".to_string()
+    }
+    fn token_warning(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+const S1_TARGET_SHA: &str = "c4206950c4206950c4206950c4206950c4206950";
+const S1_NEWER_SHA: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+fn wf_run(name: &str, id: u64, run_attempt: u64, conclusion: Option<&str>, sha: &str) -> CiRun {
+    CiRun {
+        id,
+        conclusion: conclusion.map(str::to_string),
+        head_sha: sha.to_string(),
+        url: format!("https://github.com/test/repo/actions/runs/{id}"),
+        name: name.to_string(),
+        run_attempt,
+    }
+}
+
+fn exact_head_watch_json() -> serde_json::Value {
+    serde_json::json!({
+        "repo": "o/r",
+        "branch": "main",
+        "target_head_sha": S1_TARGET_SHA,
+        "subscribers": [{"instance": "reviewer-x"}],
+        "next_after_ci": "reviewer-x",
+        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+    })
+}
+
+fn exact_head_watch_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("ci-watches").join(watch_filename("o/r", "main"))
+}
+
+/// Target SHA success (via by-SHA) while the branch's recent page shows ONLY a
+/// NEWER unrelated green (target displaced off the page). The watch must resolve
+/// on the TARGET and terminal-clear (one-shot) — the newer green must NOT
+/// complete it. RED before the poller sources by-SHA + one-shot clears.
+#[test]
+fn exact_head_success_resolves_target_ignoring_newer_branch_run() {
+    let dir = tmp_dir("s1-exact-head-success");
+    let provider = ExactHeadMock::new(
+        vec![wf_run("CI", 999, 1, Some("success"), S1_NEWER_SHA)], // branch page: newer only
+        vec![wf_run("CI", 100, 1, Some("success"), S1_TARGET_SHA)], // by-SHA: target terminal
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &provider).unwrap();
+    assert!(
+        !exact_head_watch_path(&dir).exists(),
+        "exact-head watch must terminal-clear once the TARGET sha succeeds"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RED: a delivered terminal failure at the pinned SHA must keep the exact-head
+/// watch armed so a rerun can produce a later success notification.
+#[test]
+fn exact_head_terminal_failure_keeps_watch_armed_for_rerun() {
+    let dir = tmp_dir("s1-exact-head-failure");
+    let provider = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &provider).unwrap();
+    assert!(
+        exact_head_watch_path(&dir).exists(),
+        "a delivered terminal failure must keep the exact-head watch armed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RED: a same-run rerun with an advanced attempt must notify on success and
+/// then clear the exact-head watch.
+#[test]
+fn exact_head_rerun_success_notifies_and_clears_after_failure() {
+    let dir = tmp_dir("s1-exact-head-rerun");
+    let failure = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &failure).unwrap();
+    assert!(
+        exact_head_watch_path(&dir).exists(),
+        "the failed first attempt must leave the watch armed"
+    );
+    let after_failure: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(exact_head_watch_path(&dir)).unwrap())
+            .unwrap();
+    let success = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 2, Some("success"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &after_failure, &success).unwrap();
+    assert!(
+        !exact_head_watch_path(&dir).exists(),
+        "a successful rerun must clear the exact-head watch"
+    );
+    let inbox = std::fs::read_to_string(dir.join("inbox").join("reviewer-x.jsonl"))
+        .expect("rerun success must notify the subscriber");
+    assert_eq!(
+        inbox
+            .lines()
+            .filter(|line| line.contains("[ci-ready-for-action]"))
+            .count(),
+        1,
+        "the successful rerun must produce one ready-for-action notification: {inbox}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RED: an unchanged terminal failure must remain quiet and must not refresh
+/// either the activity marker or the TTL while the watch stays armed.
+#[test]
+fn exact_head_unchanged_failure_keeps_watch_without_refreshing_ttl() {
+    let dir = tmp_dir("s1-exact-head-unchanged-failure");
+    let first = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &first).unwrap();
+    let watch_path = exact_head_watch_path(&dir);
+    let after_first: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    let expires_at = after_first["expires_at"].clone();
+    let last_terminal_seen_at = after_first["last_terminal_seen_at"].clone();
+    let second = ExactHeadMock::new(
+        vec![],
+        vec![wf_run("CI", 100, 1, Some("failure"), S1_TARGET_SHA)],
+    );
+    run_ci_check(&dir, &after_first, &second).unwrap();
+    assert!(
+        watch_path.exists(),
+        "an unchanged terminal failure must keep the exact-head watch armed"
+    );
+    let after_second: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&watch_path).unwrap()).unwrap();
+    assert_eq!(
+        after_second["expires_at"], expires_at,
+        "an unchanged terminal failure must not refresh the watch TTL"
+    );
+    assert_eq!(
+        after_second["last_terminal_seen_at"], last_terminal_seen_at,
+        "an unchanged terminal failure must not refresh activity"
+    );
+    let inbox = std::fs::read_to_string(dir.join("inbox").join("reviewer-x.jsonl"))
+        .expect("first failure must notify the subscriber");
+    assert_eq!(
+        inbox
+            .lines()
+            .filter(|line| line.contains("[ci-fail]"))
+            .count(),
+        1,
+        "an unchanged terminal failure must not re-notify: {inbox}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Target SHA still PENDING (by-SHA) while the branch page shows a newer green.
+/// The watch must stay ARMED — a newer unrelated green never completes it.
+#[test]
+fn exact_head_pending_target_stays_armed_despite_newer_green() {
+    let dir = tmp_dir("s1-exact-head-pending");
+    let provider = ExactHeadMock::new(
+        vec![wf_run("CI", 999, 1, Some("success"), S1_NEWER_SHA)],
+        vec![wf_run("CI", 100, 1, None, S1_TARGET_SHA)], // target in progress
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &provider).unwrap();
+    assert!(
+        exact_head_watch_path(&dir).exists(),
+        "a pending target must keep the exact-head watch armed (newer green ignored)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Multi-workflow: one workflow terminal-green, another still pending at the
+/// TARGET sha. Aggregate is NOT terminal → the watch must NOT resolve/clear
+/// (codex locked detail: never resolve while another workflow pends).
+#[test]
+fn exact_head_partial_workflow_pending_does_not_clear() {
+    let dir = tmp_dir("s1-exact-head-partial");
+    let provider = ExactHeadMock::new(
+        vec![],
+        vec![
+            wf_run("CI", 100, 1, Some("success"), S1_TARGET_SHA),
+            wf_run("LOC", 101, 1, None, S1_TARGET_SHA), // still pending
+        ],
+    );
+    run_ci_check(&dir, &exact_head_watch_json(), &provider).unwrap();
+    assert!(
+        exact_head_watch_path(&dir).exists(),
+        "a target with one workflow still pending must NOT terminal-clear"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Provider error on the by-SHA fetch must FAIL LOUD (Err) and NOT clear the
+/// watch — no false terminal-clear on an API error.
+#[test]
+fn exact_head_provider_error_keeps_watch_armed() {
+    let dir = tmp_dir("s1-exact-head-error");
+    let provider = ExactHeadMock::with_sha_api_error(vec![]);
+    let result = run_ci_check(&dir, &exact_head_watch_json(), &provider);
+    assert!(
+        result.is_err(),
+        "by-SHA API error must surface as Err (fail loud)"
+    );
+    assert!(
+        exact_head_watch_path(&dir).exists(),
+        "a provider error must NOT terminal-clear the exact-head watch"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #2743 r1 (P0): PRODUCTION wraps EVERY provider in `CachedCiProvider`
+/// (fan-out site poller.rs:611). Before the wrapper override, `poll_runs_for_sha`
+/// fell to the trait-default `ApiError 501` there, so every production exact-head
+/// watch stayed armed forever and never reached `GitHubCiProvider::poll_runs_for_sha`.
+/// This drives the exact-head resolution THROUGH `CachedCiProvider` deterministically
+/// (wrap the inner fake, run `ci_check_repo`) — the inner succeeds ONLY from
+/// `poll_runs_for_sha` (branch page empty), proving the wrapper forwards it.
+#[test]
+fn exact_head_resolves_through_cached_provider_wrapper() {
+    let dir = tmp_dir("s1-exact-head-cached");
+    let inner = ExactHeadMock::new(
+        vec![], // branch page: nothing (a raw poll_runs would find no target)
+        vec![wf_run("CI", 100, 1, Some("success"), S1_TARGET_SHA)], // by-SHA: target terminal
+    );
+    let cached = super::CachedCiProvider {
+        inner: Box::new(inner),
+        poll_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
+    run_ci_check(&dir, &exact_head_watch_json(), &cached).unwrap();
+    assert!(
+        !exact_head_watch_path(&dir).exists(),
+        "exact-head watch must resolve + clear THROUGH CachedCiProvider (not the 501 default)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #2743 r1 (P0): the FULL production fan-out through `check_ci_watches_with_provider`
+/// — which itself constructs the `CachedCiProvider` wrapper (proving the real wrapping
+/// applies, not just that the wrapper forwards). The inner fake succeeds ONLY from
+/// `poll_runs_for_sha`; the exact-head watch must resolve + one-shot-clear. The fan-out
+/// spawns a detached task, so we wait (bounded) for the clear.
+#[test]
+fn exact_head_resolves_through_production_fanout() {
+    let dir = tmp_dir("s1-exact-head-fanout");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).unwrap();
+    let watch_path = ci_dir.join(watch_filename("o/r", "main"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&exact_head_watch_json()).unwrap(),
+    )
+    .unwrap();
+
+    let registry: AgentRegistry =
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    // make_provider yields the inner fake; check_ci_watches_with_provider wraps it in
+    // CachedCiProvider (the production wrapping site) before ci_check_repo.
+    super::check_ci_watches_with_provider(&dir, &registry, |_ws| {
+        Some(Box::new(ExactHeadMock::new(
+            vec![],
+            vec![wf_run("CI", 100, 1, Some("success"), S1_TARGET_SHA)],
+        )) as Box<dyn CiProvider>)
+    });
+    // Detached fan-out task → wait (bounded, ~2s) for the one-shot terminal-clear.
+    let mut cleared = false;
+    for _ in 0..200 {
+        if !watch_path.exists() {
+            cleared = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        cleared,
+        "exact-head watch must resolve + clear through the real check_ci_watches fan-out (CachedCiProvider wrapping)"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ═══ Arch14 residual: terminal CI settlement must be delivery-acknowledged ═
+// (t-20260720020253134678-39872-11, parent t-20260715082138656316-68811-14)
+//
+// Live occurrence (PR #2860 @ edcff13): macOS+Windows CI failures were
+// written into last_notified_by_workflow / last_terminal_seen_at while NO
+// subscriber inbox row or idle wake existed — fan_out emitted CiFail, the
+// emit's handled-count and the handler's enqueue outcome were both ignored,
+// and persist_watch_state settled the cursors anyway.
+//
+// NOTE for RED review: the event-bus `ctor` registers ALL pattern
+// subscribers at test-binary load, so a literal zero-handler emit cannot be
+// constructed in-process. The enqueue-failure fixtures below pin the same
+// defect face: post-fix a handler only counts as handled when its durable
+// enqueue succeeded, so zero-handler (handled==0) and enqueue-failure
+// converge on the same retryable non-settlement behavior.
+
+/// Watch JSON with one subscriber ("dev") and no chain target.
+fn arch14_delivery_watch_json() -> serde_json::Value {
+    serde_json::json!({
+        "repo": "o/r",
+        "branch": "feat",
+        "subscribers": [
+            {"instance": "dev", "subscribed_at": "2026-07-20T00:00:00Z"}
+        ],
+        "instance": "lead",
+        "interval_secs": 60,
+        "last_run_id": null,
+        "head_sha": null,
+        "last_polled_at": null,
+        "last_notified_head_sha": null,
+        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+        "last_terminal_seen_at": null,
+    })
+}
+
+fn arch14_failure_run() -> CiRun {
+    CiRun {
+        run_attempt: 1,
+        id: 7,
+        conclusion: Some("failure".to_string()),
+        head_sha: "deadbeef".to_string(),
+        url: "https://example/run/7".to_string(),
+        name: "CI".to_string(),
+    }
+}
+
+fn arch14_run_check(
+    dir: &std::path::Path,
+    watch_path: &std::path::Path,
+    provider: &MockCiProvider,
+) {
+    let watch: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(watch_path).expect("watch readable"))
+            .expect("watch parses");
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        dir,
+        watch_path,
+        watch,
+        vec!["dev".to_string()],
+        &registry,
+        provider,
+    ))
+    .unwrap();
+}
+
+fn arch14_read_watch(watch_path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(watch_path).expect("watch readable"))
+        .expect("watch parses")
+}
+
+/// RED 1: a terminal failure whose durable inbox enqueue FAILS (the inbox
+/// root is blocked by a regular file, so create_dir_all errs) must NOT
+/// settle the notified cursors — the next poll must be able to retry.
+/// Today the enqueue error is swallowed (persist_or_log!), the handler
+/// reports handled anyway, and every cursor settles over a lost message.
+#[test]
+fn arch14_enqueue_failure_does_not_settle_notified_cursors() {
+    let dir = tmp_dir("arch14-lost");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    // Block the inbox ROOT with a regular file — enqueue_with_idle_hint's
+    // create_dir_all fails deterministically for every recipient.
+    std::fs::write(dir.join("inbox"), b"blocked").expect("block inbox root");
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&arch14_delivery_watch_json()).unwrap(),
+    )
+    .unwrap();
+    let provider = MockCiProvider::with_runs(vec![arch14_failure_run()]);
+
+    arch14_run_check(&dir, &watch_path, &provider);
+
+    let w = arch14_read_watch(&watch_path);
+    assert!(
+        w["last_notified_head_sha"].is_null(),
+        "no durable inbox row exists — last_notified_head_sha must NOT settle: {w}"
+    );
+    assert!(
+        w["last_terminal_seen_at"].is_null(),
+        "no durable inbox row exists — last_terminal_seen_at must NOT settle: {w}"
+    );
+    assert!(
+        w["last_notified_by_workflow"].is_null()
+            || w["last_notified_by_workflow"]
+                .as_object()
+                .is_some_and(|m| m.is_empty()),
+        "no durable inbox row exists — per-workflow cursors must NOT settle: {w}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// RED 2: after a failed delivery, a later poll with a HEALTHY inbox must
+/// deliver the terminal notification EXACTLY once and only then settle.
+/// Today poll 1 settles over the lost message and poll 2 dedups to quiet —
+/// the subscriber never receives anything.
+#[test]
+fn arch14_enqueue_failure_then_recovery_delivers_exactly_once() {
+    let dir = tmp_dir("arch14-retry");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    std::fs::write(dir.join("inbox"), b"blocked").expect("block inbox root");
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&arch14_delivery_watch_json()).unwrap(),
+    )
+    .unwrap();
+    // MockCiProvider::poll_runs is one-shot (take().unwrap()) — build a fresh
+    // provider per poll with the SAME runs.
+    let poll1 = MockCiProvider::with_runs(vec![arch14_failure_run()]);
+    arch14_run_check(&dir, &watch_path, &poll1); // poll 1: delivery fails
+
+    std::fs::remove_file(dir.join("inbox")).expect("unblock inbox root");
+    let poll2 = MockCiProvider::with_runs(vec![arch14_failure_run()]);
+    arch14_run_check(&dir, &watch_path, &poll2); // poll 2: must retry + deliver
+
+    let inbox_path = dir.join("inbox").join("dev.jsonl");
+    let body = std::fs::read_to_string(&inbox_path).unwrap_or_else(|_| {
+        panic!("dev inbox missing — lost terminal notification was never retried: {inbox_path:?}")
+    });
+    let ci_fail_rows = body.lines().filter(|l| l.contains("[ci-fail]")).count();
+    assert_eq!(
+        ci_fail_rows, 1,
+        "recovered retry must deliver the terminal [ci-fail] exactly once: {body}"
+    );
+    let w = arch14_read_watch(&watch_path);
+    assert_eq!(
+        w["last_notified_head_sha"].as_str(),
+        Some("deadbeef"),
+        "cursors settle once the delivery is durable: {w}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Control (green today, must stay green): a healthy delivery settles the
+/// cursors, lands exactly one inbox row, and a second identical poll stays
+/// quiet — the fix must not introduce duplicate successful deliveries.
+#[test]
+fn arch14_delivered_failure_settles_and_dedupes() {
+    let dir = tmp_dir("arch14-ok");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&arch14_delivery_watch_json()).unwrap(),
+    )
+    .unwrap();
+    // One-shot mock: fresh provider per poll with identical runs.
+    let poll1 = MockCiProvider::with_runs(vec![arch14_failure_run()]);
+    arch14_run_check(&dir, &watch_path, &poll1);
+    let poll2 = MockCiProvider::with_runs(vec![arch14_failure_run()]);
+    arch14_run_check(&dir, &watch_path, &poll2); // identical second poll
+
+    let body = std::fs::read_to_string(dir.join("inbox").join("dev.jsonl"))
+        .expect("dev inbox must contain the terminal notification");
+    let ci_fail_rows = body.lines().filter(|l| l.contains("[ci-fail]")).count();
+    assert_eq!(
+        ci_fail_rows, 1,
+        "healthy delivery lands exactly one [ci-fail]; the second poll dedups: {body}"
+    );
+    let w = arch14_read_watch(&watch_path);
+    assert_eq!(
+        w["last_notified_head_sha"].as_str(),
+        Some("deadbeef"),
+        "healthy delivery settles the cursor: {w}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── Supplemental RED (root GREEN-gate rejection m-20260720040031170642-422):
+// exact-head lifecycle hole — maybe_clear_exact_head_terminal removes a
+// terminal exact-head watch on target/runs alone, even when
+// outcome.delivery_failed held every cursor, deleting the only retry source.
+
+/// Exact-head variant of the delivery watch (post-merge pinned-SHA check).
+fn arch14_exact_head_watch_json() -> serde_json::Value {
+    let mut w = arch14_delivery_watch_json();
+    w["target_head_sha"] = serde_json::json!("deadbeef");
+    w
+}
+
+/// Supplemental helper: like `arch14_run_check` but takes any provider —
+/// exact-head polling needs `ExactHeadMock` (`poll_runs_for_sha` support;
+/// clone-based, safe across multiple polls).
+fn arch14_run_check_dyn(
+    dir: &std::path::Path,
+    watch_path: &std::path::Path,
+    provider: &dyn CiProvider,
+) {
+    let watch: WatchState =
+        serde_json::from_str(&std::fs::read_to_string(watch_path).expect("watch readable"))
+            .expect("watch parses");
+    let registry: AgentRegistry =
+        Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(ci_check_repo(
+        dir,
+        watch_path,
+        watch,
+        vec!["dev".to_string()],
+        &registry,
+        provider,
+    ))
+    .unwrap();
+}
+
+/// Supplemental RED A: an exact-head terminal failure whose durable delivery
+/// FAILED must keep the watch armed and unsettled — removing it would delete
+/// the only retry source. Today the removal fires on target/runs alone.
+#[test]
+fn arch14_exact_head_blocked_inbox_keeps_watch_armed() {
+    let dir = tmp_dir("arch14-eh-armed");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    std::fs::write(dir.join("inbox"), b"blocked").expect("block inbox root");
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&arch14_exact_head_watch_json()).unwrap(),
+    )
+    .unwrap();
+    let provider = ExactHeadMock::new(vec![arch14_failure_run()], vec![arch14_failure_run()]);
+
+    arch14_run_check_dyn(&dir, &watch_path, &provider);
+
+    assert!(
+        watch_path.exists(),
+        "exact-head watch with an UNDELIVERED terminal notification must stay armed \
+         (removing it deletes the only retry source)"
+    );
+    let w = arch14_read_watch(&watch_path);
+    assert!(
+        w["last_notified_head_sha"].is_null(),
+        "undelivered exact-head terminal must stay unsettled: {w}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Supplemental RED B: after the blocked poll, a healthy retry delivers the
+/// exact-head terminal failure EXACTLY once and keeps the watch armed for a
+/// later successful rerun.
+#[test]
+fn arch14_exact_head_retry_delivers_and_keeps_failure_armed() {
+    let dir = tmp_dir("arch14-eh-retry");
+    let ci_dir = dir.join("ci-watches");
+    std::fs::create_dir_all(&ci_dir).ok();
+    std::fs::write(dir.join("inbox"), b"blocked").expect("block inbox root");
+    let watch_path = ci_dir.join(watch_filename("o/r", "feat"));
+    std::fs::write(
+        &watch_path,
+        serde_json::to_string_pretty(&arch14_exact_head_watch_json()).unwrap(),
+    )
+    .unwrap();
+    let provider = ExactHeadMock::new(vec![arch14_failure_run()], vec![arch14_failure_run()]);
+    arch14_run_check_dyn(&dir, &watch_path, &provider); // delivery fails
+
+    assert!(
+        watch_path.exists(),
+        "watch must survive the undelivered terminal so the retry can happen"
+    );
+    std::fs::remove_file(dir.join("inbox")).expect("unblock inbox root");
+    arch14_run_check_dyn(&dir, &watch_path, &provider); // retry delivers + settles
+
+    let body = std::fs::read_to_string(dir.join("inbox").join("dev.jsonl"))
+        .expect("dev inbox must contain the exact-head terminal notification");
+    let ci_fail_rows = body.lines().filter(|l| l.contains("[ci-fail]")).count();
+    assert_eq!(
+        ci_fail_rows, 1,
+        "exact-head retry must deliver exactly once: {body}"
+    );
+    assert!(
+        watch_path.exists(),
+        "a delivered exact-head failure remains armed for a successful rerun"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── RED: action_required → task creator handoff ──────────────────────────
+// Frozen decisions: d-20260721185014480622-8, d-20260722033958747668-6.
+
+fn seed_task(home: &Path, task_id: &str, created_by: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    crate::task_events::append(
+        home,
+        &InstanceName(created_by.to_string()),
+        TaskEvent::Created {
+            task_id: TaskId(task_id.to_string()),
+            title: "test task".to_string(),
+            description: String::new(),
+            priority: "normal".to_string(),
+            owner: None,
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("feat".to_string()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+        },
+    )
+    .expect("seed_task: append must succeed");
+}
+
+fn action_required_watch(task_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "repo": "o/r",
+        "branch": "feat",
+        "subscribers": [
+            {"instance": "dev", "subscribed_at": "2026-07-22T00:00:00Z"}
+        ],
+        "instance": "dev",
+        "interval_secs": 60,
+        "last_run_id": null,
+        "head_sha": null,
+        "last_polled_at": null,
+        "last_notified_head_sha": null,
+        "expires_at": (chrono::Utc::now() + chrono::Duration::hours(72)).to_rfc3339(),
+        "last_terminal_seen_at": null,
+        "task_id": task_id,
+    })
+}
+
+fn action_required_provider(run_id: u64, sha: &str) -> MockCiProvider {
+    MockCiProvider::with_runs(vec![CiRun {
+        run_attempt: 1,
+        id: run_id,
+        conclusion: Some("action_required".to_string()),
+        head_sha: sha.to_string(),
+        url: format!("https://github.com/o/r/actions/runs/{run_id}"),
+        name: "CI".to_string(),
+    }])
+}
+
+/// Negative control: when creator IS the subscriber, no extra
+/// `[ci-action-required]` is delivered.
+#[test]
+fn action_required_skips_creator_when_already_subscriber() {
+    let dir = tmp_dir("action-required-creator-is-sub");
+    let task_id = "t-test-action-required-self";
+
+    seed_task(&dir, task_id, "dev");
+
+    run_ci_check(
+        &dir,
+        &action_required_watch(task_id),
+        &action_required_provider(700, "ccc3333"),
+    )
+    .expect("ci_check_repo must not error");
+
+    let dev_msgs = crate::inbox::drain(&dir, "dev");
+    assert!(
+        dev_msgs
+            .iter()
+            .any(|m| m.text.contains("[ci-ended]") && m.text.contains("action_required")),
+        "positive control: dev must receive [ci-ended]; got: {:?}",
+        dev_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    assert!(
+        !dev_msgs
+            .iter()
+            .any(|m| m.text.contains("[ci-action-required]")),
+        "creator==subscriber: must NOT receive extra [ci-action-required]; got: {:?}",
+        dev_msgs.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

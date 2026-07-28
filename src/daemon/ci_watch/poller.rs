@@ -81,6 +81,14 @@ impl CiProvider for CachedCiProvider {
         self.inner.fetch_run_jobs(repo, run_id).await
     }
 
+    async fn poll_runs_for_sha(
+        &self,
+        repo: &str,
+        sha: &str,
+    ) -> anyhow::Result<super::provider::CiPollResult> {
+        self.inner.poll_runs_for_sha(repo, sha).await
+    }
+
     fn token_warning(&self) -> Option<&'static str> {
         self.inner.token_warning()
     }
@@ -1312,6 +1320,43 @@ struct NotifyOutcome {
 /// Single-load-per-tick entry point: receives the pre-loaded `WatchState`
 /// from the caller, passes `&mut` to sub-functions, and flushes once at
 /// the end when state has changed.
+/// S1 exact-head one-shot terminal-clear. An exact-head watch fires ONE post-merge
+/// notification for its pinned SHA, then must disappear. Once EVERY run at the
+/// target SHA has concluded successfully (aggregate success), remove the watch.
+/// No-op for a non-exact-head watch or a runless, pending, or non-success target
+/// (which stays armed). Returns true when it removed the watch — the caller must
+/// then NOT flush/refresh the now-deleted file.
+fn maybe_clear_exact_head_terminal(
+    ctx: &CiCheckCtx<'_>,
+    state: &WatchState,
+    pr: &PollResult,
+) -> bool {
+    let target_sha = match &state.target_head_sha {
+        Some(sha) => sha.as_str(),
+        None => return false,
+    };
+    // For exact-head watches poll_ci_runs populates pr with SHA-specific runs
+    // (current_sha == target_sha). Use target_sha directly to be explicit.
+    if aggregate_conclusion_for_sha(&pr.runs, target_sha) != Some("success") {
+        // Runless, pending, and non-success targets remain armed for reruns.
+        return false;
+    }
+    super::remove_watch(
+        ctx.home,
+        ctx.watch_path,
+        &ctx.subscribers.join(","),
+        ctx.repo,
+        ctx.branch,
+        "exact_head_terminal",
+    );
+    tracing::info!(
+        repo = ctx.repo,
+        branch = ctx.branch,
+        sha = %target_sha,
+        "ci_watch removed (exact-head post-merge check complete)"
+    );
+    true
+}
 async fn ci_check_repo(
     home: &Path,
     watch_path: &Path,
@@ -1395,6 +1440,11 @@ async fn ci_check_repo(
         tracking.last_notified_run_conclusion,
     );
     if to_notify.is_empty() {
+        // S1 exact-head one-shot: a terminal target with nothing new to notify
+        // (already notified on a prior poll) is complete — remove and stop.
+        if maybe_clear_exact_head_terminal(&ctx, &state, &pr) {
+            return Ok(());
+        }
         // #1991: did anything actually change this cycle? A branch whose runs
         // are all terminal and all already-notified produces an UNCHANGED
         // quiet poll — pre-#1991 it still re-stamped `last_terminal_seen_at`
@@ -1434,7 +1484,15 @@ async fn ci_check_repo(
     );
     let outcome =
         fan_out_notifications(&ctx, &state, &pr, &deduped, &tracking, registry, provider).await;
-    let _settled = persist_watch_state(&ctx, &pr, &outcome, &mut state);
+    let settled = persist_watch_state(&ctx, &pr, &outcome, &mut state);
+    // S1 exact-head one-shot: the pinned target SHA reached terminal and we've
+    // just notified — remove the watch instead of persisting/refreshing it.
+    // arch14: gated on SETTLEMENT — an unsettled exact-head watch (delivery
+    // failure held the cursors) is the only retry source and must stay armed;
+    // the quiet/already-notified removal path below is unchanged.
+    if settled && maybe_clear_exact_head_terminal(&ctx, &state, &pr) {
+        return Ok(());
+    }
     if state != snapshot {
         flush_watch_state(watch_path, &state, snapshot.generation_id.as_deref());
     }
@@ -1567,6 +1625,41 @@ async fn poll_ci_runs(
     state: &mut WatchState,
     provider: &dyn CiProvider,
 ) -> anyhow::Result<Option<PollResult>> {
+    // S1 exact-head: resolve the pinned target SHA via poll_runs_for_sha instead
+    // of the branch page. The branch page shows the CURRENT HEAD (which has
+    // advanced past the target after merge), so it can never prove the target
+    // SHA passed or failed — only the by-SHA query does.
+    if let Some(ref target_sha) = state.target_head_sha.clone() {
+        let sha_result = provider.poll_runs_for_sha(ctx.repo, target_sha).await?;
+        return match sha_result {
+            CiPollResult::ApiError {
+                status, message, ..
+            } => Err(anyhow::anyhow!("{status}: {message}")),
+            CiPollResult::Runs {
+                runs,
+                rate_limit_remaining,
+                rate_limit_limit,
+            } => {
+                if let Some(r) = rate_limit_remaining {
+                    state.rate_limit_remaining = Some(r);
+                }
+                if let Some(l) = rate_limit_limit {
+                    state.rate_limit_limit = Some(l);
+                }
+                clear_stall_state(state, ctx.home, ctx.repo, ctx.branch, ctx.subscribers);
+                if runs.is_empty() {
+                    return Ok(None);
+                }
+                let effective =
+                    effective_last_run_id(tracking.prev_head_sha, target_sha, tracking.last_run_id);
+                Ok(Some(PollResult {
+                    runs,
+                    current_sha: target_sha.clone(),
+                    effective_last_run_id: effective,
+                }))
+            }
+        };
+    }
     let poll_result = provider.poll_runs(ctx.repo, ctx.branch).await?;
     match poll_result {
         CiPollResult::ApiError {

@@ -141,6 +141,12 @@ pub struct WatchState {
     /// so `earliest_subscribed_at` (the normal age anchor) is None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unwatched_at: Option<String>,
+    /// S1 exact-head protected-main watch: an immutable full commit SHA this
+    /// watch is pinned to. When `Some`, this is a post-merge close-loop watch on
+    /// a protected ref — the poller resolves runs for this SHA specifically.
+    /// `None` on a normal PR watch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_head_sha: Option<String>,
 }
 
 fn default_branch() -> String {
