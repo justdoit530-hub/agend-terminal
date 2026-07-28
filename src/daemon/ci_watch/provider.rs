@@ -302,6 +302,21 @@ pub trait CiProvider: Send + Sync {
         None
     }
 
+    /// S1 exact-head: poll runs for a specific commit SHA. Used by exact-head
+    /// watches to resolve the target SHA's runs independently of the branch page.
+    /// Default: unsupported — callers fall back to branch-based polling.
+    async fn poll_runs_for_sha(
+        &self,
+        _repo: &str,
+        _sha: &str,
+    ) -> anyhow::Result<CiPollResult> {
+        Ok(CiPollResult::Runs {
+            runs: vec![],
+            rate_limit_remaining: None,
+            rate_limit_limit: None,
+        })
+    }
+
     /// Check whether the PR/MR for `branch` has reached a terminal state.
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState;
 

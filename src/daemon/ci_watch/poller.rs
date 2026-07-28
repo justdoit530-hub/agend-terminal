@@ -81,6 +81,14 @@ impl CiProvider for CachedCiProvider {
         self.inner.fetch_run_jobs(repo, run_id).await
     }
 
+    async fn poll_runs_for_sha(
+        &self,
+        repo: &str,
+        sha: &str,
+    ) -> anyhow::Result<super::provider::CiPollResult> {
+        self.inner.poll_runs_for_sha(repo, sha).await
+    }
+
     fn token_warning(&self) -> Option<&'static str> {
         self.inner.token_warning()
     }
