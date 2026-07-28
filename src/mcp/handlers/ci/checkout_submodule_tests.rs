@@ -1310,6 +1310,7 @@ fn checkout_rollback_vs_manual_release_applies_one_transition_s1() {
     let (bound_tx, bound_rx) = std::sync::mpsc::channel();
     let (commit_tx, commit_rx) = std::sync::mpsc::channel();
     let checkout_home = home.clone();
+    // fire-and-forget: test concurrency harness; JoinHandle stored in `checkout` and joined later in this test
     let checkout = std::thread::spawn(move || {
         let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
             if phase == crate::worktree_pool::ReleaseTestPhase::CheckoutBoundBeforeCommit {
@@ -1327,6 +1328,7 @@ fn checkout_rollback_vs_manual_release_applies_one_transition_s1() {
     let (snap_tx, snap_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let release_home = home.clone();
+    // fire-and-forget: test concurrency harness; JoinHandle stored in `release` and joined later in this test
     let release = std::thread::spawn(move || {
         let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
             if phase == crate::worktree_pool::ReleaseTestPhase::AfterBindingSnapshot {
