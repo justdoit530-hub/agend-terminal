@@ -72,12 +72,45 @@ pub(super) fn registered_detached_target(source_repo: &Path, target: &Path) -> b
     let Ok(target) = target.canonicalize() else {
         return false;
     };
-    let Ok(entries) = crate::git_worktree::list_porcelain_exact(source_repo) else {
+    let Ok(entries) = list_porcelain_exact(source_repo) else {
         return false;
     };
     entries.into_iter().any(|(path, branch)| {
         branch.is_none() && path.canonicalize().ok().as_ref() == Some(&target)
     })
+}
+
+fn list_porcelain_exact(source_repo: &Path) -> Result<Vec<(PathBuf, Option<String>)>, String> {
+    let out = crate::git_helpers::git_bypass(source_repo, &["worktree", "list", "--porcelain"])
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut records = Vec::new();
+    let mut cur_path: Option<PathBuf> = None;
+    let mut cur_branch: Option<String> = None;
+    let flush = |p: &mut Option<PathBuf>, b: &mut Option<String>, out: &mut Vec<_>| {
+        if let Some(path) = p.take() {
+            out.push((path, b.take()));
+        }
+        *b = None;
+    };
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut cur_path, &mut cur_branch, &mut records);
+            cur_path = Some(PathBuf::from(p.trim()));
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            cur_branch = Some(
+                b.trim()
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(b.trim())
+                    .to_string(),
+            );
+        }
+    }
+    flush(&mut cur_path, &mut cur_branch, &mut records);
+    Ok(records)
 }
 
 pub(super) fn require_clean_legacy_target(target: &Path) -> Result<(), String> {

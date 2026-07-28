@@ -6,14 +6,37 @@
 use std::path::{Path, PathBuf};
 
 mod legacy_release;
-use legacy_release::{
-    absent_release_outcome, legacy_flat_target_path, registered_detached_target,
-    require_clean_legacy_target,
-};
+use legacy_release::absent_release_outcome;
 
 pub(crate) struct NestedDirtDiscard<'a> {
     pub expected_digest: &'a str,
     pub audit_reason: &'a str,
+}
+
+pub(super) fn marker_source_repo(target: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(target.join(MANAGED_MARKER)).ok()?;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("source_repo=") {
+            let s = v.trim();
+            if !s.is_empty() {
+                return Some(PathBuf::from(s));
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn target_source_repo_matches(target: &Path, source_repo: &Path) -> bool {
+    let Ok(common) = source_from_git_common_dir(target) else {
+        return false;
+    };
+    let Ok(common_canon) = std::fs::canonicalize(common) else {
+        return false;
+    };
+    let Ok(source_canon) = std::fs::canonicalize(source_repo) else {
+        return false;
+    };
+    common_canon == source_canon
 }
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

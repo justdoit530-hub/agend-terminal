@@ -21,6 +21,19 @@ pub(crate) use release_guard::{
     snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
 };
 
+pub(crate) fn managed_marker_agent(target: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(target.join(".agend-managed")).ok()?;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("agent=") {
+            let s = v.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
 
 /// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
