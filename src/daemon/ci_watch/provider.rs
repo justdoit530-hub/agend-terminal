@@ -305,11 +305,7 @@ pub trait CiProvider: Send + Sync {
     /// S1 exact-head: poll runs for a specific commit SHA. Used by exact-head
     /// watches to resolve the target SHA's runs independently of the branch page.
     /// Default: unsupported — callers fall back to branch-based polling.
-    async fn poll_runs_for_sha(
-        &self,
-        _repo: &str,
-        _sha: &str,
-    ) -> anyhow::Result<CiPollResult> {
+    async fn poll_runs_for_sha(&self, _repo: &str, _sha: &str) -> anyhow::Result<CiPollResult> {
         Ok(CiPollResult::Runs {
             runs: vec![],
             rate_limit_remaining: None,
@@ -588,6 +584,77 @@ impl CiProvider for GitHubCiProvider {
             })
         }
         .await)
+    }
+
+    /// S1 exact-head: query Actions runs for a specific commit SHA via
+    /// `repos/{repo}/actions/runs?head_sha={sha}`. Used by exact-head watches
+    /// to resolve the target SHA's CI state independently of the branch page
+    /// (the branch HEAD advances past the target after merge, so branch-page
+    /// runs belong to the newer commit).
+    async fn poll_runs_for_sha(&self, repo: &str, sha: &str) -> anyhow::Result<CiPollResult> {
+        let resp = self
+            .http
+            .get(&format!(
+                "repos/{repo}/actions/runs?head_sha={sha}&per_page={POLL_RUNS_PAGE_SIZE}"
+            ))
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let rate_limit_reset = resp
+            .headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
+        let parse_u64_header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+        };
+        let rate_limit_remaining = parse_u64_header("x-ratelimit-remaining");
+        let rate_limit_limit = parse_u64_header("x-ratelimit-limit");
+        let body: serde_json::Value = resp.json().await?;
+        if !(200..300).contains(&status) {
+            let message = body["message"]
+                .as_str()
+                .unwrap_or("(no message)")
+                .to_string();
+            let hint = if status == 403
+                && crate::github_token::cached_token().is_none()
+                && message.to_lowercase().contains("rate limit")
+            {
+                " — set GITHUB_TOKEN or run `gh auth login` to raise the unauthenticated 60/hr cap"
+            } else {
+                ""
+            };
+            return Ok(CiPollResult::ApiError {
+                status,
+                message: format!("GH API {status}: {message}{hint}"),
+                rate_limit_reset,
+            });
+        }
+        let runs = body["workflow_runs"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        Some(CiRun {
+                            id: r["id"].as_u64()?,
+                            conclusion: r["conclusion"].as_str().map(String::from),
+                            head_sha: r["head_sha"].as_str()?.to_string(),
+                            url: r["html_url"].as_str().unwrap_or("").to_string(),
+                            name: r["name"].as_str().unwrap_or("").to_string(),
+                            run_attempt: r["run_attempt"].as_u64().unwrap_or(1),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(CiPollResult::Runs {
+            runs,
+            rate_limit_remaining,
+            rate_limit_limit,
+        })
     }
 
     async fn check_pr_terminal(&self, repo: &str, branch: &str) -> PrState {

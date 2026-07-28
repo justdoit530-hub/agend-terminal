@@ -1650,11 +1650,8 @@ async fn poll_ci_runs(
                 if runs.is_empty() {
                     return Ok(None);
                 }
-                let effective = effective_last_run_id(
-                    tracking.prev_head_sha,
-                    target_sha,
-                    tracking.last_run_id,
-                );
+                let effective =
+                    effective_last_run_id(tracking.prev_head_sha, target_sha, tracking.last_run_id);
                 Ok(Some(PollResult {
                     runs,
                     current_sha: target_sha.clone(),
