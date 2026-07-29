@@ -536,6 +536,7 @@ fn remove_worktree(agent: &str, wt_path: &Path, source_repo: &Path) -> WorktreeR
 }
 
 mod workspace;
+pub(crate) use workspace::prepare_workspace_worktree_with_permit;
 pub(crate) use workspace::worktree_has_work_at_risk;
 #[allow(unused_imports)]
 pub use workspace::{
