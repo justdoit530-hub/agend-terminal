@@ -1935,4 +1935,62 @@ mod tests {
              not a raw drain-lock `try_acquire_file_lock` — see #2666 / flake recurrence #3"
         );
     }
+
+    /// #2967 RED: `sync_notification_state` must perform exactly ONE
+    /// queue-directory `read_dir` per pass, across ALL panes/tabs — not one
+    /// per pane.
+    #[test]
+    fn sync_notification_state_performs_exactly_one_dir_scan_2967() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-test-sync-notif-dirscan-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::create_dir_all(&home);
+
+        let mut layout = crate::layout::Layout::new();
+        fn pane(name: &str) -> crate::app::Pane {
+            crate::app::Pane {
+                agent_name: name.into(),
+                instance_id: crate::types::InstanceId::default(),
+                vterm: crate::vterm::VTerm::new(10, 10),
+                rx: crossbeam_channel::bounded(1).1,
+                id: 1,
+                backend: None,
+                working_dir: None,
+                display_name: None,
+                scroll_offset: 0,
+                has_notification: false,
+                fleet_instance_name: None,
+                last_input_at: None,
+                pending_notification_count: 0,
+                selection: None,
+                source: crate::app::PaneSource::Local,
+                offthread: None,
+                _fwd_cancel: None,
+            }
+        }
+        layout
+            .tabs
+            .push(crate::layout::Tab::new("tab0".into(), pane("agent0")));
+        layout.tabs[0].split_focused(crate::layout::SplitDir::Horizontal, pane("agent1"));
+        layout
+            .tabs
+            .push(crate::layout::Tab::new("tab1".into(), pane("agent2")));
+        layout.tabs[1].split_focused(crate::layout::SplitDir::Horizontal, pane("agent3"));
+        layout
+            .tabs
+            .push(crate::layout::Tab::new("tab2".into(), pane("agent4")));
+
+        reset_scan_counters();
+        crate::app::sync_notification_state(&home, &mut layout);
+
+        assert_eq!(
+            dir_scan_count(),
+            1,
+            "a sync_notification_state pass over 5 panes must perform exactly ONE \
+             queue-directory read_dir, not one per pane"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

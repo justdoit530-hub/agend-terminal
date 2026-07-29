@@ -16,7 +16,10 @@
 //! resolve + sidecar lifecycle); hook-site precedent is #870 in
 //! `auto_release` (handle_send post-enqueue).
 
+pub(crate) mod pending_scan;
 pub(crate) mod team_nudge;
+
+pub(crate) use pending_scan::*;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -411,36 +414,6 @@ pub(crate) fn record_dispatch(
         }
     }
     Some(dispatch_id)
-}
-
-/// Read all pending dispatch sidecars from disk. Forward-compat: skips
-/// any sidecar whose `schema_version` is unknown.
-pub(crate) fn list_pending(home: &Path) -> Vec<PendingDispatch> {
-    note_list_pending();
-
-    let dir = pending_dir(home);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(d) = serde_json::from_str::<PendingDispatch>(&content) else {
-            continue;
-        };
-        if d.schema_version != SCHEMA_VERSION {
-            continue;
-        }
-        out.push(d);
-    }
-    out.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
-    out
 }
 
 fn write_dispatch(home: &Path, d: &PendingDispatch) -> bool {
@@ -1521,29 +1494,6 @@ impl DispatchIdleTracker {
         scan_and_emit(home);
         true
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    static LIST_PENDING_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn note_list_pending() {
-    LIST_PENDING_CALLS.with(|count| count.set(count.get() + 1));
-}
-
-#[cfg(not(test))]
-fn note_list_pending() {}
-
-#[cfg(test)]
-pub(crate) fn reset_list_pending_call_count() {
-    LIST_PENDING_CALLS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn take_list_pending_call_count() -> usize {
-    LIST_PENDING_CALLS.with(|count| count.replace(0))
 }
 
 #[cfg(test)]

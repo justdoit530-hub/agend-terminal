@@ -992,9 +992,7 @@ fn pane_input_contains_submit(backend: Option<&crate::backend::Backend>, bytes: 
     bytes.windows(submit.len()).any(|w| w == submit)
 }
 
-fn sync_notification_state(home: &Path, layout: &mut Layout) {
-    // #2967/#2978: ONE read_dir of the queue directory per pass — was one
-    // `pending_count` (its own read_dir) per PANE, every ~1s.
+pub(crate) fn sync_notification_state(home: &Path, layout: &mut Layout) {
     let snapshot = notification_queue::QueueDirSnapshot::scan(home);
     for tab in &mut layout.tabs {
         let pane_ids = tab.root().pane_ids();
@@ -2089,68 +2087,6 @@ mod tests {
         for h in app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false))) {
             h.run(&ctx); // panic here = test failure
         }
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    fn pane(name: &str) -> Pane {
-        Pane {
-            agent_name: name.into(),
-            instance_id: crate::types::InstanceId::default(),
-            vterm: VTerm::new(10, 10),
-            rx: crossbeam_channel::bounded(1).1,
-            id: 1,
-            backend: None,
-            working_dir: None,
-            display_name: None,
-            scroll_offset: 0,
-            has_notification: false,
-            fleet_instance_name: None,
-            last_input_at: None,
-            pending_notification_count: 0,
-            selection: None,
-            source: PaneSource::Local,
-            offthread: None,
-            _fwd_cancel: None,
-        }
-    }
-
-    /// #2967 RED: `sync_notification_state` must perform exactly ONE
-    /// queue-directory `read_dir` per pass, across ALL panes/tabs — not one
-    /// per pane (the shape the #84833-15 comment above `NOTIF_SYNC_INTERVAL`
-    /// already documents). Pre-fix (`pending_count` called per pane, each
-    /// doing its own `list_draining_files` `read_dir`) this fails with N
-    /// (here 5, spread across 3 tabs); post-fix
-    /// (`QueueDirSnapshot::scan` once, `pending_count` reading from the
-    /// snapshot) it is exactly 1. Every agent is idle (nothing queued) so no
-    /// content read is exercised here — this test is purely about the
-    /// `read_dir` count.
-    #[test]
-    fn sync_notification_state_performs_exactly_one_dir_scan_2967() {
-        let home = tmp_home("sync-notif-dirscan");
-        let mut layout = Layout::new();
-        // 5 panes across 3 tabs, each a distinct agent — mirrors a real
-        // multi-tab fleet session.
-        layout
-            .tabs
-            .push(crate::layout::Tab::new("tab0".into(), pane("agent0")));
-        layout.tabs[0].split_focused(crate::layout::SplitDir::Horizontal, pane("agent1"));
-        layout
-            .tabs
-            .push(crate::layout::Tab::new("tab1".into(), pane("agent2")));
-        layout.tabs[1].split_focused(crate::layout::SplitDir::Horizontal, pane("agent3"));
-        layout
-            .tabs
-            .push(crate::layout::Tab::new("tab2".into(), pane("agent4")));
-
-        notification_queue::reset_scan_counters();
-        sync_notification_state(&home, &mut layout);
-
-        assert_eq!(
-            notification_queue::dir_scan_count(),
-            1,
-            "a sync_notification_state pass over 5 panes must perform exactly ONE \
-             queue-directory read_dir, not one per pane"
-        );
         std::fs::remove_dir_all(&home).ok();
     }
 
