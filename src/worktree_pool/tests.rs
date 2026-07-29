@@ -4412,7 +4412,6 @@ fn live_task_review_branch_records_retry_intent_3090() {
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
 }
-
 /// Transition a seeded task to Done — the terminal state
 /// `reconcile_terminal_review_intents` requires. Cancelled is deliberately not
 /// used here: its semantics are unchanged by this fix.

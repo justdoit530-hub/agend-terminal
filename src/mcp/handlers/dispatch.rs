@@ -1916,6 +1916,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn try_dispatch_rejects_send_without_message_or_message_from_file() {
+        // Handler-level send rejects when neither message nor
+        // message_from_file is present (after selector/invariant checks pass).
+        // Supply a valid sender (real fleet identity) to bypass the
+        // identity gate and hit the message-validity gate.
+        let home = std::env::temp_dir();
+        let args = json!({"instance": "target"}); // valid selector, no message
+        let ctx = HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "alpha",
+            sender: &Some(crate::identity::Sender::new("alpha").expect("valid sender name")),
+            runtime: None,
+        };
+        let result = super::try_dispatch("send", &ctx).expect("registered tool returns Some");
+        assert_eq!(
+            result["error"], "missing or empty 'message'",
+            "send must reject with no message or message_from_file: {result}"
+        );
+    }
+
+    // Machine-checkable schema test: message/message_from_file must use
+    // anyOf so that "at least one is required" is expressible in JSON Schema.
+    #[test]
+    fn schema_has_anyof_message_from_file() {
+        use crate::mcp::tools::*;
+        let reply = def_reply();
+        let send = def_send();
+        for (name, def) in [("reply", &reply), ("send", &send)] {
+            let schema = &def["inputSchema"];
+            assert!(
+                schema.get("anyOf").is_some(),
+                "{name} schema must have an anyOf clause"
+            );
+            let any_of = schema["anyOf"].as_array().unwrap();
+            assert_eq!(any_of.len(), 2);
+        }
+    }
 }
 
 #[cfg(test)]

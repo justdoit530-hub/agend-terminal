@@ -699,7 +699,14 @@ fn resolve_branch_cleanup(
         let (deleted, skip_reason) =
             cleanup_merged_branch(Path::new(sr_str), branch, dry_run, authority_proven_head);
         out.branch_deleted = deleted;
-        out.branch_cleanup_skipped_reason = skip_reason;
+        out.branch_cleanup_skipped_reason = skip_reason.clone();
+        // Cleanup intent: clean feature branch released pre-merge → persist
+        // intent so it can be settled on pr-merged event or periodic sweep.
+        // Dirty branches get no intent (preserved permanently).
+        if !deleted && !was_dirty && !dry_run {
+            out.intent_persist_error =
+                crate::cleanup_intents::persist_release_intent(home, sr_str, branch, task_id);
+        }
     } else if branch.is_empty() {
         out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());
     } else {
