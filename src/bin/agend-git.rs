@@ -2213,7 +2213,11 @@ fn resolve_real_git() -> String {
             return path;
         }
     }
-    for known in &["/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git"] {
+    for known in &[
+        "/usr/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ] {
         if std::path::Path::new(known).exists() {
             return (*known).to_string();
         }
