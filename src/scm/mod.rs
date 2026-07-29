@@ -86,23 +86,12 @@ pub(crate) struct ListFilter {
 }
 
 /// Options for [`ScmProvider::pr_merge`] (site 3).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct MergeOpts {
     pub admin: bool,
     pub squash: bool,
     pub delete_branch: bool,
     pub expected_head_sha: Option<String>,
-}
-
-impl Default for MergeOpts {
-    fn default() -> Self {
-        Self {
-            admin: false,
-            squash: false,
-            delete_branch: false,
-            expected_head_sha: None,
-        }
-    }
 }
 
 /// Result of [`ScmProvider::pr_merge`]. `Submitted` means `gh pr merge`
