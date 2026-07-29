@@ -97,9 +97,9 @@ pub(crate) struct MergeOpts {
 impl Default for MergeOpts {
     fn default() -> Self {
         Self {
-            admin: true,
-            squash: true,
-            delete_branch: true,
+            admin: false,
+            squash: false,
+            delete_branch: false,
             expected_head_sha: None,
         }
     }
