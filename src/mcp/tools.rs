@@ -140,7 +140,7 @@ pub(crate) fn def_create_instance() -> Value {
     json!({"name": "create_instance", "description": "Create agent instance(s). Team modes: (a) homogeneous — count:3, backend:\"claude\", team:\"dev\" → dev-1..dev-3 all claude; (b) heterogeneous — backends:[\"codex\",\"kiro-cli\",\"agy\"], team:\"mixed\" → mixed-1=codex, mixed-2=kiro-cli, mixed-3=agy, all grouped in one tab.",
     "inputSchema": {"type": "object", "properties": {
         "name": {"type": "string", "description": "Instance name (single instance) or base name (ignored when team is set — team name is used as prefix)"},
-        "backend": {"type": "string", "description": "Backend CLI name: claude, agy, kiro-cli, codex, opencode"},
+        "backend": {"type": "string", "description": "Backend CLI name: claude, agy, kiro-cli, codex, opencode, grok"},
         "args": {"type": "string", "description": "Extra CLI arguments"},
         "model": {"type": "string", "description": "Concrete model override (e.g. --model flag). Wins over model_tier."},
         "model_tier": {"type": "string", "description": "Symbolic model tier key from fleet.yaml model_tiers (e.g. cheap/strong). Used when model is omitted; lets leads spawn mechanical-task workers on cheaper models (#2477)."},
@@ -511,6 +511,26 @@ mod tests {
                 .expect("desc")
                 .contains("claude"),
             "backend description should list available CLI names"
+        );
+    }
+
+    #[test]
+    fn create_instance_backend_schema_lists_all_canonical_commands() {
+        let definition = def_create_instance();
+        let description = definition["inputSchema"]["properties"]["backend"]["description"]
+            .as_str()
+            .expect("backend description");
+
+        for backend in crate::backend::Backend::all() {
+            let command = backend.preset().command;
+            assert!(
+                description.contains(command),
+                "create_instance backend schema must advertise canonical command '{command}'"
+            );
+        }
+        assert!(
+            description.contains("grok"),
+            "create_instance backend schema must advertise the Grok CLI"
         );
     }
 
