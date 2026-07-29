@@ -1949,8 +1949,8 @@ mod tests {
         let _ = std::fs::create_dir_all(&home);
 
         let mut layout = crate::layout::Layout::new();
-        fn pane(name: &str) -> crate::app::Pane {
-            crate::app::Pane {
+        fn pane(name: &str) -> crate::layout::Pane {
+            crate::layout::Pane {
                 agent_name: name.into(),
                 instance_id: crate::types::InstanceId::default(),
                 vterm: crate::vterm::VTerm::new(10, 10),
@@ -1965,7 +1965,7 @@ mod tests {
                 last_input_at: None,
                 pending_notification_count: 0,
                 selection: None,
-                source: crate::app::PaneSource::Local,
+                source: crate::layout::PaneSource::Local,
                 offthread: None,
                 _fwd_cancel: None,
             }

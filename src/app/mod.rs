@@ -2089,6 +2089,27 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
     }
+    fn pane(name: &str) -> Pane {
+        Pane {
+            agent_name: name.into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        }
+    }
 
     /// #982 RC wiring-pin: assert `flush_idle_notifications` invokes
     /// the submit-aware injector (`inject_notification_with_submit`)
