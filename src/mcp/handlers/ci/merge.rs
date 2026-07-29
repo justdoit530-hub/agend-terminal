@@ -1,6 +1,112 @@
 use serde_json::{json, Value};
 use std::path::Path;
 
+/// Post-merge receipt persistence + actionable exact-head watch auto-arm.
+/// Separated for testability — the merge handler calls this after
+/// `MergeVerdict::Confirmed`. Returns diagnostic fields to embed in the
+/// merge response. Merge success is truthful regardless of this outcome.
+///
+/// `pr_branch`: the PR's source branch (headRefName). Used to find the
+/// task assignee whose binding matches this branch — NOT the merge caller,
+/// because the merge caller is typically the orchestrator (unbound).
+pub(crate) fn post_merge_receipt_and_watch(
+    home: &Path,
+    repo: &str,
+    merge_commit: &str,
+    pr: u64,
+    pr_branch: &str,
+    merge_authority: &str,
+) -> Value {
+    let Some((assignee, task_id)) = resolve_task_assignee_for_branch(home, repo, pr_branch) else {
+        return json!({"skipped": "no task-linked binding for PR branch"});
+    };
+    let expiry =
+        chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
+    let receipt = crate::merge_receipt::MergeReceipt {
+        repo: repo.to_string(),
+        merge_sha: merge_commit.to_string(),
+        task_id: task_id.clone(),
+        task_assignee: assignee.clone(),
+        merge_authority: merge_authority.to_string(),
+        pr_number: pr,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        expires_at: expiry.to_rfc3339(),
+    };
+    if let Err(e) = crate::merge_receipt::persist(home, &receipt) {
+        return json!({"receipt_error": format!("receipt persist failed: {e}")});
+    }
+    let next_after_ci = if merge_authority.is_empty() {
+        assignee.as_str()
+    } else {
+        merge_authority
+    };
+    let watch_result = handle_watch_ci(
+        home,
+        &json!({
+            "repository": repo,
+            "branch": "main",
+            "head_sha": merge_commit,
+            "task_id": &task_id,
+            "next_after_ci": [next_after_ci],
+        }),
+        "",
+    );
+    if watch_result.get("error").is_some() {
+        json!({
+            "receipt": "persisted",
+            "assignee": &assignee,
+            "watch_error": watch_result["error"],
+        })
+    } else {
+        json!({
+            "receipt": "persisted",
+            "assignee": &assignee,
+            "watch": "armed",
+        })
+    }
+}
+
+/// Resolve the task assignee for a PR branch by scanning all bindings.
+/// Returns `(agent_name, task_id)` or `None` if no unique match.
+/// Fail-closed: ambiguity (multiple matches), no match, or repo
+/// mismatch → None. Requires canonical repo + branch + non-empty task_id.
+fn resolve_task_assignee_for_branch(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+) -> Option<(String, String)> {
+    if branch.is_empty() || repo.is_empty() {
+        return None;
+    }
+    let repo_lower = repo.to_lowercase();
+    let bindings = crate::binding::binding_scan_all(home);
+    let mut matches: Vec<(String, String)> = Vec::new();
+    for (agent, binding) in &bindings {
+        let b_branch = binding["branch"].as_str().unwrap_or("");
+        let b_task = binding["task_id"].as_str().unwrap_or("");
+        if b_branch != branch || b_task.is_empty() {
+            continue;
+        }
+        let b_source = binding["source_repo"].as_str().unwrap_or("");
+        if b_source.is_empty() {
+            continue;
+        }
+        let b_slug = crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(
+            std::path::Path::new(b_source),
+        );
+        let repo_matches = b_slug
+            .as_deref()
+            .is_some_and(|s| s.to_lowercase() == repo_lower);
+        if repo_matches {
+            matches.push((agent.clone(), b_task.to_string()));
+        }
+    }
+    if matches.len() == 1 {
+        Some(matches.remove(0))
+    } else {
+        None
+    }
+}
 /// #1467: outcome of post-merge verification via `gh pr view`.
 pub(crate) enum MergeVerdict {
     /// PR confirmed merged: `state == "MERGED"` AND a non-empty merge commit
