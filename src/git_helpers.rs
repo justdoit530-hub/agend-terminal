@@ -82,9 +82,13 @@ pub(crate) fn git_bypass_timeout(
         }
     }
     let mut cmd = std::process::Command::new("git");
+    let real_git = std::env::var("AGEND_REAL_GIT")
+        .or_else(|_| std::env::var("AGENTIC_GIT_REAL_GIT"))
+        .unwrap_or_else(|_| "/usr/bin/git".into());
     cmd.args(args)
         .current_dir(cwd)
         .env("AGEND_GIT_BYPASS", "1")
+        .env("AGEND_REAL_GIT", &real_git)
         .env("LC_ALL", "C")
         .env("LANG", "C");
     spawn_group_bounded(cmd, &format!("git {:?}", &args[..1]), timeout)

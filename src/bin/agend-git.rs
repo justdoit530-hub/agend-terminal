@@ -1595,7 +1595,7 @@ fn log_bypass_mutating_op(home: &str, agent: &str, args: &[String]) {
 /// committer identity the heartbeat commit will carry. Invokes the real git
 /// (AGEND_REAL_GIT) to avoid recursing through this shim.
 fn effective_git_email(cwd: &str) -> Option<String> {
-    let real_git = env::var("AGEND_REAL_GIT").unwrap_or_else(|_| "git".to_string());
+    let real_git = resolve_real_git();
     let out = std::process::Command::new(real_git)
         .args(["-C", cwd, "config", "user.email"])
         .output()
@@ -2208,14 +2208,23 @@ fn resolve_real_git() -> String {
             return path;
         }
     }
-    // Priority 2: which excluding $AGEND_HOME/bin/ (the shim dir).
-    // #1504 L2: exclude via canonicalized Path comparison, not a string compare.
-    // `format!("{h}/bin")` (forward slash) never matched a Windows PATH entry
-    // (backslash / case / trailing-slash), so the shim failed to exclude itself
-    // and `which_in` resolved git back to THIS binary → recursive-spawn storm.
-    // With L1 fixed the daemon injects AGEND_REAL_GIT and Priority 1 above
-    // short-circuits, so this fallback rarely runs — but it must be correct when
-    // it does. `split_paths` also gives the right separator + drive-colon handling.
+    if let Ok(path) = env::var("AGENTIC_GIT_REAL_GIT") {
+        if !path.is_empty() && std::path::Path::new(&path).exists() {
+            return path;
+        }
+    }
+    for known in &[
+        "/usr/bin/git",
+        "/usr/local/bin/git",
+        "/opt/homebrew/bin/git",
+    ] {
+        if std::path::Path::new(known).exists() {
+            return (*known).to_string();
+        }
+    }
+    // Priority 2: which excluding $AGEND_HOME/bin (shim dir). #1504 L2 uses
+    // canonical Path compare — string `format!("{h}/bin")` missed Windows PATH
+    // entries and recursed into this binary. AGEND_REAL_GIT usually short-circuits.
     let agend_bin: Option<PathBuf> =
         env::var_os("AGEND_HOME").map(|h| PathBuf::from(h).join("bin"));
     let path_os = env::var_os("PATH").unwrap_or_default();

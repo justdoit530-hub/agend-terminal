@@ -41,6 +41,7 @@ pub(crate) struct PrSummary {
     pub author_login: Option<String>,
     pub head_ref: Option<String>,
     pub head_ref_oid: Option<String>,
+    pub base_ref_oid: Option<String>,
     /// #1750-B4: GitHub's `isCrossRepository` — true when the PR's head branch
     /// lives in a FORK, not the base repo. A cross-repo head_ref can collide
     /// with a base-repo branch name, so remote-orphan GC must never treat it as
@@ -85,11 +86,12 @@ pub(crate) struct ListFilter {
 }
 
 /// Options for [`ScmProvider::pr_merge`] (site 3).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct MergeOpts {
     pub admin: bool,
     pub squash: bool,
     pub delete_branch: bool,
+    pub expected_head_sha: Option<String>,
 }
 
 /// Result of [`ScmProvider::pr_merge`]. `Submitted` means `gh pr merge`
@@ -255,6 +257,10 @@ fn pr_merge_args(repo: &str, pr: u64, opts: &MergeOpts) -> Vec<String> {
     if opts.delete_branch {
         a.push("--delete-branch".into());
     }
+    if let Some(ref sha) = opts.expected_head_sha {
+        a.push("--match-head-commit".into());
+        a.push(sha.clone());
+    }
     a
 }
 
@@ -300,6 +306,7 @@ fn parse_pr_summary(v: &Value) -> PrSummary {
         author_login: v["author"]["login"].as_str().map(String::from),
         head_ref: v["headRefName"].as_str().map(String::from),
         head_ref_oid: v["headRefOid"].as_str().map(String::from),
+        base_ref_oid: v["baseRefOid"].as_str().map(String::from),
         is_cross_repository: v["isCrossRepository"].as_bool(),
         is_draft: v["isDraft"].as_bool(),
         merged_at: nonempty("mergedAt"),
@@ -1048,6 +1055,7 @@ mod tests {
                     admin: true,
                     squash: true,
                     delete_branch: true,
+                    ..Default::default()
                 }
             ),
             vec![

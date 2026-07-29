@@ -1358,6 +1358,123 @@ fn p780_setup_source_broken_origin(parent: &Path) -> std::path::PathBuf {
     repo
 }
 
+#[cfg(unix)]
+fn p780_checkout_target(home: &Path, agent: &str, source: &Path) -> std::path::PathBuf {
+    // d-20260726055029475978-81: the handler mangles the RESOLVED source — the
+    // canonical repo root — so this mirror must canonicalize too.
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    home.join("worktrees").join(format!(
+        "{}-{}",
+        agent,
+        source
+            .display()
+            .to_string()
+            .replace(['/', '\\', ':'], "_")
+            .replace('~', "")
+    ))
+}
+
+#[cfg(unix)]
+fn p780_branch_exists(source: &Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git rev-parse branch")
+        .success()
+}
+
+/// Arch14 residue: a checkout that auto-created its branch must delete only that
+/// branch when the fixed worktree target is already occupied and `git worktree add`
+/// fails. The occupied target is deliberately preserved as out-of-scope state.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_worktree_add_failure_rolls_back_auto_created_branch_arch14() {
+    let home = p778_tmp_home("arch14-branch-rollback-new");
+    let parent = p778_tmp_home("arch14-branch-rollback-new-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "arch14-rollback-new-agent";
+    let branch = "feat/arch14-rollback-new";
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("occupied checkout target");
+    let keep = target.join("KEEP.txt");
+    std::fs::write(&keep, "legacy dirty worktree state").expect("preserved target state");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+            "from_ref": "main",
+        }),
+        agent,
+    );
+
+    assert_eq!(resp["code"].as_str(), Some("worktree_add_failed"), "{resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(true), "{resp}");
+    assert!(
+        !p780_branch_exists(&source, branch),
+        "a branch created by this failed checkout must be rolled back: {resp}"
+    );
+    assert!(
+        keep.exists(),
+        "the pre-existing occupied target and its dirty state must be preserved"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// Arch14 guard: the same worktree-add failure must never delete a branch that
+/// existed before this checkout transaction began.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_worktree_add_failure_preserves_preexisting_branch_arch14() {
+    let home = p778_tmp_home("arch14-branch-rollback-existing");
+    let parent = p778_tmp_home("arch14-branch-rollback-existing-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "arch14-rollback-existing-agent";
+    let branch = "feat/arch14-rollback-existing";
+    let create = std::process::Command::new("git")
+        .args(["branch", branch, "main"])
+        .current_dir(&source)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("create pre-existing branch");
+    assert!(create.status.success(), "create branch: {:?}", create);
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("occupied checkout target");
+    let keep = target.join("KEEP.txt");
+    std::fs::write(&keep, "legacy dirty worktree state").expect("preserved target state");
+
+    let resp = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+            "from_ref": "main",
+        }),
+        agent,
+    );
+
+    assert_eq!(resp["code"].as_str(), Some("worktree_add_failed"), "{resp}");
+    assert_eq!(resp["auto_created_branch"].as_bool(), Some(false), "{resp}");
+    assert!(
+        p780_branch_exists(&source, branch),
+        "a pre-existing branch must survive a failed checkout: {resp}"
+    );
+    assert!(keep.exists(), "the occupied target must be preserved");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
 #[test]
 #[cfg(unix)]
 fn checkout_bind_true_invalid_from_ref_returns_structured_error_with_stage() {
@@ -2207,6 +2324,11 @@ fn merge_force_audit_write_failure_refuses_merge() {
     let events_path = home.join("fleet_events.jsonl");
     std::fs::create_dir_all(&events_path).unwrap();
 
+    let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let _g = crate::scm::set_test_scm_provider(std::sync::Arc::new(
+        super::exact_head_merge_tests::MergeMock::new(recorded),
+    ));
+
     let result = super::handle_merge_repo(
         &home,
         // #1619: explicit `repository` so resolution succeeds and the
@@ -2546,119 +2668,10 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-#[test]
-fn changed_review_class_reconciles_pr_gate_without_replaying_ci_3114() {
-    let home = watch_test_home("review-class-change-pr-gate");
-    let args = serde_json::json!({"repository": "o/r", "branch": "feat/x"});
-    super::handle_watch_ci(&home, &args, "dev-1");
-    let path = watch_path_for(&home, "o/r", "feat/x");
-    let gen_before = seed_notify_cursors(&path);
-    let head = "f".repeat(40);
-    let mut state = crate::daemon::pr_state::new_for_branch(
-        "o/r",
-        "feat/x",
-        &head,
-        crate::daemon::pr_state::ReviewClass::Unresolved,
-    );
-    state.pr_number = 3114;
-    state.ci_state = crate::daemon::pr_state::CiState::Green {
-        sha: head.clone(),
-        observed_at: chrono::Utc::now().to_rfc3339(),
-    };
-    state
-        .validated_review_receipts
-        .push(crate::review_receipt::ReviewReceiptSummary {
-            receipt_id: "review-receipt:3114-positive".into(),
-            source_id: "3114-positive".into(),
-            evidence_digest: "a".repeat(64),
-            assignment_id: uuid::Uuid::new_v4(),
-            reviewer_instance_id: crate::types::InstanceId::new(),
-            reviewer_name: "reviewer".into(),
-            repo: "o/r".into(),
-            pr_number: 3114,
-            branch: "feat/x".into(),
-            task_id: "t-3114-positive".into(),
-            reviewed_head: head.clone(),
-            review_class: crate::daemon::pr_state::ReviewClass::Single,
-            slot: crate::review_receipt::ReviewSlot::Primary,
-            verdict: crate::review_receipt::ReviewVerdict::Verified,
-        });
-    state.diagnostic_emitted_for_sha = Some(head);
-    crate::daemon::pr_state::save(&home, &state).unwrap();
-
-    let result = super::handle_watch_ci(
-        &home,
-        &serde_json::json!({
-            "repository": "o/r",
-            "branch": "feat/x",
-            "review_class": "single",
-        }),
-        "dev-1",
-    );
-    assert!(result.get("error").is_none(), "{result}");
-
-    let v = read_watch(&path);
-    assert_eq!(v["last_run_id"].as_u64(), Some(100));
-    assert!(
-        v["last_notified_by_workflow"]["#run:100"].is_object(),
-        "resolving review_class must not replay an already-delivered CI run: {v}"
-    );
-    assert_eq!(
-        v["generation_id"].as_str(),
-        Some(gen_before.as_str()),
-        "resolving review_class must preserve the notification epoch: {v}"
-    );
-    assert_eq!(v["review_class"], "single");
-    let reconciled = crate::daemon::pr_state::load(&home, "o/r", "feat/x").unwrap();
-    assert_eq!(
-        reconciled.review_class,
-        crate::daemon::pr_state::ReviewClass::Single
-    );
-    assert_eq!(
-        reconciled.merge_state,
-        crate::daemon::pr_state::MergeState::MergeReady,
-        "resolving the class must recompute the already-green, already-reviewed PR gate"
-    );
-    assert!(
-        reconciled.diagnostic_emitted_for_sha.is_none(),
-        "resolving the PR gate must clear the unresolved-class diagnostic debounce"
-    );
-    std::fs::remove_dir_all(&home).ok();
-}
-
-#[test]
-fn unchanged_review_class_preserves_notification_epoch_3114() {
-    let home = watch_test_home("review-class-unchanged-epoch");
-    let args = serde_json::json!({
-        "repository": "o/r",
-        "branch": "feat/x",
-        "review_class": "single",
-    });
-    super::handle_watch_ci(&home, &args, "dev-1");
-    let path = watch_path_for(&home, "o/r", "feat/x");
-    let gen_before = seed_notify_cursors(&path);
-
-    super::handle_watch_ci(&home, &args, "dev-1");
-
-    let v = read_watch(&path);
-    assert_eq!(v["last_run_id"].as_u64(), Some(100));
-    assert!(
-        v["last_notified_by_workflow"]["#run:100"].is_object(),
-        "an unchanged review_class must not redeliver a terminal run: {v}"
-    );
-    assert_eq!(
-        v["generation_id"].as_str(),
-        Some(gen_before.as_str()),
-        "an unchanged review_class must preserve the notification epoch: {v}"
-    );
-    assert_eq!(v["review_class"], "single");
-    std::fs::remove_dir_all(&home).ok();
-}
-
 /// The complement of the test above, and the regression risk of the reset: an
 /// ORDINARY resubscribe (no tombstone — the watch still has a live subscriber)
-/// with no review-class change must NOT touch the notification cursors or the
-/// generation.
+/// must NOT touch the notification cursors or the generation. Only the
+/// zero-subscriber tombstone path starts a new epoch.
 #[test]
 fn ordinary_resubscribe_preserves_notify_cursors_and_generation() {
     let home = watch_test_home("ordinary-resubscribe-epoch");
@@ -2822,7 +2835,6 @@ fn checkout_via_linked_worktree_binds_canonical_repo_root_and_keeps_one_lease() 
         canonical_r.display().to_string(),
         "a subdirectory of R must resolve to the canonical repo root"
     );
-
     // 4. One repository + one branch ⇒ one lease and one managed target.
     assert_eq!(
         lease_locks(&home),

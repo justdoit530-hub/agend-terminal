@@ -6,15 +6,12 @@
 格式基於 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)；專案遵循 [SemVer](https://semver.org/spec/v2.0.0.html)。
 
 ## [Unreleased]
-
 ### Fixed
 
 - **`fleet.yaml` mutation 不再抹除 operator 註解** — team 與 instance 更新會依原順序保留註解文字；由於語意化 YAML 序列化仍會正規化呈現方式，保留的註解會集中到文件開頭，不承諾維持原本的縮排或 key 歸屬（#3111）。
 - **移除未使用的 transcript context estimator** — 刪除未被呼叫的實作與測試；基於 statusline 的 context 回報與警報行為維持不變（#3100 Phase A）。
 - **解決 CI watch 的 review class 後不再卡住 merge gate** — 明確的 class 現在會直接修復既有的 unresolved PR state，不會重送已交付的 CI 結果或 `ci-ready` handoff（#3114）。
-
-## [0.11.3] — 2026-07-26
-
+- **`waiting_on` 過期警報不再重複發送或錯投** — 警報改投遞至 instance 設定的名稱（確保能進 agent inbox 與 team orchestrator），並遵守 30 分鐘重報間隔，同時跳過已不存在於 fleet 的舊 instance metadata（#3077）。
 ### Changed
 
 - **移除已過期的環境變數別名** — watchdog 拓樸現在只讀 `fleet.yaml` 的 `watchdog:` 區塊；worktree 封存 fallback 只讀 `AGEND_WORKTREE_ARCHIVE_FALLBACK`；decisions retention 只讀 `AGEND_RETENTION_DECISIONS_CUTOVER`。
@@ -46,6 +43,11 @@
 ## [0.11.0] — 2026-07-23
 
 自 0.10.0 起共 212 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
+<<<<<<< HEAD
+=======
+
+>>>>>>> 7dec68de (fix(waiting_on_stale): key the live set by InstanceId, not name (#3077))
+>>>>>>> eb6c6cc4 (fix(waiting_on_stale): key the live set by InstanceId, not name (#3077))
 ### Added
 
 - **per-role MCP 工具子集(#2344、#2367)** — 新增 per-role MCP capability registry(#2344),加上 `fleet.yaml` 中型別化、由 operator 宣告的 `role_kind`(七種變體)驅動它(#2367),裁切 agent 對外公告的工具面。先前用自由文字 `role:` 比對,永遠對不上真實的散文角色名,所以每個 agent 都看到全部工具;唯讀角色(reviewer/planner/explorer)現在拿到 report/read 子集,且 exhaustive match 強制每個新角色都要明確決定。opt-in、預設全工具(#2300)。

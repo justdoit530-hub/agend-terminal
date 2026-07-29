@@ -113,4 +113,8 @@ fn resolve_repo_or_error(home: &Path, instance_name: &str, args: &Value) -> Resu
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+mod exact_head_merge_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests;

@@ -58,3 +58,7 @@ pub use watcher::check_ci_watches;
 pub(crate) use registry::parse_subscribers;
 #[allow(unused_imports)]
 pub(crate) use watch_state::WatchState;
+
+pub(crate) fn is_full_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
