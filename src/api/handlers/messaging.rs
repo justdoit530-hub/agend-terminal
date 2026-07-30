@@ -598,8 +598,21 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
         Ok(v) => v,
         Err(e) => return e,
     };
+<<<<<<< HEAD
     if let Err(e) = check_team_isolation(ctx.home, vs.from, vs.target) {
         return e;
+=======
+    let summary = receipt.summary();
+    let task_id = &summary.task_id;
+    let _ = crate::daemon::dispatch_idle::mark_resolved(home, task_id, reporter);
+    if matches!(
+        summary.verdict,
+        crate::review_receipt::ReviewVerdict::Verified
+    ) {
+        let _ = crate::tasks::auto_close::auto_close_on_validated_review(
+            home, task_id, reporter, &msg.text,
+        );
+>>>>>>> c3badb7d (Fix review-task subject ownership and receipt completion (#3149))
     }
     if let Err(e) = check_quota_gate(ctx.registry, ctx.home, params, vs.target) {
         return e;

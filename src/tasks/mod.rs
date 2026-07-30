@@ -41,6 +41,28 @@ pub(crate) fn assignee_completion_guard(
     caller: &str,
     record: &crate::task_events::TaskRecord,
 ) -> Result<(), String> {
+    assignee_completion_guard_with_review_branch(home, task_id, caller, record, false)
+}
+
+/// Completion proof used only after a validated review receipt has been accepted.
+/// Disposable review worktrees intentionally use an isolated branch, so their
+/// binding branch is not required to equal the subject task's PR branch.
+pub(crate) fn validated_review_completion_guard(
+    home: &Path,
+    task_id: &str,
+    caller: &str,
+    record: &crate::task_events::TaskRecord,
+) -> Result<(), String> {
+    assignee_completion_guard_with_review_branch(home, task_id, caller, record, true)
+}
+
+fn assignee_completion_guard_with_review_branch(
+    home: &Path,
+    task_id: &str,
+    caller: &str,
+    record: &crate::task_events::TaskRecord,
+    allow_disposable_review_branch_mismatch: bool,
+) -> Result<(), String> {
     let Some(branch) = record.branch.as_deref() else {
         return Ok(());
     };
@@ -55,9 +77,19 @@ pub(crate) fn assignee_completion_guard(
     let binding_branch = binding["branch"].as_str();
     let source_repo = binding["source_repo"].as_str().unwrap_or("");
     let worktree = binding["worktree"].as_str().unwrap_or("");
+    let provisioned_head = match (
+        binding["checkout_purpose"].as_str(),
+        binding["provenance"].as_str(),
+        binding["provisioned_head"].as_str(),
+    ) {
+        (Some("disposable_review"), Some("DaemonProvisionedReview"), Some(head)) => Some(head),
+        _ => None,
+    };
+    let branch_matches_task = binding_branch == Some(branch)
+        || (allow_disposable_review_branch_mismatch && provisioned_head.is_some());
     if binding_agent != Some(caller)
         || binding_task != Some(task_id)
-        || binding_branch != Some(branch)
+        || !branch_matches_task
         || source_repo.is_empty()
         || worktree.is_empty()
     {
@@ -73,20 +105,14 @@ pub(crate) fn assignee_completion_guard(
         return Err("assignee worktree has dirty or unpushed work".to_string());
     }
 
-    let actual_branch = crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"])
-        .map_err(|error| format!("assignee worktree branch check failed: {error}"))?;
-    if actual_branch != branch {
-        return Err("assignee worktree branch does not match the task".to_string());
+    if !allow_disposable_review_branch_mismatch || provisioned_head.is_none() {
+        let actual_branch =
+            crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"])
+                .map_err(|error| format!("assignee worktree branch check failed: {error}"))?;
+        if actual_branch != branch {
+            return Err("assignee worktree branch does not match the task".to_string());
+        }
     }
-
-    let provisioned_head = match (
-        binding["checkout_purpose"].as_str(),
-        binding["provenance"].as_str(),
-        binding["provisioned_head"].as_str(),
-    ) {
-        (Some("disposable_review"), Some("DaemonProvisionedReview"), Some(head)) => Some(head),
-        _ => None,
-    };
     let disposable_review_at_provisioned_head = if let Some(expected_head) = provisioned_head {
         let actual_head = crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"])
             .map_err(|error| format!("assignee review HEAD check failed: {error}"))?;
@@ -157,6 +183,7 @@ pub(crate) fn assignee_completion_guard(
 pub(crate) fn cancel_review_assignment_task(
     home: &Path,
     task_id: &str,
+    target: &str,
     reason: &str,
 ) -> anyhow::Result<bool> {
     let routed = match load_routed(home, task_id) {
@@ -168,20 +195,67 @@ pub(crate) fn cancel_review_assignment_task(
             ))
         }
     };
-    if matches!(
-        routed.task.status,
-        crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
-    ) {
-        return Ok(false);
-    }
+    let task_id_owned = task_id.to_string();
+    let target_owned = target.to_string();
+    let reason_owned = reason.to_string();
     let emitter = crate::task_events::InstanceName::from("system:review-assignment");
-    let event = crate::task_events::TaskEvent::Cancelled {
-        task_id: crate::task_events::TaskId(task_id.to_string()),
-        by: emitter.clone(),
-        reason: reason.to_string(),
+    let event_emitter = emitter.clone();
+    let outcome = match routed.with_revalidated_computed(home, &emitter, move |state| {
+            let Some(record) = state
+                .tasks
+                .get(&crate::task_events::TaskId(task_id_owned.clone()))
+            else {
+                return Err(format!(
+                    "review-assignment task '{task_id_owned}' disappeared during write-time revalidation"
+                ));
+            };
+            if matches!(
+                record.status,
+                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
+            ) {
+                return Ok(Vec::new());
+            }
+            let task_owned_by_target = record
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.0 == target_owned)
+                || record
+                    .routed_to
+                    .as_ref()
+                    .is_some_and(|routed_to| routed_to.0 == target_owned);
+            if !task_owned_by_target {
+                tracing::warn!(
+                    task_id = %task_id_owned,
+                    expected_target = %target_owned,
+                    owner = ?record.owner,
+                    routed_to = ?record.routed_to,
+                    "review-assignment cancellation skipped — task not owned by assignment target (preserved)"
+                );
+                return Ok(Vec::new());
+            }
+            Ok(vec![crate::task_events::TaskEvent::Cancelled {
+                task_id: crate::task_events::TaskId(task_id_owned.clone()),
+                by: event_emitter.clone(),
+                reason: reason_owned.clone(),
+            }])
+        }) {
+        Ok(outcome) => outcome,
+        Err(TaskRouteError::NotFound) => return Ok(false),
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "review-assignment task write route failed for '{task_id}': {error}"
+            ))
+        }
     };
-    crate::task_events::append(home, &emitter, event)?;
-    Ok(true)
+    match outcome {
+        Ok(Ok(events)) => Ok(!events.is_empty()),
+        Ok(Err(reason)) => Err(anyhow::anyhow!(
+            "review-assignment task cancellation refused for '{task_id}': {reason}"
+        )),
+        Err(error) => Err(anyhow::anyhow!(
+            "review-assignment task cancellation append failed for '{task_id}': {error}"
+        )),
+    }
 }
 pub use handler::handle;
 pub use handler::register_subscriber as register_cascade_subscriber;

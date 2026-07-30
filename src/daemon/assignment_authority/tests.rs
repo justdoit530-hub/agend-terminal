@@ -33,6 +33,10 @@ fn mk_record(
 }
 
 fn seed_open_task(home: &Path, task_id: &str) {
+    seed_open_task_as(home, task_id, "reviewer");
+}
+
+fn seed_open_task_as(home: &Path, task_id: &str, owner: &str) {
     crate::task_events::append(
         home,
         &crate::task_events::InstanceName::from("system:test"),
@@ -41,7 +45,7 @@ fn seed_open_task(home: &Path, task_id: &str) {
             title: "review task".into(),
             description: String::new(),
             priority: "normal".into(),
-            owner: Some(crate::task_events::InstanceName::from("lead")),
+            owner: Some(crate::task_events::InstanceName::from(owner)),
             due_at: None,
             depends_on: Vec::new(),
             routed_to: None,
@@ -390,8 +394,8 @@ fn t33_transfer_atomic_other_targets_untouched() {
 #[test]
 fn terminal_tombstones_only_matching_pr_number() {
     let home = tmp_home("terminal-pr");
-    seed_open_task(&home, "t-term-g");
-    seed_open_task(&home, "t-term-gp");
+    seed_open_task_as(&home, "t-term-g", "rev-g");
+    seed_open_task_as(&home, "t-term-gp", "rev-gp");
     let mut g = mk_record("o/r", "feat/x", "rev-g", 30, "2026-07-13T00:00:00Z");
     g.task_id = "t-term-g".into();
     let mut gp = mk_record("o/r", "feat/x", "rev-gp", 31, "2026-07-13T00:00:00Z");
@@ -913,8 +917,8 @@ fn review_assignment_replacement_same_task_preserves_task() {
 #[test]
 fn review_assignment_revoke_does_not_cancel_other_reviewer_task() {
     let home = tmp_home("task-scope");
-    seed_open_task(&home, "t-scope-a");
-    seed_open_task(&home, "t-scope-b");
+    seed_open_task_as(&home, "t-scope-a", "rev-a");
+    seed_open_task_as(&home, "t-scope-b", "rev-b");
     let mut a = mk_record("o/r", "feat/x", "rev-a", 42, "2026-07-13T00:00:00Z");
     a.task_id = "t-scope-a".into();
     let mut b = mk_record("o/r", "feat/x", "rev-b", 42, "2026-07-13T00:00:00Z");
@@ -940,12 +944,31 @@ fn review_assignment_revoke_does_not_cancel_other_reviewer_task() {
 fn already_terminal_review_task_cancellation_is_idempotent() {
     let home = tmp_home("task-terminal");
     seed_open_task(&home, "t-terminal");
-    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "test").unwrap();
-    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "test-again").unwrap();
+    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "reviewer", "test").unwrap();
+    crate::tasks::cancel_review_assignment_task(&home, "t-terminal", "reviewer", "test-again")
+        .unwrap();
 
     assert_eq!(
         task_status(&home, "t-terminal"),
         crate::task_events::TaskStatus::Cancelled
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn review_assignment_revoke_preserves_task_owned_by_implementation_target() {
+    let home = tmp_home("task-owner-mismatch");
+    seed_open_task_as(&home, "t-implementation", "implementer");
+    let mut record = mk_record("o/r", "feat/x", "reviewer", 42, "2026-07-13T00:00:00Z");
+    record.task_id = "t-implementation".into();
+    persist(&home, &record).unwrap();
+
+    revoke(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:10Z").unwrap();
+
+    assert_eq!(
+        task_status(&home, "t-implementation"),
+        crate::task_events::TaskStatus::Open,
+        "retiring a reviewer assignment must not cancel an implementation task"
     );
     std::fs::remove_dir_all(&home).ok();
 }

@@ -104,8 +104,8 @@ pub(crate) fn bridge_verdict_to_review_task(
     let _ = crate::daemon::dispatch_idle::mark_resolved(home, &task_id);
     // Only VERIFIED closes the review task. terminal=true synthesized internally.
     if matches!(verdict, Verdict::Verified) {
-        let _ = crate::tasks::auto_close::auto_close_on_report(
-            home, "report", &task_id, reporter, &msg.text, true,
+        let _ = crate::tasks::auto_close::auto_close_on_validated_review(
+            home, &task_id, reporter, &msg.text,
         );
     }
 }
