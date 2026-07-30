@@ -992,13 +992,14 @@ fn pane_input_contains_submit(backend: Option<&crate::backend::Backend>, bytes: 
     bytes.windows(submit.len()).any(|w| w == submit)
 }
 
-fn sync_notification_state(home: &Path, layout: &mut Layout) {
+pub(crate) fn sync_notification_state(home: &Path, layout: &mut Layout) {
+    let snapshot = notification_queue::QueueDirSnapshot::scan(home);
     for tab in &mut layout.tabs {
         let pane_ids = tab.root().pane_ids();
         for pane_id in pane_ids {
             if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
                 let prev = pane.pending_notification_count;
-                let now = notification_queue::pending_count(home, &pane.agent_name);
+                let now = snapshot.pending_count(&pane.agent_name);
                 // #1944 instrument: the pane-title `[N]` badge renders off this
                 // count (core_render.rs). Log every CHANGE so the "badge
                 // disappeared" report can be located at runtime — the code is
@@ -2088,7 +2089,6 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
     }
-
     fn pane(name: &str) -> Pane {
         Pane {
             agent_name: name.into(),

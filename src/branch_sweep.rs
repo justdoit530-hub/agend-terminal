@@ -943,6 +943,7 @@ pub(crate) fn emit_delete_batch_with_context(
     {
         name_to_candidate.insert(cand.name.as_str(), cand);
     }
+    let mut open_pr_inventory: Option<OpenPrSnapshot> = None;
     let category_of = |name: &str| -> &'static str {
         if categories.clean_merged.iter().any(|c| c.name == name) {
             "clean_merged"
@@ -990,7 +991,8 @@ pub(crate) fn emit_delete_batch_with_context(
             crate::worktree::disposition::BranchProvenance::Unknown
         );
         let open_pr = if terminal {
-            match open_pr_status(repo, base, name) {
+            let inventory = open_pr_inventory.get_or_insert_with(|| open_pr_snapshot(repo, base));
+            match inventory.status_for(name) {
                 OpenPrStatus::Open => Some(true),
                 OpenPrStatus::NotOpen => Some(false),
                 OpenPrStatus::Unknown => None,
@@ -1161,6 +1163,7 @@ fn branch_is_checked_out(repo: &Path, branch: &str) -> Option<bool> {
 }
 
 pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> Option<bool> {
+    note_active_task_probe();
     let tasks = crate::tasks::list_all_strict(home).ok()?;
     Some(tasks.iter().any(|task| {
         task.branch.as_deref() == Some(branch)
@@ -1217,11 +1220,36 @@ pub(crate) fn prepare_branch_recovery(
     Ok(identity)
 }
 
+// #3011: counts calls into `branch_has_active_task`, to prove that
+// non-terminal candidates in `prune_orphaned_branches_with_home` skip the
+// strict task-ledger replay.
+#[cfg(test)]
+std::thread_local! {
+    static ACTIVE_TASK_PROBE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_active_task_probe() {
+    ACTIVE_TASK_PROBE_COUNT.with(|count| count.set(count.get() + 1));
+}
+#[cfg(not(test))]
+fn note_active_task_probe() {}
+
+/// Read the count and zero it — so a caller can also use this as the "start
+/// from zero" setup step, with no separate reset accessor.
+#[cfg(test)]
+pub(crate) fn take_active_task_probe_count() -> usize {
+    ACTIVE_TASK_PROBE_COUNT.with(|count| count.replace(0))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[path = "branch_sweep_2999_tests.rs"]
+    mod tests_2999;
 
     // ── #852 PR-C — reviewer_checkout pattern unit tests ──────────────
 

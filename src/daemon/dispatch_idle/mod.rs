@@ -16,7 +16,10 @@
 //! resolve + sidecar lifecycle); hook-site precedent is #870 in
 //! `auto_release` (handle_send post-enqueue).
 
+pub(crate) mod pending_scan;
 pub(crate) mod team_nudge;
+
+pub(crate) use pending_scan::*;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -282,6 +285,7 @@ pub(crate) fn record_dispatch(
     if std::fs::create_dir_all(&dir).is_err() {
         return None;
     }
+    let pending = correlation_id.map(|_| list_pending(home));
     // t-dispatchidle-clear-on-report (2): dedup by (dispatcher, target,
     // correlation_id). Re-dispatching the SAME task (same task_id) used to create a
     // fresh duplicate sidecar each call (`next_dispatch_id()`), so 142 correlation
@@ -298,7 +302,10 @@ pub(crate) fn record_dispatch(
                 && d.target == target
                 && d.correlation_id.as_deref() == Some(corr)
         };
-        if let Some(mut existing) = list_pending(home).into_iter().find(is_same_intent) {
+        if let Some(mut existing) = pending
+            .as_ref()
+            .and_then(|pending| pending.iter().find(|d| is_same_intent(d)).cloned())
+        {
             existing.issued_at = chrono::Utc::now().to_rfc3339();
             existing.status = DispatchStatus::Pending;
             existing.nudge_sent_at = None;
@@ -384,7 +391,7 @@ pub(crate) fn record_dispatch(
         correlation_id,
         chrono::DateTime::parse_from_rfc3339(&payload.issued_at),
     ) {
-        for stale in list_pending(home).into_iter().filter(|d| {
+        for stale in pending.unwrap_or_default().into_iter().filter(|d| {
             matches!(d.status, DispatchStatus::Pending | DispatchStatus::Exceeded)
                 && d.dispatcher == dispatcher
                 && d.target == target
@@ -407,34 +414,6 @@ pub(crate) fn record_dispatch(
         }
     }
     Some(dispatch_id)
-}
-
-/// Read all pending dispatch sidecars from disk. Forward-compat: skips
-/// any sidecar whose `schema_version` is unknown.
-pub(crate) fn list_pending(home: &Path) -> Vec<PendingDispatch> {
-    let dir = pending_dir(home);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(d) = serde_json::from_str::<PendingDispatch>(&content) else {
-            continue;
-        };
-        if d.schema_version != SCHEMA_VERSION {
-            continue;
-        }
-        out.push(d);
-    }
-    out.sort_by(|a, b| a.issued_at.cmp(&b.issued_at));
-    out
 }
 
 fn write_dispatch(home: &Path, d: &PendingDispatch) -> bool {
