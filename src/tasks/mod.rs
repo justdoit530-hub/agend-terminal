@@ -923,20 +923,33 @@ pub(crate) fn list_all_strict(home: &Path) -> Result<Vec<Task>, TaskRouteError> 
 
     // Other boards
     let boards_dir = home.join("boards");
-    if let Ok(entries) = std::fs::read_dir(&boards_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && path != board {
-                let state = crate::task_events::replay_at(&path).map_err(|e| {
-                    TaskRouteError::Unreadable {
-                        path: path.clone(),
-                        cause: e.to_string(),
-                    }
+    match std::fs::read_dir(&boards_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|e| TaskRouteError::Unreadable {
+                    path: boards_dir.clone(),
+                    cause: e.to_string(),
                 })?;
-                for record in state.tasks.values() {
-                    tasks.push(record_to_task(record));
+                let path = entry.path();
+                if path.is_dir() && path != board {
+                    let state = crate::task_events::replay_at(&path).map_err(|e| {
+                        TaskRouteError::Unreadable {
+                            path: path.clone(),
+                            cause: e.to_string(),
+                        }
+                    })?;
+                    for record in state.tasks.values() {
+                        tasks.push(record_to_task(record));
+                    }
                 }
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(TaskRouteError::Unreadable {
+                path: boards_dir,
+                cause: e.to_string(),
+            });
         }
     }
 
