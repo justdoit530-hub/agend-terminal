@@ -195,67 +195,40 @@ pub(crate) fn cancel_review_assignment_task(
             ))
         }
     };
-    let task_id_owned = task_id.to_string();
-    let target_owned = target.to_string();
-    let reason_owned = reason.to_string();
-    let emitter = crate::task_events::InstanceName::from("system:review-assignment");
-    let event_emitter = emitter.clone();
-    let outcome = match routed.with_revalidated_computed(home, &emitter, move |state| {
-            let Some(record) = state
-                .tasks
-                .get(&crate::task_events::TaskId(task_id_owned.clone()))
-            else {
-                return Err(format!(
-                    "review-assignment task '{task_id_owned}' disappeared during write-time revalidation"
-                ));
-            };
-            if matches!(
-                record.status,
-                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
-            ) {
-                return Ok(Vec::new());
-            }
-            let task_owned_by_target = record
-                .owner
-                .as_ref()
-                .is_some_and(|owner| owner.0 == target_owned)
-                || record
-                    .routed_to
-                    .as_ref()
-                    .is_some_and(|routed_to| routed_to.0 == target_owned);
-            if !task_owned_by_target {
-                tracing::warn!(
-                    task_id = %task_id_owned,
-                    expected_target = %target_owned,
-                    owner = ?record.owner,
-                    routed_to = ?record.routed_to,
-                    "review-assignment cancellation skipped — task not owned by assignment target (preserved)"
-                );
-                return Ok(Vec::new());
-            }
-            Ok(vec![crate::task_events::TaskEvent::Cancelled {
-                task_id: crate::task_events::TaskId(task_id_owned.clone()),
-                by: event_emitter.clone(),
-                reason: reason_owned.clone(),
-            }])
-        }) {
-        Ok(outcome) => outcome,
-        Err(TaskRouteError::NotFound) => return Ok(false),
-        Err(error) => {
-            return Err(anyhow::anyhow!(
-                "review-assignment task write route failed for '{task_id}': {error}"
-            ))
-        }
-    };
-    match outcome {
-        Ok(Ok(events)) => Ok(!events.is_empty()),
-        Ok(Err(reason)) => Err(anyhow::anyhow!(
-            "review-assignment task cancellation refused for '{task_id}': {reason}"
-        )),
-        Err(error) => Err(anyhow::anyhow!(
-            "review-assignment task cancellation append failed for '{task_id}': {error}"
-        )),
+    if matches!(
+        routed.task.status,
+        crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
+    ) {
+        return Ok(false);
     }
+    let task_owned_by_target = routed
+        .task
+        .assignee
+        .as_ref()
+        .is_some_and(|assignee| assignee == target)
+        || routed
+            .task
+            .routed_to
+            .as_ref()
+            .is_some_and(|routed_to| routed_to == target);
+    if !task_owned_by_target {
+        tracing::warn!(
+            task_id = %task_id,
+            expected_target = %target,
+            assignee = ?routed.task.assignee,
+            routed_to = ?routed.task.routed_to,
+            "review-assignment cancellation skipped — task not owned by assignment target (preserved)"
+        );
+        return Ok(false);
+    }
+    let emitter = crate::task_events::InstanceName::from("system:review-assignment");
+    let event = crate::task_events::TaskEvent::Cancelled {
+        task_id: crate::task_events::TaskId(task_id.to_string()),
+        by: emitter.clone(),
+        reason: reason.to_string(),
+    };
+    crate::task_events::append(home, &emitter, event)?;
+    Ok(true)
 }
 pub use handler::handle;
 pub use handler::register_subscriber as register_cascade_subscriber;

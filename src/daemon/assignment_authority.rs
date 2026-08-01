@@ -1263,6 +1263,7 @@ pub(crate) fn record_terminal(
                 if crate::tasks::cancel_review_assignment_task(
                     home,
                     &record.task_id,
+                    &record.target,
                     "review assignment PR generation became terminal",
                 )? {
                     cleanup_tasks.push(record.task_id.clone());
@@ -1325,6 +1326,7 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
                 match crate::tasks::cancel_review_assignment_task(
                     home,
                     &record.task_id,
+                    &record.target,
                     "review assignment PR generation became terminal",
                 ) {
                     Ok(true) => cleanup_tasks.push(record.task_id.clone()),

@@ -136,11 +136,12 @@ pub(crate) fn worktree_has_work_at_risk(wt: &Path) -> bool {
         }
         _ => return true, // fail-closed
     }
-    // "Unpushed" only has meaning when a remote exists; in a remote-less repo
-    // every commit looks unreachable-from-remotes, which is not work-at-risk.
-    let has_remote = crate::git_helpers::git_bypass(wt, &["remote"])
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+    // "Unpushed" only has meaning when a remote with tracking refs exists; in a remote-less
+    // or un-fetched repo every commit looks unreachable-from-remotes, which is not work-at-risk.
+    let has_remote =
+        crate::git_helpers::git_bypass(wt, &["for-each-ref", "--count=1", "refs/remotes/"])
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
     if !has_remote {
         return false;
     }

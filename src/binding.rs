@@ -312,6 +312,11 @@ pub fn bind_full(
     Ok(())
 }
 
+mod review_lease;
+#[allow(unused_imports)]
+pub(crate) use review_lease::{
+    retarget_disposable_review_binding_for_receipt, try_augment_review_lease,
+};
 /// #2158 GR1: surface an OUT-OF-DISPATCH binding CREATE/CHANGE (no task_id) to the
 /// operator — the realistic accidental-sub-agent / first-bind-hijack vector that
 /// guard-b can't prevent. Dedup is per `(agent, branch)` via a runtime-dir sidecar
