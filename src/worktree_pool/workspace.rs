@@ -154,7 +154,7 @@ pub(crate) fn worktree_has_work_at_risk(wt: &Path) -> bool {
                 .ok()
         })
         .map(|n| n > 0)
-        .unwrap_or(false)
+        .unwrap_or(true) // fail-closed
 }
 
 /// Back up a worktree WHOLE to `<home>/reconcile-backups/<agent>-<epoch>/`,

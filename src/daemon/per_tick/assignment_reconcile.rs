@@ -298,7 +298,7 @@ mod tests {
                 title: "review task".into(),
                 description: String::new(),
                 priority: "normal".into(),
-                owner: Some(InstanceName::from("lead")),
+                owner: Some(InstanceName::from("reviewer")),
                 due_at: None,
                 depends_on: Vec::new(),
                 routed_to: None,
@@ -915,6 +915,17 @@ mod tests {
     fn head_advance_cancels_owned_task_before_retire() {
         let home = tmp_home("task-terminality-head-advance");
         seed_open_task(&home, "t-rev-1");
+        crate::task_events::append(
+            &home,
+            &InstanceName::from("system:test"),
+            TaskEvent::OwnerAssigned {
+                task_id: TaskId::from("t-rev-1"),
+                by: InstanceName::from("system:test"),
+                owner: Some(InstanceName::from("reviewer")),
+                routed_to: None,
+            },
+        )
+        .unwrap();
         let rec = mk_with_head(
             "o/r",
             "feat/x",

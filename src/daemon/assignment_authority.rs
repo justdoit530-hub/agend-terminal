@@ -831,6 +831,7 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
                     && crate::tasks::cancel_review_assignment_task(
                         home,
                         &old.task_id,
+                        &old.target,
                         "review assignment authority replaced by a different task",
                     )?
                 {
@@ -1035,6 +1036,7 @@ pub(crate) fn retire_if_id_matches(
         if crate::tasks::cancel_review_assignment_task(
             home,
             &record.task_id,
+            &record.target,
             "review assignment authority retired",
         )? {
             cleanup_task = Some(record.task_id.clone());
@@ -1107,6 +1109,7 @@ fn revoke_under_lock(
         && crate::tasks::cancel_review_assignment_task(
             home,
             &record.task_id,
+            target,
             "review assignment authority revoked",
         )?
     {
@@ -1260,6 +1263,7 @@ pub(crate) fn record_terminal(
                 if crate::tasks::cancel_review_assignment_task(
                     home,
                     &record.task_id,
+                    &record.target,
                     "review assignment PR generation became terminal",
                 )? {
                     cleanup_tasks.push(record.task_id.clone());
@@ -1322,6 +1326,7 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
                 match crate::tasks::cancel_review_assignment_task(
                     home,
                     &record.task_id,
+                    &record.target,
                     "review assignment PR generation became terminal",
                 ) {
                     Ok(true) => cleanup_tasks.push(record.task_id.clone()),
