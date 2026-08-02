@@ -1,3 +1,4 @@
+use super::watch::handle_watch_ci;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -40,6 +41,9 @@ pub(crate) fn post_merge_receipt_and_watch(
     } else {
         merge_authority
     };
+    // Pass the merge authority as instance_name so they become a durable
+    // subscriber when they are the watch target (self-notification). Operator
+    // merges pass "" — handled by the operator bypass in the exact-head gate.
     let watch_result = handle_watch_ci(
         home,
         &json!({
@@ -49,7 +53,7 @@ pub(crate) fn post_merge_receipt_and_watch(
             "task_id": &task_id,
             "next_after_ci": [next_after_ci],
         }),
-        "",
+        merge_authority,
     );
     let has_subscribers = watch_result
         .get("subscribers")
@@ -99,7 +103,7 @@ fn resolve_task_assignee_for_branch(
         if b_source.is_empty() {
             continue;
         }
-        let b_slug = crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(
+        let b_slug = crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(
             std::path::Path::new(b_source),
         );
         let repo_matches = b_slug
@@ -270,7 +274,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     // head+base it INTENDS; if either can't be read, fail closed (never merge a
     // head/base we cannot identify). `force` relaxes only the CI/verdict/freshness
     // POLICY below, never this acquisition nor the pre-merge identity recheck.
-    let (gated_head, gated_base, _pr_branch, gated_merge_state) = match acquire_head_base(
+    let (gated_head, gated_base, pr_branch, gated_merge_state) = match acquire_head_base(
         &repo, pr, true,
     ) {
         Some(hb) => hb,
@@ -448,12 +452,24 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         Ok(crate::scm::MergeOutcome::Submitted) => match verify_merge_landed(&repo, pr) {
             MergeVerdict::Confirmed(merge_commit) => {
                 crate::reflexion::auto_correct_on_ci_pass(home, instance_name, None);
-                json!({
+                let mut resp = json!({
                     "merged": true,
                     "pr": pr,
                     "forced": force,
-                    "mergeCommit": merge_commit,
-                })
+                    "mergeCommit": &merge_commit,
+                });
+                let diag = post_merge_receipt_and_watch(
+                    home,
+                    &repo,
+                    &merge_commit,
+                    pr,
+                    &pr_branch,
+                    instance_name,
+                );
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("post_merge".into(), diag);
+                }
+                resp
             }
             MergeVerdict::Unconfirmed {
                 state,

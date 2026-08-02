@@ -4152,13 +4152,7 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
         std::fs::write(repo.join("dirty.txt"), "dirty").expect("dirty");
     }
     if mode == "default-error" {
-        git(&[
-            "-C",
-            r,
-            "symbolic-ref",
-            "-d",
-            "refs/remotes/origin/HEAD",
-        ]);
+        git(&["-C", r, "symbolic-ref", "-d", "refs/remotes/origin/HEAD"]);
     }
     std::fs::write(
         repo.join(".agend-managed"),
@@ -4221,7 +4215,9 @@ fn task_done_rejects_pushed_ahead_assignee_s1() {
         "dev-agent",
         &serde_json::json!({"action":"done","id":id}),
     );
-    let done_status = super::lifecycle::read_task_record(&home, &id).expect("task").status;
+    let done_status = super::handler::read_task_record(&home, &id)
+        .expect("task")
+        .status;
     assert!(
         done.get("error").is_some(),
         "RED: explicit done currently succeeds: {done}"
@@ -4242,7 +4238,9 @@ fn terminal_report_rejects_pushed_ahead_assignee_s1() {
         true,
     )
     .expect("auto-close");
-    let status = super::lifecycle::read_task_record(&home, &id).expect("task").status;
+    let status = super::handler::read_task_record(&home, &id)
+        .expect("task")
+        .status;
     assert!(!closed, "RED: terminal report currently returns true");
     assert_eq!(status, crate::task_events::TaskStatus::Claimed);
     std::fs::remove_dir_all(&home).ok();
@@ -4284,7 +4282,9 @@ fn terminal_report_assignee_completion_provenance_controls_s1() {
         .expect("auto-close");
         assert!(!closed, "unsafe review provenance allowed for {mode}");
         assert_eq!(
-            super::lifecycle::read_task_record(&home, &id).expect("task").status,
+            super::handler::read_task_record(&home, &id)
+                .expect("task")
+                .status,
             crate::task_events::TaskStatus::Claimed,
             "unsafe review provenance changed task status for {mode}"
         );

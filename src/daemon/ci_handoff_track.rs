@@ -74,6 +74,9 @@ pub(crate) struct CiHandoffTrack {
     /// tier-b) — no `schema_version` bump.
     #[serde(default)]
     pub head_sha: Option<String>,
+    /// The task id associated with this handoff, when available.
+    #[serde(default)]
+    pub task_id: Option<String>,
 }
 
 fn dir(home: &Path) -> PathBuf {
@@ -198,6 +201,7 @@ pub(crate) fn record(
     correlation: &str,
     sent_at: &str,
     head_sha: Option<&str>,
+    task_id: Option<&str>,
 ) {
     let track = CiHandoffTrack {
         schema_version: SCHEMA_VERSION,
@@ -205,6 +209,7 @@ pub(crate) fn record(
         correlation: correlation.to_string(),
         sent_at: sent_at.to_string(),
         head_sha: head_sha.map(String::from),
+        task_id: task_id.map(String::from),
     };
     let path = file_for(home, target, correlation);
     if let Err(e) = std::fs::create_dir_all(dir(home)) {
@@ -507,11 +512,32 @@ mod tests {
     #[test]
     fn record_list_roundtrip_and_refresh() {
         let home = tmp_home("roundtrip");
-        record(&home, "reviewer", "o/r@b1", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@b2", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b1",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer",
+            "o/r@b2",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(list(&home).len(), 2);
         // Re-record same key = refresh (no duplicate file).
-        record(&home, "reviewer", "o/r@b1", "2026-06-10T01:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b1",
+            "2026-06-10T01:00:00Z",
+            None,
+            None,
+        );
         let tracks = list(&home);
         assert_eq!(tracks.len(), 2, "refresh must not duplicate");
         assert!(tracks
@@ -523,9 +549,30 @@ mod tests {
     #[test]
     fn resolve_by_correlation_clears_all_targets() {
         let home = tmp_home("resolve-corr");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer-2", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@other", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer-2",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer",
+            "o/r@other",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(resolve_by_correlation(&home, "o/r@b", "test"), 2);
         let left = list(&home);
         assert_eq!(left.len(), 1);
@@ -539,9 +586,23 @@ mod tests {
         // exact repo@branch — a co-subscriber's track (same correlation, different
         // target) and the caller's other-branch track both survive.
         let home = tmp_home("resolve-tc");
-        record(&home, "lead", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "lead", "o/r@other", "2026-06-10T00:00:00Z", None);
+        record(&home, "lead", "o/r@b", "2026-06-10T00:00:00Z", None, None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "lead",
+            "o/r@other",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(resolve_for_target_correlation(&home, "lead", "o/r@b"), 1);
         let left = list(&home);
         assert_eq!(left.len(), 2, "only lead's o/r@b cleared");
@@ -557,8 +618,22 @@ mod tests {
     #[test]
     fn resolve_claimed_scopes_to_target_and_branch() {
         let home = tmp_home("resolve-claim");
-        record(&home, "reviewer", "o/r@fix/x", "2026-06-10T00:00:00Z", None);
-        record(&home, "other", "o/r@fix/x", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@fix/x",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "other",
+            "o/r@fix/x",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(resolve_claimed(&home, "reviewer", "fix/x"), 1);
         let left = list(&home);
         assert_eq!(left.len(), 1, "other target's track untouched");
@@ -572,9 +647,16 @@ mod tests {
         let now = chrono::Utc::now();
         let old = (now - chrono::Duration::hours(25)).to_rfc3339();
         let fresh = now.to_rfc3339();
-        record(&home, "reviewer", "o/r@old", &old, None);
-        record(&home, "reviewer", "o/r@fresh", &fresh, None);
-        record(&home, "reviewer", "o/r@broken", "not-a-timestamp", None);
+        record(&home, "reviewer", "o/r@old", &old, None, None);
+        record(&home, "reviewer", "o/r@fresh", &fresh, None, None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@broken",
+            "not-a-timestamp",
+            None,
+            None,
+        );
         assert_eq!(sweep_expired(&home, &now), 2, "old + broken swept");
         let left = list(&home);
         assert_eq!(left.len(), 1);
@@ -591,7 +673,14 @@ mod tests {
     #[test]
     fn remove_if_unchanged_refuses_stale_delete_1963() {
         let home = tmp_home("cas");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         let path = file_for(&home, "reviewer", "o/r@b");
         // Same episode → delete succeeds.
         assert!(remove_if_unchanged(
@@ -608,8 +697,22 @@ mod tests {
 
         // Re-record a NEW episode (new sent_at = a new CI pass), then a deleter
         // carrying the STALE listed sent_at must NOT delete it (the race).
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None); // S1
-        record(&home, "reviewer", "o/r@b", "2026-06-10T09:00:00Z", None); // S2
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        ); // S1
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T09:00:00Z",
+            None,
+            None,
+        ); // S2
         assert!(
             !remove_if_unchanged(&home, &path, "reviewer", "o/r@b", "2026-06-10T00:00:00Z"),
             "#1963: a delete carrying the STALE listed sent_at must be refused"
@@ -631,7 +734,14 @@ mod tests {
     #[test]
     fn atomic_write_and_sidecars_excluded_from_list_1963() {
         let home = tmp_home("atomic");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         let tracks = list(&home);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].1.correlation, "o/r@b");
@@ -659,8 +769,22 @@ mod tests {
     #[test]
     fn sanitize_colliding_keys_get_distinct_files_1969() {
         let home = tmp_home("collide");
-        record(&home, "reviewer", "o/r@a/b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@a_b", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@a/b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer",
+            "o/r@a_b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         let tracks = list(&home);
         assert_eq!(
             tracks.len(),
@@ -694,6 +818,7 @@ mod tests {
             "reviewer",
             "o/r@active",
             "2026-06-10T00:00:00Z",
+            None,
             None,
         );
         let active_lock = lock_for(&home, "reviewer", "o/r@active");
@@ -767,6 +892,7 @@ mod tests {
             correlation: "o/r@b".into(),
             sent_at: "2026-06-10T00:00:00Z".into(),
             head_sha: None,
+            task_id: None,
         };
         std::fs::write(&old_path, serde_json::to_vec(&track).unwrap()).unwrap();
         assert_eq!(
@@ -797,6 +923,7 @@ mod tests {
             "o/r@b",
             "2026-06-10T00:00:00Z",
             Some("HEAD_OLD"),
+            None,
         );
         assert_eq!(list(&home).len(), 1);
         let resolved = resolve_head_advanced(&home, "o/r@b", "HEAD_NEW");
@@ -822,6 +949,7 @@ mod tests {
             "o/r@b",
             "2026-06-10T00:00:00Z",
             Some("HEAD_X"),
+            None,
         );
         let resolved = resolve_head_advanced(&home, "o/r@b", "HEAD_X");
         assert_eq!(resolved, 0, "an unchanged head must keep the track");
@@ -866,6 +994,7 @@ mod tests {
             "o/r@b1",
             "2026-06-10T00:00:00Z",
             Some("HEAD_OLD"),
+            None,
         );
         record(
             &home,
@@ -873,6 +1002,7 @@ mod tests {
             "o/r@b2",
             "2026-06-10T00:00:00Z",
             Some("HEAD_OLD"),
+            None,
         );
         let resolved = resolve_head_advanced(&home, "o/r@b1", "HEAD_NEW");
         assert_eq!(resolved, 1, "only b1's track is for the moved head");

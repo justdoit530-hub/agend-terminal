@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Subscriber {
@@ -108,7 +108,11 @@ pub struct WatchState {
     pub stalled_since_ms: Option<i64>,
 
     // Routing
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_next_after_ci_opt"
+    )]
     pub next_after_ci: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -147,6 +151,13 @@ pub struct WatchState {
     /// `None` on a normal PR watch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_head_sha: Option<String>,
+
+    /// #2812: when `true`, this watch is a developer self-notification (no
+    /// privileged continuation). `actionable_next_after_ci_targets` returns
+    /// empty; the poller notifies the subscriber but does not enqueue any
+    /// handoff. The receipt is consumed on terminal removal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_only: Option<bool>,
 }
 
 fn default_branch() -> String {
@@ -179,6 +190,25 @@ impl WatchState {
         Vec::new()
     }
 
+    /// Raw `next_after_ci` targets — always returns the stored value regardless of mode.
+    #[allow(dead_code)]
+    pub fn next_after_ci_targets(&self) -> Vec<String> {
+        match &self.next_after_ci {
+            None => Vec::new(),
+            Some(s) if s.is_empty() => Vec::new(),
+            Some(s) => vec![s.clone()],
+        }
+    }
+
+    /// Actionable handoff targets — suppressed when `notification_only=true`.
+    #[allow(dead_code)]
+    pub fn actionable_next_after_ci_targets(&self) -> Vec<String> {
+        if self.notification_only == Some(true) {
+            return Vec::new();
+        }
+        self.next_after_ci_targets()
+    }
+
     /// #1750 A2: the earliest `subscribed_at` across subscribers, as a stable
     /// watch-age anchor. Unlike `expires_at` / `last_polled_at`, `subscribed_at`
     /// is set once at subscription time and never refreshed by polling, so it is
@@ -195,6 +225,49 @@ impl WatchState {
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .min()
     }
+}
+
+/// Normalize a `next_after_ci` JSON value (string or array) into a sorted,
+/// deduplicated Vec of non-empty target names.
+pub(crate) fn normalize_next_after_ci(value: &serde_json::Value) -> Vec<String> {
+    let mut out = match value {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.clone()]
+            }
+        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    };
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Custom deserializer: accepts `"target"` (string) or `["a","b"]` (array).
+/// Normalizes by taking the first non-empty target (single-target compat).
+/// Arrays are joined as comma-separated so all targets survive the round-trip
+/// when stored in the legacy `Option<String>` field.
+fn deserialize_next_after_ci_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let targets = value
+        .map(|v| normalize_next_after_ci(&v))
+        .unwrap_or_default();
+    Ok(match targets.as_slice() {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => Some(many.join(",")),
+    })
 }
 
 #[cfg(test)]

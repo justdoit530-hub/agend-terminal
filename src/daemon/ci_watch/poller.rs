@@ -110,7 +110,7 @@ use super::provider::{
     GitLabCiProvider,
 };
 #[cfg(test)]
-use super::registry::{parse_subscribers, watch_filename};
+use super::registry::{parse_subscribers, watch_filename, watch_filename_exact_head};
 #[cfg(test)]
 use super::sweep::{
     clear_stall_and_maybe_notify_resumed, gc_stale_watches, startup_sweep, STALL_THRESHOLD,
@@ -2108,6 +2108,7 @@ fn persist_watch_state(
                             // so a later head move can invalidate it (head-aware
                             // resolve).
                             Some(&pr.current_sha),
+                            state.task_id.as_deref(),
                         );
                     }
                 }

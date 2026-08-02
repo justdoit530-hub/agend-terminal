@@ -1318,6 +1318,7 @@ fn poll_with_advanced_head_resolves_stale_handoff_track() {
         "o/r@feat",
         "2026-06-10T00:00:00Z",
         Some("OLDHEAD"),
+        None,
     );
     assert_eq!(crate::daemon::ci_handoff_track::list(&dir).len(), 1);
     // A real poll observes the branch head has advanced to NEWHEAD.
@@ -1348,6 +1349,7 @@ fn poll_with_unchanged_head_keeps_handoff_track() {
         "o/r@feat",
         "2026-06-10T00:00:00Z",
         Some("abc"),
+        None,
     );
     let provider = MockCiProvider::with_runs(vec![CiRun {
         run_attempt: 1,
