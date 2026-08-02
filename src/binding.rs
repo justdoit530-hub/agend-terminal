@@ -18,17 +18,22 @@ const BINDING_SCHEMA_VERSION: u64 = 1;
 pub(crate) mod release_guard;
 pub(crate) use release_guard::{
     acquire_agent_mutation_lock, acquire_binding_file_lock, guarded_binding_disk_fresh,
-    preflight_guarded_binding, snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
+    snapshot_guarded_binding, BindingFingerprint, GuardedBinding,
 };
-mod rebind_guard;
-use rebind_guard::same_agent_metadata_catchup_allowed;
-mod signature;
-pub(crate) use signature::signature_valid;
-mod unbind;
-pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
-mod unbind_compat;
-#[allow(unused_imports)]
-pub use unbind_compat::unbind;
+
+pub(crate) fn managed_marker_agent(target: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(target.join(".agend-managed")).ok()?;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("agent=") {
+            let s = v.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
 
 /// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
@@ -43,7 +48,7 @@ static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::n
 /// [`present_including_future`] instead, so they never mistake a future binding
 /// for absent and reclaim a newer daemon's live worktree. The missing-signature
 /// fail-closed path is unchanged.
-pub(crate) fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> {
+fn parse_binding_guarded(content: &str) -> Option<serde_json::Value> {
     let v: serde_json::Value = serde_json::from_str(content).ok()?;
     let found = v.get("version").and_then(|x| x.as_u64()).unwrap_or(0);
     if found > BINDING_SCHEMA_VERSION {
@@ -145,81 +150,6 @@ pub fn bind(home: &Path, agent: &str, task_id: &str, branch: &str) {
     }
 }
 
-/// Parse a daemon-managed worktree's `.agend-managed` marker for its recorded
-/// `agent=` line. `None` when the marker is missing or the line isn't present
-/// — callers that require ownership certainty must already have checked
-/// `worktree_pool::is_daemon_managed` before this matters.
-///
-/// `pub(crate)` — also used by `mcp::handlers::force_release`'s #2496 safe
-/// rebind-repair path (same ownership check, different flow control).
-pub(crate) fn managed_marker_agent(worktree: &Path) -> Option<String> {
-    let content =
-        std::fs::read_to_string(worktree.join(crate::worktree_pool::MANAGED_MARKER)).ok()?;
-    content
-        .lines()
-        .find_map(|l| l.strip_prefix("agent="))
-        .map(|s| s.trim().to_string())
-}
-
-/// #2496: does `agent` hold an active CI watch on `branch`? A stale branch
-/// still being watched must not be silently abandoned by a metadata-only
-/// binding repair. `pub(crate)` — shared with `force_release`'s repair path.
-pub(crate) fn agent_has_active_ci_watch_on_branch(home: &Path, agent: &str, branch: &str) -> bool {
-    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
-    let Ok(entries) = std::fs::read_dir(&ci_dir) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(watch) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        if watch["branch"].as_str() != Some(branch) {
-            continue;
-        }
-        if crate::daemon::ci_watch::parse_subscribers(&watch)
-            .iter()
-            .any(|s| s == agent)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// #2496: is any task's STRUCTURED `branch` link still pointing at `branch`
-/// in an active status? Same active-status set
-/// `status_summary::auto_close_merged_tasks` uses for its structured-link arm
-/// (Open/Claimed/InProgress/InReview/Blocked/Verified) — a stale branch still
-/// tracked by a live task must not be silently abandoned by a metadata-only
-/// binding repair. `pub(crate)` — shared with `force_release`'s repair path.
-pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> bool {
-    use crate::task_events::TaskStatus;
-    crate::tasks::list_all(home).iter().any(|t| {
-        t.branch.as_deref() == Some(branch)
-            && matches!(
-                t.status,
-                TaskStatus::Open
-                    | TaskStatus::Claimed
-                    | TaskStatus::InProgress
-                    | TaskStatus::InReview
-                    | TaskStatus::Blocked
-                    | TaskStatus::Verified
-            )
-    })
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BindingProvenance<'a> {
-    DaemonProvisionedReview { provisioned_head: &'a str },
-}
-
 /// Write a full binding including worktree + source-repo paths.
 ///
 /// `source_repo` is the parent repo that owns the worktree, persisted as a
@@ -228,15 +158,14 @@ pub(crate) enum BindingProvenance<'a> {
 /// the git registry leaves a stale prunable entry after a manual `remove_dir_all`
 /// fallback. Pass an empty path when unknown — `release_full` falls back to
 /// deriving the source from the worktree path's `.worktrees/<agent>` ancestor.
-/// #779 P2 (Option B): hard-break API now returns `Result<(), String>` so
-/// callers can surface partial-failure diagnostics. I/O failures
-/// (`create_dir_all`, lock, `atomic_write`) are explicit `Err` cases.
-///
-/// Production callers match the Result (they do **not** swallow with
-/// `.ok()`): `dispatch_auto_bind_lease` rolls back a fresh lease on `Err`
-/// (`dispatch_hook`); `ci::handle_checkout_repo` hard-fails + rolls back;
-/// `binding::bind` logs and stays fail-closed. `worktree_pool::lease` no
-/// longer writes bindings — the authoritative caller binds after lease.
+/// #779 P2 (Option B): hard-break signature now returns `Result<(), String>`
+/// so callers can surface partial-failure diagnostics. The two pre-existing
+/// silent failure points (`create_dir_all` + `atomic_write`) become explicit
+/// `Err` cases. Two non-target callers (`worktree_pool::lease`,
+/// `dispatch_auto_bind_lease`) preserve their pre-#779-P2 silent semantic
+/// via `let _ = bind_full(...).ok();` — zero observable behavior change to
+/// the dispatch path. Only `ci::handle_checkout_repo` consumes the Result
+/// to populate its new `warnings` array.
 pub fn bind_full(
     home: &Path,
     agent: &str,
@@ -245,39 +174,10 @@ pub fn bind_full(
     worktree: &std::path::Path,
     source_repo: &std::path::Path,
     // #2158 GR1: true ⟺ an AGENT SELF-CLAIM (`bind_self` / `repo checkout bind:true`),
-    // which surfaces to the operator UNLESS `task_id` is non-empty (#2533: a
-    // task_id-carrying self-claim is attributable to a task, so it's in-dispatch).
-    // Dispatch / internal binds pass `is_self_claim=false` and are NEVER gated on
-    // task_id here — a single-target auto-create `send kind=task` legitimately
-    // binds with task_id="" and must NOT false-notify.
+    // which surfaces to the operator. Dispatch / internal binds pass false. Keyed on
+    // the caller's EXPLICIT intent, NOT on task_id — a single-target auto-create
+    // `send kind=task` legitimately binds with task_id="" and must NOT false-notify.
     is_self_claim: bool,
-) -> Result<(), String> {
-    bind_full_with_provenance(
-        home,
-        agent,
-        task_id,
-        branch,
-        worktree,
-        source_repo,
-        is_self_claim,
-        None,
-    )
-}
-
-/// Write a full binding with optional typed provenance included in the initial
-/// signed document. Provenance is deliberately not a post-bind augmentation:
-/// callers that need destructive lifecycle authority must publish all identity
-/// fields before the binding is signed and visible to release/GC readers.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn bind_full_with_provenance(
-    home: &Path,
-    agent: &str,
-    task_id: &str,
-    branch: &str,
-    worktree: &std::path::Path,
-    source_repo: &std::path::Path,
-    is_self_claim: bool,
-    provenance: Option<BindingProvenance<'_>>,
 ) -> Result<(), String> {
     // #1888 phase-2: the agent claiming a branch is acting on any pending
     // ci-handoff for it — resolve the track (re-nudge stops). Scoped to this
@@ -316,44 +216,19 @@ pub(crate) fn bind_full_with_provenance(
             .map(|w| std::path::Path::new(w).exists())
             .unwrap_or(false);
         if ex_worktree_live && !ex_branch.is_empty() && ex_branch != branch {
-            // #2496 (adversarial consensus d-20260701140903334693-1): guard-b's
-            // blanket rejection can't distinguish a genuine live cross-branch
-            // bind-over (the #2158 danger this guard exists for) from "the
-            // worktree was ALREADY cleanly switched to the requested branch
-            // out-of-band (a plain `git checkout`, bypassing bind/release) and
-            // binding.json just hasn't caught up". `same_agent_metadata_catchup_allowed`
-            // is the strict, same-agent-only exception for the latter: pure
-            // metadata catch-up, zero mutation to the worktree. Any condition
-            // failing keeps the original reject — this only WIDENS what's
-            // allowed, never narrows the existing guard.
-            if same_agent_metadata_catchup_allowed(
+            crate::event_log::log(
                 home,
+                "binding_rebind_rejected",
                 agent,
-                worktree,
-                source_repo,
-                branch,
-                ex_branch,
-            ) {
-                tracing::info!(
-                    %agent, %ex_branch, %branch,
-                    "#2496: same-agent stale binding metadata caught up to the worktree's \
-                     already-correct branch — no worktree/branch mutation"
-                );
-            } else {
-                crate::event_log::log(
-                    home,
-                    "binding_rebind_rejected",
-                    agent,
-                    &format!(
-                        "live binding on '{ex_branch}' — refused cross-branch rebind to '{branch}' (#2158); {}",
-                        crate::event_log::caller_process_context()
-                    ),
-                );
-                return Err(format!(
-                    "#2158: agent '{agent}' is bound to a LIVE worktree on branch '{ex_branch}' — \
-                     release_worktree first before binding to '{branch}' (no silent cross-branch rebind)"
-                ));
-            }
+                &format!(
+                    "live binding on '{ex_branch}' — refused cross-branch rebind to '{branch}' (#2158); {}",
+                    crate::event_log::caller_process_context()
+                ),
+            );
+            return Err(format!(
+                "#2158: agent '{agent}' is bound to a LIVE worktree on branch '{ex_branch}' — \
+                 release_worktree first before binding to '{branch}' (no silent cross-branch rebind)"
+            ));
         }
     }
     let wt_str = worktree.display().to_string();
@@ -370,12 +245,6 @@ pub(crate) fn bind_full_with_provenance(
     }
     if !src_str.is_empty() {
         binding["source_repo"] = json!(src_str);
-        register_managed_repo(home, &src_str);
-    }
-    if let Some(BindingProvenance::DaemonProvisionedReview { provisioned_head }) = provenance {
-        binding["checkout_purpose"] = json!("disposable_review");
-        binding["provenance"] = json!("DaemonProvisionedReview");
-        binding["provisioned_head"] = json!(provisioned_head);
     }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     crate::store::atomic_write(&path, body.as_bytes())
@@ -388,8 +257,7 @@ pub(crate) fn bind_full_with_provenance(
     // (a same-uid agent could read the key + re-sign; true sealing needs
     // OS-isolation, parked #1653). Best-effort: a missing/failed sidecar leaves
     // the binding unsigned → the shim fails CLOSED (denies), never open.
-    // embedder P1b: BINDING signer → core `sign_binding` (SAME bare-hex bytes; rollback = revert to `config_integrity::sign`; rationale in Cargo.toml + golden `daemon_signer_core_swap_is_byte_identical_p1b`).
-    match agentic_git_core::integrity_core::sign_binding(home, body.as_bytes()) {
+    match crate::config_integrity::sign(home, body.as_bytes()) {
         Ok(tag) => {
             if let Err(e) = crate::store::atomic_write(&binding_sig_path(&dir), tag.as_bytes()) {
                 tracing::warn!(%agent, error = %e,
@@ -436,22 +304,19 @@ pub(crate) fn bind_full_with_provenance(
     // guard-b cannot prevent (identity-indistinguishable). NOT gated on `changed`: the
     // dispatch flow double-binds (lease then re-bind), so a self-claim's intent-bind is
     // frequently a no-op (changed=false); the per-(agent,branch) sidecar in the helper
-    // gives fire-once. #2533: ALSO gated on an empty `task_id` — a self-claim that
-    // carries a task_id (e.g. `bind_self(task_id=...)` / `repo checkout bind:true
-    // task_id=...`) is attributable to a task and is treated as in-dispatch, so it
-    // does not warn. A single-target auto-create DISPATCH (is_self_claim=false)
-    // never reaches this branch regardless of task_id (see the param doc above).
-    if is_self_claim && task_id.is_empty() {
+    // gives fire-once. Keyed on the caller's explicit `is_self_claim`, NOT task_id — a
+    // single-target auto-create dispatch legitimately binds with task_id="".
+    if is_self_claim {
         notify_operator_out_of_dispatch_bind(home, agent, branch, &wt_str, prev_branch.as_deref());
     }
     Ok(())
 }
 
 mod review_lease;
+#[allow(unused_imports)]
 pub(crate) use review_lease::{
     retarget_disposable_review_binding_for_receipt, try_augment_review_lease,
 };
-
 /// #2158 GR1: surface an OUT-OF-DISPATCH binding CREATE/CHANGE (no task_id) to the
 /// operator — the realistic accidental-sub-agent / first-bind-hijack vector that
 /// guard-b can't prevent. Dedup is per `(agent, branch)` via a runtime-dir sidecar
@@ -522,32 +387,22 @@ fn notify_operator_out_of_dispatch_bind(
     };
     // Best-effort, file-based inbox to the resolved recipient — mirrors
     // `canonical_auto_stash`.
-    let text = out_of_dispatch_notify_body(agent, branch, prev_branch);
+    let was = prev_branch
+        .map(|p| format!(", was `{p}`"))
+        .unwrap_or_default();
+    let text = format!(
+        "[system:binding_out_of_dispatch] instance `{agent}` bound to branch `{branch}`{was} \
+         OUTSIDE a task dispatch (no task_id). If unexpected, a transient sub-agent or a \
+         self-claim may have moved this instance's worktree. The daemon CANNOT name the exact \
+         caller — a Task sub-agent shares the primary's identity and process. Inspect with \
+         `binding_state instance={agent}`; undo with `release_worktree`. (#2158 GR1)"
+    );
     crate::inbox::notify_agent(
         home,
         &recipient,
         &crate::inbox::NotifySource::System("binding_out_of_dispatch"),
         &text,
     );
-}
-
-/// #2533: the notification BODY text for an out-of-dispatch self-claim bind.
-/// Extracted as a pure fn so the double-tag regression is unit-testable:
-/// `NotifySource::System("binding_out_of_dispatch")` already renders the
-/// `[system:binding_out_of_dispatch]` tag at the delivery-layer wrapper
-/// (`inbox::format_notification_for_inject`) — this body must NOT hardcode
-/// the same tag, or the rendered notification doubles it.
-fn out_of_dispatch_notify_body(agent: &str, branch: &str, prev_branch: Option<&str>) -> String {
-    let was = prev_branch
-        .map(|p| format!(", was `{p}`"))
-        .unwrap_or_default();
-    format!(
-        "instance `{agent}` bound to branch `{branch}`{was} \
-         OUTSIDE a task dispatch (no task_id). If unexpected, a transient sub-agent or a \
-         self-claim may have moved this instance's worktree. The daemon CANNOT name the exact \
-         caller — a Task sub-agent shares the primary's identity and process. Inspect with \
-         `binding_state instance={agent}`; undo with `release_worktree`. (#2158 GR1)"
-    )
 }
 
 /// #2347: resolve WHO receives the out-of-dispatch live notice for `agent`.
@@ -573,6 +428,40 @@ fn out_of_dispatch_notify_recipient(home: &Path, agent: &str) -> Option<String> 
 /// the same `binding.json.sig` name (it cannot import this — separate binary).
 fn binding_sig_path(dir: &Path) -> PathBuf {
     dir.join("binding.json.sig")
+}
+
+/// Clear a binding for an agent (task completed/released).
+pub fn unbind(home: &Path, agent: &str) {
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    // #2158 PR2 (ii): audit the release/clear side of binding-change detection with
+    // caller process context (read the prior branch before removal). Only logs when
+    // a binding actually existed (a no-op unbind stays silent).
+    if let Some(prev_branch) = std::fs::read_to_string(dir.join("binding.json"))
+        .ok()
+        .and_then(|c| parse_binding_guarded(&c))
+        .and_then(|v| v.get("branch").and_then(|b| b.as_str()).map(String::from))
+    {
+        crate::event_log::log(
+            home,
+            "binding_released",
+            agent,
+            &format!(
+                "prev_branch={prev_branch}; {}",
+                crate::event_log::caller_process_context()
+            ),
+        );
+    }
+    let _ = std::fs::remove_file(dir.join("binding.json"));
+    // #1651: drop the HMAC sidecar too, so a stale signature can't linger.
+    let _ = std::fs::remove_file(binding_sig_path(&dir));
+    // bug-audit Rank6: clear the out-of-dispatch notify latch so a release resets
+    // it — a later real re-claim of the same branch re-surfaces instead of being
+    // silently swallowed as "already notified". Scoped to release, so the
+    // per-(agent,branch) intra-cycle fire-once dedup is preserved.
+    let _ = std::fs::remove_file(dir.join(OUT_OF_DISPATCH_SIDECAR));
+    if let Ok(mut map) = binding_index().write() {
+        map.remove(&index_key(home, agent));
+    }
 }
 
 // #1688 (codex): there is intentionally NO startup "re-sign unsigned bindings"
@@ -643,30 +532,6 @@ pub fn scan_existing_branch_binding(
     None
 }
 
-/// #2550 W3 Wave1: fresh (uncached) enumeration of every agent under `home`'s
-/// runtime dir whose `binding.json` is present and parses as JSON. An agent
-/// with a missing/unreadable/corrupt binding.json is silently skipped —
-/// every existing scan-all-agents call site already tolerated this, so the
-/// shared primitive preserves it uniformly. Field-level extraction and any
-/// further validation (branch match, empty-task_id, dedup, ...) is the
-/// caller's job.
-pub(crate) fn binding_scan_all(home: &Path) -> Vec<(String, serde_json::Value)> {
-    let runtime_dir = crate::paths::runtime_dir(home);
-    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let agent_name = entry.file_name().to_string_lossy().into_owned();
-            let binding_path = crate::paths::binding_path(home, &agent_name);
-            let content = std::fs::read_to_string(&binding_path).ok()?;
-            let v: serde_json::Value = serde_json::from_str(&content).ok()?;
-            Some((agent_name, v))
-        })
-        .collect()
-}
-
 /// PR-3 (t-ci-ready-pr3-arm-not-armed): the distinct `source_repo` paths of every
 /// LIVE bound branch (each `runtime/<agent>/binding.json`'s `source_repo`).
 ///
@@ -677,11 +542,35 @@ pub(crate) fn binding_scan_all(home: &Path) -> Vec<(String, serde_json::Value)> 
 /// unwatched PR in an otherwise-unseeded repo would never be discovered (the
 /// #1782 gap). Returns raw paths (slug resolution is the caller's job) to keep
 /// this module free of the git/scm dependency.
-mod managed_repos;
-#[cfg(test)]
-pub(crate) use managed_repos::read_managed_repo_registry;
-pub(crate) use managed_repos::register_managed_repo;
-pub use managed_repos::{all_managed_repos, bound_source_repos};
+pub fn bound_source_repos(home: &Path) -> Vec<std::path::PathBuf> {
+    let runtime_dir = crate::paths::runtime_dir(home);
+    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<std::path::PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let binding_path = entry.path().join("binding.json");
+        let Ok(content) = std::fs::read_to_string(&binding_path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+        if let Some(src) = v["source_repo"].as_str() {
+            let path = std::path::PathBuf::from(src);
+            if !repos.contains(&path) {
+                repos.push(path);
+            }
+        }
+    }
+    repos
+}
+
+// #t-…81457-1: the worktree-occupancy equivalent of `bound_source_repos`
+// lives in `worktree_cleanup` (its only consumer) as
+// `bound_worktree_paths_or_ambiguous` — it needs to distinguish "no
+// binding.json" from "unreadable/corrupt binding.json" for the delete-path
+// fail-closed requirement, unlike this module's existing scan helpers.
 
 /// Read the current binding for an agent.
 /// Hot path: returns from in-memory index (read lock). Cold path
@@ -723,11 +612,6 @@ pub fn is_agent_in_managed_worktree(home: &Path, agent: &str) -> bool {
         .map(|wt| wt.join(".agend-managed").exists())
         .unwrap_or(false)
 }
-
-/// #2755 R4: binding-adoption query for checkout recovery, extracted to the
-/// `worktree_state` submodule; re-exported for the stable `crate::binding` path.
-mod worktree_state;
-pub(crate) use worktree_state::{refresh_cached, worktree_binding_state, WorktreeBindingState};
 
 /// Install the prepare-commit-msg hook into a worktree via core.hooksPath.
 /// Points to `$AGEND_HOME/hooks/` unified directory.
@@ -830,19 +714,41 @@ pub fn reconcile_hooks(home: &Path) {
     }
 }
 
-/// Git/kill shim installation — see [`shim_install::symlink_shim`]. Homed in its
-/// own module so the #2524-P2 flag-gated backend-swap logic AND its unit tests
-/// don't push this core file past the anti-monolith LOC ceiling. Re-exported so
-/// the public path stays `crate::binding::symlink_shim` (call site + wiring
-/// invariant unchanged).
-mod shim_install;
-pub use shim_install::symlink_shim;
+/// Symlink the agend-git binary into $AGEND_HOME/bin/git.
+/// Called at daemon startup so the shim shadows /usr/bin/git via PATH.
+pub fn symlink_shim(home: &Path) {
+    let bin_dir = home.join("bin");
+    std::fs::create_dir_all(&bin_dir).ok();
+    let link_name = if cfg!(windows) { "git.exe" } else { "git" };
+    let link_path = bin_dir.join(link_name);
+
+    // Find the agend-git binary alongside the main binary.
+    let shim_name = if cfg!(windows) {
+        "agend-git.exe"
+    } else {
+        "agend-git"
+    };
+    let shim_src = std::env::current_exe().ok().and_then(|exe| {
+        let candidate = exe.with_file_name(shim_name);
+        candidate.exists().then_some(candidate)
+    });
+
+    if let Some(src) = shim_src {
+        // Remove stale symlink/file first.
+        let _ = std::fs::remove_file(&link_path);
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink(&src, &link_path);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::copy(&src, &link_path);
+        }
+    }
+}
 
 /// Clear orphan bindings (agents no longer in registry).
-/// Called at daemon startup, after the singleton `.daemon.lock` is acquired by
-/// normal bootstrap/app/handoff paths. This is a source-pinned pre-agent
-/// exemption from the per-agent lifecycle permit: no competing daemon writer
-/// can enter until bootstrap releases that singleton lock.
+/// Called at daemon startup.
 pub fn reconcile_orphans(home: &Path) {
     let runtime_dir = crate::paths::runtime_dir(home);
     if !runtime_dir.exists() {
@@ -852,11 +758,6 @@ pub fn reconcile_orphans(home: &Path) {
         for entry in entries.flatten() {
             let binding_path = entry.path().join("binding.json");
             if binding_path.exists() {
-                let entry_path = entry.path();
-                let agent_name = entry_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
                 // Check if binding is stale (issued_at > 24h ago).
                 if let Ok(content) = std::fs::read_to_string(&binding_path) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -866,6 +767,11 @@ pub fn reconcile_orphans(home: &Path) {
                                     .signed_duration_since(dt.with_timezone(&chrono::Utc));
                                 if age > chrono::Duration::hours(24) {
                                     // #693: check heartbeat — if agent is still active, don't delete
+                                    let entry_path = entry.path();
+                                    let agent_name = entry_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("");
                                     let hb =
                                         crate::daemon::heartbeat_pair::snapshot_for(agent_name);
                                     let hb_age_ms = crate::daemon::heartbeat_pair::now_ms()
@@ -890,6 +796,54 @@ pub fn reconcile_orphans(home: &Path) {
             }
         }
     }
+}
+
+pub fn find_agent_by_branch_or_task(
+    home: &Path,
+    branch: &str,
+    task_id: Option<&str>,
+) -> Option<String> {
+    let runtime_dir = crate::paths::runtime_dir(home);
+    let entries = std::fs::read_dir(runtime_dir).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        if entry.path().is_dir() {
+            let agent_name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(binding) = read(home, &agent_name) {
+                if !branch.is_empty() {
+                    if let Some(b) = binding["branch"].as_str() {
+                        if b == branch {
+                            return Some(agent_name);
+                        }
+                    }
+                }
+                if let Some(tid) = task_id {
+                    if let Some(t) = binding["task_id"].as_str() {
+                        if t == tid {
+                            return Some(agent_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn binding_scan_all(home: &Path) -> Vec<(String, serde_json::Value)> {
+    let runtime_dir = crate::paths::runtime_dir(home);
+    let Ok(entries) = std::fs::read_dir(&runtime_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let agent_name = entry.file_name().to_string_lossy().into_owned();
+            let binding_path = entry.path().join("binding.json");
+            let content = std::fs::read_to_string(&binding_path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+            Some((agent_name, v))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1053,74 +1007,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).ok();
         dir
-    }
-
-    // ─── #2550 W3 Wave1 pins: bound_source_repos (pre-refactor, zero prior
-    // coverage) — locks current field-extraction/dedup/corruption-tolerance/
-    // missing-field behavior before the binding_scan_all() extraction. ───────
-
-    #[test]
-    fn bound_source_repos_returns_distinct_source_repos_2550_w3() {
-        let home = tmp_home("src-repos-distinct");
-        write_binding_json(&home, "alpha", "feat/a", Some("/repo/a"));
-        write_binding_json(&home, "beta", "feat/b", Some("/repo/b"));
-
-        let mut repos = bound_source_repos(&home);
-        repos.sort();
-        assert_eq!(
-            repos,
-            vec![
-                std::path::PathBuf::from("/repo/a"),
-                std::path::PathBuf::from("/repo/b")
-            ],
-            "distinct source_repo paths across agents must all surface: {repos:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn bound_source_repos_dedupes_same_source_repo_2550_w3() {
-        let home = tmp_home("src-repos-dedup");
-        write_binding_json(&home, "alpha", "feat/a", Some("/repo/shared"));
-        write_binding_json(&home, "beta", "feat/b", Some("/repo/shared"));
-
-        let repos = bound_source_repos(&home);
-        assert_eq!(
-            repos,
-            vec![std::path::PathBuf::from("/repo/shared")],
-            "two agents bound to the SAME source_repo must dedupe to one entry: {repos:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn bound_source_repos_skips_missing_source_repo_field_2550_w3() {
-        let home = tmp_home("src-repos-missing-field");
-        write_binding_json(&home, "legacy", "feat/legacy", None); // no source_repo
-
-        let repos = bound_source_repos(&home);
-        assert!(
-            repos.is_empty(),
-            "a binding with no source_repo field must not contribute an entry: {repos:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn bound_source_repos_tolerates_corrupt_binding_json_2550_w3() {
-        let home = tmp_home("src-repos-corrupt");
-        let corrupt_dir = crate::paths::runtime_dir(&home).join("corrupt-agent");
-        std::fs::create_dir_all(&corrupt_dir).unwrap();
-        std::fs::write(corrupt_dir.join("binding.json"), b"not valid json").unwrap();
-        write_binding_json(&home, "good-agent", "feat/good", Some("/repo/good"));
-
-        let repos = bound_source_repos(&home);
-        assert_eq!(
-            repos,
-            vec![std::path::PathBuf::from("/repo/good")],
-            "a corrupt sibling binding must not block finding the valid one: {repos:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
     }
 
     /// #2234: install_hooks must write the reference-transaction detach instrument
@@ -1585,248 +1471,6 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    // ── #2496: same-agent metadata-catchup exception to guard-b ──────────────
-
-    /// A real git-repo dir standing in for a worktree (plain repo — every
-    /// check the #2496 exception performs, `is_git_repo`/`has_uncommitted_changes`/
-    /// `branch --show-current`/`switch`, works identically on a plain repo or an
-    /// actual `git worktree add` checkout).
-    fn tmp_git_repo(tag: &str) -> std::path::PathBuf {
-        let dir = tmp_home(tag);
-        std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .args(["init", "-q", "-b", "main"])
-            .current_dir(&dir)
-            .output()
-            .ok();
-        // Every REAL source repo gitignores `.agend-managed` (this repo's own
-        // .gitignore does — see `worktree.rs::commit_marker_gitignore`'s test
-        // precedent) so the lease marker never makes a clean worktree look
-        // dirty. Commit it here so `write_managed_marker` doesn't trip
-        // `has_uncommitted_changes` in these tests.
-        std::fs::write(dir.join(".gitignore"), ".agend-managed\n").unwrap();
-        std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .args(["add", ".gitignore"])
-            .current_dir(&dir)
-            .output()
-            .ok();
-        std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .args([
-                "-c",
-                "user.name=test",
-                "-c",
-                "user.email=test@test",
-                "commit",
-                "-q",
-                "-m",
-                "init",
-            ])
-            .current_dir(&dir)
-            .output()
-            .ok();
-        dir
-    }
-
-    fn git_switch(repo: &Path, branch: &str) {
-        std::process::Command::new("git")
-            .env("AGEND_GIT_BYPASS", "1")
-            .args(["switch", "-c", branch])
-            .current_dir(repo)
-            .output()
-            .ok();
-    }
-
-    fn write_managed_marker(worktree: &Path, agent: &str) {
-        std::fs::write(
-            worktree.join(crate::worktree_pool::MANAGED_MARKER),
-            format!("agent={agent}\nbranch=irrelevant\n"),
-        )
-        .unwrap();
-    }
-
-    /// #2496 (consensus test 1 + 8): a worktree that was cleanly `git
-    /// checkout`'d to the requested branch out-of-band (bind/release bypassed
-    /// entirely) — daemon-managed, owned by this agent, clean — gets its
-    /// STALE binding metadata caught up instead of rejected. No worktree
-    /// mutation happens (it was already on the right branch).
-    #[test]
-    fn guard_b_allows_metadata_catchup_when_worktree_already_on_requested_branch_2496() {
-        let home = tmp_home("2496-catchup-allow");
-        let wt = tmp_git_repo("2496-catchup-allow-wt");
-        write_managed_marker(&wt, "agentA");
-        let src = home.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
-
-        // Out-of-band: the worktree is switched to feat/y directly (bypassing
-        // bind/release) — binding.json still says feat/x.
-        git_switch(&wt, "feat/y");
-
-        bind_full(&home, "agentA", "", "feat/y", &wt, &src, false).expect(
-            "same-agent metadata catchup must be allowed: worktree is already on feat/y, clean, managed",
-        );
-        assert_eq!(
-            read(&home, "agentA")
-                .and_then(|b| b.get("branch").and_then(|v| v.as_str()).map(String::from))
-                .as_deref(),
-            Some("feat/y"),
-            "binding.json must catch up to the worktree's actual branch"
-        );
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&wt).ok();
-    }
-
-    /// #2496 (consensus test 2): same scenario, but the worktree is DIRTY —
-    /// guard-b's original reject stands; metadata is untouched.
-    #[test]
-    fn guard_b_rejects_metadata_catchup_when_worktree_dirty_2496() {
-        let home = tmp_home("2496-catchup-dirty");
-        let wt = tmp_git_repo("2496-catchup-dirty-wt");
-        write_managed_marker(&wt, "agentA");
-        let src = home.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
-        git_switch(&wt, "feat/y");
-        std::fs::write(wt.join("dirty.txt"), "uncommitted").unwrap();
-
-        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
-            .expect_err("dirty worktree must NOT get the metadata-catchup exception");
-        assert!(
-            err.contains("#2158"),
-            "must be the original guard-b reject: {err}"
-        );
-        assert_eq!(
-            read(&home, "agentA")
-                .and_then(|b| b.get("branch").and_then(|v| v.as_str()).map(String::from))
-                .as_deref(),
-            Some("feat/x"),
-            "rejected catchup must not mutate the binding"
-        );
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&wt).ok();
-    }
-
-    /// #2496 (consensus test 3): missing `.agend-managed` marker, and a marker
-    /// present but recording a DIFFERENT agent, both reject.
-    #[test]
-    fn guard_b_rejects_metadata_catchup_when_marker_missing_or_mismatched_2496() {
-        let home = tmp_home("2496-catchup-marker");
-        let src = home.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-
-        // Sub-case: marker missing entirely.
-        let wt1 = tmp_git_repo("2496-catchup-marker-missing");
-        bind_full(&home, "agentA", "", "feat/x", &wt1, &src, false).expect("first bind ok");
-        git_switch(&wt1, "feat/y");
-        assert!(
-            bind_full(&home, "agentA", "", "feat/y", &wt1, &src, false).is_err(),
-            "no .agend-managed marker → not daemon-managed → reject"
-        );
-        std::fs::remove_dir_all(&wt1).ok();
-
-        // Sub-case: marker present but for a DIFFERENT agent.
-        let wt2 = tmp_git_repo("2496-catchup-marker-mismatch");
-        write_managed_marker(&wt2, "someone-else");
-        bind_full(&home, "agentB", "", "feat/x", &wt2, &src, false).expect("first bind ok");
-        git_switch(&wt2, "feat/y");
-        assert!(
-            bind_full(&home, "agentB", "", "feat/y", &wt2, &src, false).is_err(),
-            "marker agent mismatch → reject, not treated as this agent's own stale metadata"
-        );
-        std::fs::remove_dir_all(&wt2).ok();
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #2496 (consensus test 4): the requested branch is already held by a
-    /// DIFFERENT agent — reject even though this agent's own worktree is
-    /// clean and genuinely on that branch (two worktrees can't both claim the
-    /// same (source_repo, branch)).
-    #[test]
-    fn guard_b_rejects_metadata_catchup_when_branch_held_by_another_agent_2496() {
-        let home = tmp_home("2496-catchup-other-agent");
-        let src = home.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        let other_wt = home.join("other-wt");
-        std::fs::create_dir_all(&other_wt).unwrap();
-        bind_full(&home, "other-agent", "", "feat/y", &other_wt, &src, false)
-            .expect("other agent holds feat/y");
-
-        let wt = tmp_git_repo("2496-catchup-other-agent-wt");
-        write_managed_marker(&wt, "agentA");
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
-        git_switch(&wt, "feat/y");
-
-        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
-            .expect_err("feat/y is held by another agent on the same source_repo — must reject");
-        assert!(err.contains("#2158"), "{err}");
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&wt).ok();
-    }
-
-    /// #2496 (consensus test 5): the stale branch (`feat/x`, being abandoned)
-    /// has an active CI watch for this agent — must not silently orphan it.
-    #[test]
-    fn guard_b_rejects_metadata_catchup_when_stale_branch_has_active_ci_watch_2496() {
-        let home = tmp_home("2496-catchup-ci-watch");
-        let wt = tmp_git_repo("2496-catchup-ci-watch-wt");
-        write_managed_marker(&wt, "agentA");
-        let src = home.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
-        git_switch(&wt, "feat/y");
-
-        let ci_dir = home.join("ci-watches");
-        std::fs::create_dir_all(&ci_dir).unwrap();
-        std::fs::write(
-            ci_dir.join("w.json"),
-            serde_json::to_string(&serde_json::json!({
-                "repo": "o/r",
-                "branch": "feat/x",
-                "subscribers": [{"instance": "agentA"}],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
-            .expect_err("active CI watch on the abandoned stale branch must block catchup");
-        assert!(err.contains("#2158"), "{err}");
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&wt).ok();
-    }
-
-    /// #2496 (consensus test 6): the stale branch has an active
-    /// branch-linked task — must not silently orphan it.
-    #[test]
-    fn guard_b_rejects_metadata_catchup_when_stale_branch_has_active_task_2496() {
-        let home = tmp_home("2496-catchup-task");
-        let wt = tmp_git_repo("2496-catchup-task-wt");
-        write_managed_marker(&wt, "agentA");
-        let src = home.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("first bind ok");
-        git_switch(&wt, "feat/y");
-
-        crate::tasks::handle(
-            &home,
-            "agentA",
-            &serde_json::json!({
-                "action": "create",
-                "title": "work on feat/x",
-                "assignee": "agentA",
-                "branch": "feat/x",
-            }),
-        );
-
-        let err = bind_full(&home, "agentA", "", "feat/y", &wt, &src, false)
-            .expect_err("active task linked to the abandoned stale branch must block catchup");
-        assert!(err.contains("#2158"), "{err}");
-        std::fs::remove_dir_all(&home).ok();
-        std::fs::remove_dir_all(&wt).ok();
-    }
-
     /// (ii) binding-change audit: a bind emits `binding_changed` and an unbind emits
     /// `binding_released`, both carrying caller process context (`pid=`).
     #[test]
@@ -1947,57 +1591,6 @@ mod tests {
             "#2158 GR1: an EMPTY-task_id dispatch (is_self_claim=false) must NOT false-notify: {log}"
         );
         std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ── #2533: task_id-carrying self-claim is in-dispatch (no warning) ───────
-
-    /// A self-claim bind (`bind_self` / `repo checkout bind:true`) that CARRIES a
-    /// task_id — e.g. a dev's `bind_self(task_id=...)` workaround for #2525, or a
-    /// reviewer's `repo checkout bind:true task_id=...` — is legitimately
-    /// attributed to a task and must be treated as IN-DISPATCH: no
-    /// `binding_out_of_dispatch` marker/notify. An EMPTY task_id self-claim
-    /// (`self_claim_bind_surfaces_once_per_branch_2158_gr1` above) still warns —
-    /// unchanged.
-    #[test]
-    fn self_claim_bind_with_task_id_does_not_surface_2533() {
-        let home = tmp_home("2533-task-id-no-warn");
-        let wt = home.join("wt");
-        std::fs::create_dir_all(&wt).unwrap();
-        let src = home.join("src");
-        std::fs::create_dir_all(&src).unwrap();
-
-        bind_full(&home, "ag", "T-123", "feat/x", &wt, &src, true)
-            .expect("self-claim bind with task_id ok");
-
-        let log = read_event_log(&home);
-        assert!(
-            !log.contains("binding_out_of_dispatch"),
-            "#2533: a self-claim bind CARRYING a task_id must be treated as in-dispatch — no \
-             warning: {log}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #2533: `notify_operator_out_of_dispatch_bind`'s body text must NOT
-    /// hardcode the `[system:binding_out_of_dispatch]` tag — `NotifySource::System`
-    /// already renders it once at the delivery-layer wrapper
-    /// (`format_notification_for_inject`). A hardcoded prefix doubles it:
-    /// `[system:binding_out_of_dispatch] [system:binding_out_of_dispatch] ...`.
-    #[test]
-    fn out_of_dispatch_notification_renders_tag_exactly_once_2533() {
-        let text = out_of_dispatch_notify_body("ag", "feat/x", None);
-        let rendered = crate::inbox::format_notification_for_inject(
-            false,
-            &crate::inbox::NotifySource::System("binding_out_of_dispatch"),
-            &text,
-            &[],
-        );
-        assert_eq!(
-            rendered.matches("[system:binding_out_of_dispatch]").count(),
-            1,
-            "#2533: rendered notification must carry the tag exactly once (double-render bug): \
-             {rendered}"
-        );
     }
 
     // ── #2347: route the binding_out_of_dispatch DELIVERY to the team ────────
@@ -2436,60 +2029,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
         std::fs::remove_dir_all(&base).ok();
     }
-
-    /// Lifecycle #1: after the last binding for a repo is released, the repo is
-    /// still discoverable via the durable managed-repo registry — closes the
-    /// last-binding repo-discovery hole. RED without register_managed_repo.
-    #[test]
-    fn last_binding_gone_repo_still_discovered() {
-        let home = tmp_home("last-binding-discovery");
-        let wt = home.join("wt");
-        std::fs::create_dir_all(&wt).unwrap();
-        let src = home.join("canonical-repo");
-        std::fs::create_dir_all(&src).unwrap();
-
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("bind ok");
-        // The repo is seeded into the registry on bind.
-        assert!(
-            all_managed_repos(&home).contains(&src),
-            "repo must be discoverable while bound"
-        );
-
-        // Simulate last-binding release: remove the binding.json.
-        let binding_path = crate::paths::runtime_dir(&home)
-            .join("agentA")
-            .join("binding.json");
-        std::fs::remove_file(&binding_path).ok();
-
-        // Live bindings now empty, but the registry keeps the repo discoverable.
-        assert!(
-            bound_source_repos(&home).is_empty(),
-            "no live bindings after release"
-        );
-        assert!(
-            all_managed_repos(&home).contains(&src),
-            "repo must STILL be discovered after the last binding is released"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// Lifecycle #2: registry dedups — binding the same repo twice records it once.
-    #[test]
-    fn managed_repo_registry_dedups() {
-        let home = tmp_home("registry-dedup");
-        let wt = home.join("wt");
-        std::fs::create_dir_all(&wt).unwrap();
-        let src = home.join("repo");
-        std::fs::create_dir_all(&src).unwrap();
-
-        bind_full(&home, "agentA", "", "feat/x", &wt, &src, false).expect("bind1");
-        bind_full(&home, "agentB", "", "feat/y", &wt, &src, false).expect("bind2");
-
-        let registry = read_managed_repo_registry(&home);
-        let count = registry.iter().filter(|p| **p == src).count();
-        assert_eq!(count, 1, "repo recorded exactly once in registry");
-        std::fs::remove_dir_all(&home).ok();
-    }
 }
+
 #[cfg(test)]
 mod review_repro_agent_binding;

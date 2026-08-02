@@ -60,7 +60,6 @@ mod layout;
 mod logging;
 mod mcp;
 mod mcp_config;
-mod merge_receipt;
 mod mouse_forward;
 mod notification_queue;
 pub mod operator_mode;
