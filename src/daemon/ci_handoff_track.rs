@@ -55,6 +55,10 @@ pub(crate) const SCHEMA_VERSION: u32 = 1;
 /// Backstop lifetime: a track never resolved within this window is swept
 /// (with a WARN) so the re-nudge cannot run forever.
 pub(crate) const TRACK_MAX_AGE: chrono::Duration = chrono::Duration::hours(24);
+/// Grace after a handoff was recorded before a processed inbox row may be used
+/// as crash-recovery evidence. This leaves the normal explicit resolver first
+/// chance and avoids racing a just-written row/track pair.
+pub(crate) const TRACK_RECONCILE_GRACE: chrono::Duration = chrono::Duration::seconds(30);
 
 /// One pending CI handoff awaiting pickup-resolution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -65,6 +69,14 @@ pub(crate) struct CiHandoffTrack {
     /// `owner/repo@branch` — the same key the handoff message carries as its
     /// `correlation_id` and that reviewer reports / pr_state events use.
     pub correlation: String,
+    /// Opaque identity shared with the durable ci-ready inbox row. Missing on
+    /// legacy tracks; protected settlement must fail closed in that case.
+    #[serde(default)]
+    pub ci_handoff_episode: Option<String>,
+    /// Protected/feature class shared with the inbox row. Missing on legacy
+    /// tracks; callers must not infer it from a branch string.
+    #[serde(default)]
+    pub ci_handoff_class: Option<crate::inbox::CiHandoffClass>,
     /// RFC3339 — when the handoff was enqueued (the re-nudge age anchor).
     pub sent_at: String,
     /// #2008: the branch head (`pr.current_sha`) at record time. `#[serde(default)]`
@@ -74,6 +86,141 @@ pub(crate) struct CiHandoffTrack {
     /// tier-b) — no `schema_version` bump.
     #[serde(default)]
     pub head_sha: Option<String>,
+    /// #2412-follow-up (ci-handoff correlation convention split): the fleet
+    /// dispatch's own `t-...` task id, when the handoff's `next_after_ci`
+    /// recipient was reached via a dispatch that carries one (the poller's
+    /// `state.task_id`). A standard `kind=report` in this fleet carries
+    /// `correlation_id=t-...` (Sprint 58 W4 PR-1), NOT `repo@branch` — so
+    /// [`resolve_by_correlation`] matching only `correlation` made that the
+    /// common case a permanent no-op (`messaging.rs`'s `track_dispatch`
+    /// forwards every report's correlation here uninspected). Matching EITHER
+    /// key closes it without touching `resolve_claimed`/`resolve_head_advanced`/
+    /// the 24h sweep, whose pinned tests assume `correlation` alone.
+    /// `#[serde(default)]` → a pre-fix track reads back as `None` (matches
+    /// nothing extra, unchanged behavior).
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// #35896-11 ⑥: the last time the `handoff_timeout_watchdog` re-nudged /
+    /// escalated this `(target, correlation)`, persisted DURABLY on the track so a
+    /// daemon RESTART doesn't reset the in-mem throttle map and re-fire a burst for
+    /// every live handoff on boot. RFC3339. The watchdog's in-mem map stays the
+    /// primary (fast) throttle; these are consulted ONLY as the fallback when the
+    /// map lacks the key (post-restart). A fresh [`record`] (new CI pass) leaves
+    /// them `None` → the new episode is un-throttled (correct: a genuinely new
+    /// handoff should renudge on its own schedule). `#[serde(default)]` → a pre-⑥
+    /// track reads back `None` = never-nudged/never-escalated = the pre-⑥ behavior
+    /// (the first post-restart tick nudges once, then persists the throttle).
+    #[serde(default)]
+    pub last_renudged_at: Option<String>,
+    #[serde(default)]
+    pub last_escalated_at: Option<String>,
+    #[serde(default)]
+    pub deferred_by: Option<String>,
+    #[serde(default)]
+    pub deferred_at: Option<String>,
+    #[serde(default)]
+    pub wake_task_id: Option<String>,
+    #[serde(default)]
+    pub defer_reason: Option<String>,
+    #[serde(default)]
+    pub defer_expires_at: Option<String>,
+}
+
+impl CiHandoffTrack {
+    pub fn is_deferred(&self) -> bool {
+        self.deferred_at.is_some()
+    }
+
+    pub fn is_defer_expired(&self, now: &chrono::DateTime<chrono::Utc>) -> bool {
+        match self
+            .defer_expires_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        {
+            Some(exp) => *now >= exp.with_timezone(&chrono::Utc),
+            None => true, // missing/malformed → expired (fail-safe, never indefinite)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DeferOutcome {
+    Deferred,
+    EpisodeMismatch,
+    AlreadyDeferred,
+    TrackNotFound,
+    LockFailed,
+}
+
+pub(crate) struct DeferRequest<'a> {
+    pub target: &'a str,
+    pub correlation: &'a str,
+    pub episode: &'a str,
+    pub deferred_by: &'a str,
+    pub wake_task_id: &'a str,
+    pub reason: &'a str,
+    pub defer_secs: i64,
+}
+
+pub(crate) fn defer_track(home: &Path, req: &DeferRequest<'_>) -> DeferOutcome {
+    let path = file_for(home, req.target, req.correlation);
+    let lock_path = lock_for(home, req.target, req.correlation);
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+        return DeferOutcome::LockFailed;
+    };
+    let current = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    let Some(mut track) = current else {
+        return DeferOutcome::TrackNotFound;
+    };
+    if track.ci_handoff_episode.as_deref() != Some(req.episode) {
+        return DeferOutcome::EpisodeMismatch;
+    }
+    if track.is_deferred() {
+        return DeferOutcome::AlreadyDeferred;
+    }
+    let now = chrono::Utc::now();
+    track.deferred_by = Some(req.deferred_by.to_string());
+    track.deferred_at = Some(now.to_rfc3339());
+    track.wake_task_id = Some(req.wake_task_id.to_string());
+    track.defer_reason = Some(req.reason.to_string());
+    track.defer_expires_at = Some((now + chrono::Duration::seconds(req.defer_secs)).to_rfc3339());
+    if atomic_write_track(&path, &track).is_err() {
+        return DeferOutcome::LockFailed;
+    }
+    DeferOutcome::Deferred
+}
+
+pub(crate) fn reactivate_track(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+) -> bool {
+    let path = file_for(home, target, correlation);
+    let lock_path = lock_for(home, target, correlation);
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
+        return false;
+    };
+    let current = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    let Some(mut track) = current else {
+        return false;
+    };
+    if track.ci_handoff_episode.as_deref() != Some(episode) {
+        return false;
+    }
+    if !track.is_deferred() {
+        return false;
+    }
+    track.deferred_by = None;
+    track.deferred_at = None;
+    track.wake_task_id = None;
+    track.defer_reason = None;
+    track.defer_expires_at = None;
+    atomic_write_track(&path, &track).is_ok()
 }
 
 fn dir(home: &Path) -> PathBuf {
@@ -190,26 +337,94 @@ fn remove_if_unchanged(
     }
 }
 
+/// Episode-aware delete guard for protected settlement. Matching the durable
+/// episode as well as `sent_at` prevents an old ACK from deleting a re-recorded
+/// track when both writes happen within the same timestamp tick.
+fn remove_if_episode_unchanged(
+    home: &Path,
+    path: &Path,
+    target: &str,
+    correlation: &str,
+    expect_sent_at: &str,
+    expect_episode: &str,
+) -> bool {
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_for(home, target, correlation)) else {
+        return false;
+    };
+    let current = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    match current {
+        Some(t)
+            if t.sent_at == expect_sent_at
+                && t.ci_handoff_episode.as_deref() == Some(expect_episode) =>
+        {
+            std::fs::remove_file(path).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Record (or refresh — a NEW CI pass on the same branch restarts the age
 /// anchor) the pending handoff for `(target, correlation)`.
+#[allow(dead_code)]
 pub(crate) fn record(
     home: &Path,
     target: &str,
     correlation: &str,
     sent_at: &str,
     head_sha: Option<&str>,
+    task_id: Option<&str>,
 ) {
+    let _ = record_with_identity(
+        home,
+        target,
+        correlation,
+        sent_at,
+        head_sha,
+        task_id,
+        None,
+        None,
+    );
+}
+
+/// Record a track with the durable row identity. Returns `true` only after the
+/// JSON track is atomically persisted; callers can keep the CI notification
+/// cursor retryable if this write fails.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_with_identity(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    sent_at: &str,
+    head_sha: Option<&str>,
+    task_id: Option<&str>,
+    ci_handoff_episode: Option<&str>,
+    ci_handoff_class: Option<crate::inbox::CiHandoffClass>,
+) -> bool {
     let track = CiHandoffTrack {
         schema_version: SCHEMA_VERSION,
         target: target.to_string(),
         correlation: correlation.to_string(),
+        ci_handoff_episode: ci_handoff_episode.map(String::from),
+        ci_handoff_class,
         sent_at: sent_at.to_string(),
         head_sha: head_sha.map(String::from),
+        task_id: task_id.map(String::from),
+        // #35896-11 ⑥: a fresh record (new CI pass) starts un-throttled — the new
+        // handoff episode renudges/escalates on its own schedule.
+        last_renudged_at: None,
+        last_escalated_at: None,
+        deferred_by: None,
+        deferred_at: None,
+        wake_task_id: None,
+        defer_reason: None,
+        defer_expires_at: None,
     };
     let path = file_for(home, target, correlation);
     if let Err(e) = std::fs::create_dir_all(dir(home)) {
         tracing::warn!(%target, %correlation, error = %e, "#1888: ci-handoff track dir create failed");
-        return;
+        return false;
     }
     // #1963: take the per-key lock so this write is atomic w.r.t. a concurrent
     // resolve/sweep of the same key (delete-if-unchanged) — the resolution can't
@@ -218,7 +433,7 @@ pub(crate) fn record(
     let _lock = crate::store::acquire_file_lock(&lock_for(home, target, correlation)).ok();
     if let Err(e) = atomic_write_track(&path, &track) {
         tracing::warn!(%target, %correlation, error = %e, "#1888: ci-handoff track write failed");
-        return;
+        return false;
     }
     tracing::info!(
         tag = "#1888-track-recorded",
@@ -226,6 +441,56 @@ pub(crate) fn record(
         %correlation,
         "ci-handoff track recorded (re-nudge until resolution, not until read)"
     );
+    true
+}
+
+/// Mint an opaque per-delivery episode token. It is deliberately independent
+/// of target/correlation so a re-record of the same branch cannot be settled by
+/// an old row or delayed ACK.
+pub(crate) fn new_episode() -> String {
+    format!("ci-episode-{}", uuid::Uuid::new_v4())
+}
+
+/// #35896-11 ⑥: persist the watchdog throttle timestamp(s) on an EXISTING track so
+/// a daemon restart doesn't reset the in-mem throttle map and re-fire a burst.
+/// Called from the watchdog with the ACTUAL `list()`-supplied `path`
+/// (encoding-independent, like the resolve/sweep deleters). Read-modify-write UNDER
+/// the per-key lock (the same lock `record`/`remove_if_unchanged` take, so it can't
+/// interleave with a concurrent record's write or a resolve's delete), preserving
+/// every other field incl. `sent_at` — so a concurrent resolve's delete-if-unchanged
+/// still matches its episode. No-op if the track was resolved (deleted) concurrently
+/// or on any lock/read/write failure: a lost stamp just means one extra renudge
+/// after a restart — the failure mode is "slightly noisier", never "obligation lost".
+pub(crate) fn stamp_throttle(
+    home: &Path,
+    path: &Path,
+    target: &str,
+    correlation: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+    renudged: bool,
+    escalated: bool,
+) {
+    let Ok(_lock) = crate::store::acquire_file_lock(&lock_for(home, target, correlation)) else {
+        return;
+    };
+    // Re-read the ACTUAL path under the lock (not a `file_for` reconstruction — an
+    // older-encoding track stays stampable, mirroring `remove_if_unchanged`).
+    let Some(mut track) = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok())
+    else {
+        return; // resolved/absent/torn — nothing to throttle (self-heals next tick)
+    };
+    let stamp = now.to_rfc3339();
+    if renudged {
+        track.last_renudged_at = Some(stamp.clone());
+    }
+    if escalated {
+        track.last_escalated_at = Some(stamp);
+    }
+    if let Err(e) = atomic_write_track(path, &track) {
+        tracing::warn!(%target, %correlation, error = %e, "#35896-11 ⑥: throttle stamp write failed");
+    }
 }
 
 /// All currently-pending tracks, each paired with its ACTUAL on-disk path.
@@ -252,12 +517,16 @@ pub(crate) fn list(home: &Path) -> Vec<(PathBuf, CiHandoffTrack)> {
     out
 }
 
-/// Resolve (delete) every track carrying `correlation`, any target. Returns
-/// how many were resolved. `reason` is for the log only.
+/// Resolve (delete) every track carrying `correlation` — matching EITHER the
+/// track's `correlation` (`owner/repo@branch`, what a pr_state/reviewer-verdict
+/// report carries) OR its `task_id` (`t-...`, what a standard fleet
+/// `kind=report` carries per Sprint 58 W4 PR-1 — see the `task_id` field doc
+/// for why both keys are needed). Any target. Returns how many were resolved.
+/// `reason` is for the log only.
 pub(crate) fn resolve_by_correlation(home: &Path, correlation: &str, reason: &str) -> usize {
     let mut resolved = 0;
     for (path, track) in list(home) {
-        if track.correlation == correlation
+        if (track.correlation == correlation || track.task_id.as_deref() == Some(correlation))
             && remove_if_unchanged(
                 home,
                 &path,
@@ -309,6 +578,85 @@ pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
     resolved
 }
 
+/// #35896-11 ①: the dispatcher `from` DELEGATED this ci-ready obligation by
+/// dispatching the work (a `kind=task` review) to someone else — that IS their
+/// discharge, so resolve `from`'s OWN track. Target-scoped to `from` so a
+/// co-subscriber's handoff for the same branch is left intact.
+///
+/// Matches by `corr` against the track's `task_id` OR `correlation` (PRIMARY
+/// path), and opportunistically by the dispatched `branch` — but the branch
+/// fallback resolves ONLY when it uniquely identifies a single track (#2667 F2:
+/// a bare `@branch` suffix has no repo dimension, so 2+ matches across repos are
+/// ambiguous → resolve none by branch, never a cross-repo false-stop).
+///
+/// **Convention dependency**: the primary path relies on the fleet's
+/// review-dispatch convention REUSING the implementer's original task id (never
+/// minting a new one) — `record` stores that id as the track's `task_id`
+/// (#2412-follow-up, `poller.rs`), so the delegating dispatch's
+/// `correlation_id.or(task_id)` matches it. If that convention ever changes, this
+/// resolver goes silent and the ci-ready re-nudge falls back to the explicit
+/// `inbox action=discharge` gesture + the escalation watchdog (by design, #35896-11
+/// Q4 vet). Branch match is opportunistic because dispatches usually omit `branch=`.
+pub(crate) fn resolve_delegated(
+    home: &Path,
+    from: &str,
+    corr: Option<&str>,
+    branch: Option<&str>,
+) -> usize {
+    let branch_suffix = branch.filter(|b| !b.is_empty()).map(|b| format!("@{b}"));
+    let corr_hit = |t: &CiHandoffTrack| {
+        corr.is_some_and(|c| t.task_id.as_deref() == Some(c) || t.correlation == c)
+    };
+    let branch_hit = |t: &CiHandoffTrack| {
+        branch_suffix
+            .as_deref()
+            .is_some_and(|s| t.correlation.ends_with(s))
+    };
+
+    // Target-scoped: only the dispatcher's OWN tracks are eligible (a
+    // co-subscriber's handoff for the same branch must survive).
+    let own: Vec<(PathBuf, CiHandoffTrack)> = list(home)
+        .into_iter()
+        .filter(|(_, t)| t.target == from)
+        .collect();
+
+    // #2667 F2 (reviewer5, isolation): the branch fallback compares only
+    // `ends_with("@{branch}")` — it has NO repo dimension, so a same-named branch
+    // in two repos both match. If the dispatcher holds such handoffs in 2+ repos, a
+    // single delegation would false-stop ALL of them = silent cross-repo obligation
+    // loss. Mirror #2662's exactly-one fail-safe: a branch match is a valid
+    // discharge signal ONLY when it uniquely identifies one track; 2+ branch matches
+    // = ambiguity → resolve NONE by branch (prefer a missed stop over a wrong one —
+    // the precise task_id/full-correlation path and the explicit `inbox
+    // action=discharge` gesture back-stop the residual). The corr path stays precise
+    // (a task id / full `owner/repo@branch` names exactly one work item).
+    let branch_unique = own.iter().filter(|(_, t)| branch_hit(t)).count() == 1;
+
+    let mut resolved = 0;
+    for (path, track) in &own {
+        let is_hit = corr_hit(track) || (branch_unique && branch_hit(track));
+        if is_hit
+            && remove_if_unchanged(
+                home,
+                path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#1888-track-resolved",
+                agent = %track.target,
+                correlation = %track.correlation,
+                reason = "dispatcher_delegated",
+                "ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
 /// #t-92758 P2: resolve the track whose TARGET is `agent` AND whose correlation
 /// is exactly `correlation` (`owner/repo@branch`) — the dismiss path for
 /// `ci unwatch`. Unlike [`resolve_by_correlation`] (which clears every target's
@@ -317,6 +665,17 @@ pub(crate) fn resolve_claimed(home: &Path, agent: &str, branch: &str) -> usize {
 /// handoff" eviction: only the unwatching agent's own ci-ready obligation for
 /// this exact repo@branch is cleared, leaving any co-subscriber's track intact.
 pub(crate) fn resolve_for_target_correlation(home: &Path, agent: &str, correlation: &str) -> usize {
+    resolve_for_target_correlation_reason(home, agent, correlation, "unwatch")
+}
+
+/// Target/correlation resolver with an explicit audit reason for non-watch
+/// callers (for example a feature-branch channel discharge).
+pub(crate) fn resolve_for_target_correlation_reason(
+    home: &Path,
+    agent: &str,
+    correlation: &str,
+    reason: &str,
+) -> usize {
     let mut resolved = 0;
     for (path, track) in list(home) {
         if track.target == agent
@@ -334,8 +693,158 @@ pub(crate) fn resolve_for_target_correlation(home: &Path, agent: &str, correlati
                 tag = "#1888-track-resolved",
                 agent = %track.target,
                 correlation = %track.correlation,
-                reason = "unwatch_dismiss",
+                reason,
                 "ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
+/// Resolve an explicit-discharge legacy handoff without inferring identity
+/// for a newer protected episode that reuses the same target/correlation key.
+/// Feature and classless tracks retain the pre-episode discharge behavior;
+/// protected tracks must use [`resolve_protected_episode`] instead.
+pub(crate) fn resolve_legacy_for_target_correlation_reason(
+    home: &Path,
+    agent: &str,
+    correlation: &str,
+    reason: &str,
+) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.target == agent
+            && track.correlation == correlation
+            && track.ci_handoff_class != Some(crate::inbox::CiHandoffClass::Protected)
+            && remove_if_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#1888-track-resolved",
+                agent = %track.target,
+                correlation = %track.correlation,
+                reason,
+                "legacy ci-handoff track resolved"
+            );
+        }
+    }
+    resolved
+}
+
+/// Resolve one protected handoff only when every durable identity component
+/// matches. Legacy/classless/episode-less tracks are deliberately ignored.
+pub(crate) fn resolve_protected_episode(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+    reason: &str,
+) -> usize {
+    resolve_exact_episode(
+        home,
+        target,
+        correlation,
+        episode,
+        crate::inbox::CiHandoffClass::Protected,
+        reason,
+    )
+}
+
+/// Resolve one current-schema handoff only when target, correlation, episode,
+/// and class all match. This is the neutral pickup-settlement primitive used by
+/// `ci action=ack_handoff`; it never mutates the watch subscription.
+pub(crate) fn resolve_exact_episode(
+    home: &Path,
+    target: &str,
+    correlation: &str,
+    episode: &str,
+    class: crate::inbox::CiHandoffClass,
+    reason: &str,
+) -> usize {
+    if episode.is_empty() {
+        return 0;
+    }
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        if track.target == target
+            && track.correlation == correlation
+            && track.ci_handoff_episode.as_deref() == Some(episode)
+            && track.ci_handoff_class == Some(class)
+            && remove_if_episode_unchanged(
+                home,
+                &path,
+                &track.target,
+                &track.correlation,
+                &track.sent_at,
+                episode,
+            )
+        {
+            resolved += 1;
+            tracing::info!(
+                tag = "#2817-track-resolved",
+                agent = %target,
+                %correlation,
+                %episode,
+                reason,
+                "exact ci-handoff episode resolved"
+            );
+        }
+    }
+    resolved
+}
+
+/// Reconcile a crash after the inbox row was durably marked processed but
+/// before the sidecar delete completed. The inbox probe is exact and runs
+/// under its own lock; this function never deletes a missing or ambiguous row.
+pub(crate) fn reconcile_processed(home: &Path, now: &chrono::DateTime<chrono::Utc>) -> usize {
+    let mut resolved = 0;
+    for (path, track) in list(home) {
+        let Some(episode) = track.ci_handoff_episode.as_deref() else {
+            continue;
+        };
+        let Some(class) = track.ci_handoff_class else {
+            continue;
+        };
+        let Ok(sent_at) = chrono::DateTime::parse_from_rfc3339(&track.sent_at) else {
+            continue;
+        };
+        if now.signed_duration_since(sent_at.with_timezone(&chrono::Utc)) < TRACK_RECONCILE_GRACE {
+            continue;
+        }
+        if !matches!(
+            crate::inbox::storage::handoff_row_state(
+                home,
+                &track.target,
+                &track.correlation,
+                episode,
+                class,
+            ),
+            crate::inbox::storage::ProtectedHandoffRowState::ExplicitlyAcked
+        ) {
+            continue;
+        }
+        if remove_if_episode_unchanged(
+            home,
+            &path,
+            &track.target,
+            &track.correlation,
+            &track.sent_at,
+            episode,
+        ) {
+            resolved += 1;
+            tracing::info!(
+                tag = "#2817-track-reconciled",
+                agent = %track.target,
+                correlation = %track.correlation,
+                %episode,
+                reason = "ack_reconciled",
+                "processed exact ci-handoff episode reconciled"
             );
         }
     }
@@ -504,14 +1013,65 @@ mod tests {
         p
     }
 
+    fn typed_review_report(task_id: &str) -> crate::inbox::InboxMessage {
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "gapfix-dev",
+            "report",
+            "VERIFIED\n\n### Evidence\nran: cargo test --all-targets → passed",
+        )
+        .with_correlation_id(task_id.to_string());
+        msg.report_purpose = crate::review_receipt::ReportPurpose::CodeReview;
+        msg.validated_code_review =
+            Some(crate::review_receipt::ValidatedCodeReviewReceipt::for_test(
+                crate::review_receipt::ReviewReceiptSummary {
+                    receipt_id: "review-receipt:m-ci-handoff-test".into(),
+                    source_id: "m-ci-handoff-test".into(),
+                    evidence_digest: "a".repeat(64),
+                    assignment_id: uuid::Uuid::new_v4(),
+                    reviewer_instance_id: crate::types::InstanceId::new(),
+                    reviewer_name: "gapfix-dev".into(),
+                    repo: "owner/repo".into(),
+                    pr_number: 1,
+                    branch: "branch".into(),
+                    task_id: task_id.into(),
+                    reviewed_head: "a".repeat(40),
+                    review_class: crate::daemon::pr_state::ReviewClass::Single,
+                    slot: crate::review_receipt::ReviewSlot::Primary,
+                    verdict: crate::review_receipt::ReviewVerdict::Verified,
+                },
+            ));
+        msg
+    }
+
     #[test]
     fn record_list_roundtrip_and_refresh() {
         let home = tmp_home("roundtrip");
-        record(&home, "reviewer", "o/r@b1", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@b2", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b1",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer",
+            "o/r@b2",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(list(&home).len(), 2);
         // Re-record same key = refresh (no duplicate file).
-        record(&home, "reviewer", "o/r@b1", "2026-06-10T01:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b1",
+            "2026-06-10T01:00:00Z",
+            None,
+            None,
+        );
         let tracks = list(&home);
         assert_eq!(tracks.len(), 2, "refresh must not duplicate");
         assert!(tracks
@@ -521,15 +1081,341 @@ mod tests {
     }
 
     #[test]
+    fn resolve_delegated_matches_reused_task_id_and_is_target_scoped() {
+        let home = tmp_home("delegated");
+        // Lead holds a ci-ready handoff; the track records the implementer's
+        // original task id (the id the review dispatch REUSES, #2412-follow-up).
+        record(
+            &home,
+            "lead",
+            "o/r@fix/x",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-orig-1"),
+        );
+        // A co-subscriber holds a track for the SAME branch — must survive.
+        record(
+            &home,
+            "reviewer2",
+            "o/r@fix/x",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-orig-1"),
+        );
+        // Lead delegates by dispatching a task reusing t-orig-1 (corr = task_id).
+        assert_eq!(
+            resolve_delegated(&home, "lead", Some("t-orig-1"), None),
+            1,
+            "delegating dispatcher's own track resolves on the reused task id"
+        );
+        let left = list(&home);
+        assert_eq!(left.len(), 1, "co-subscriber's track must be left intact");
+        assert_eq!(left[0].1.target, "reviewer2");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn resolve_delegated_opportunistic_branch_and_no_false_positive() {
+        let home = tmp_home("delegated-branch");
+        record(
+            &home,
+            "lead",
+            "o/r@fix/y",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-orig-2"),
+        );
+        // No corr/task-id match, but the dispatch carried branch=fix/y → resolves.
+        assert_eq!(
+            resolve_delegated(&home, "lead", Some("t-unrelated"), Some("fix/y")),
+            1
+        );
+        // Fresh track: neither corr nor branch matches → no resolution.
+        record(
+            &home,
+            "lead",
+            "o/r@fix/z",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-orig-3"),
+        );
+        assert_eq!(
+            resolve_delegated(&home, "lead", Some("t-nope"), Some("fix/other")),
+            0
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2667 F1 (reviewer4): the `resolve_delegated` CALL SITE must fire only for a
+    /// kind=TASK delegation — a kind=query carrying the same correlation is NOT a
+    /// delegation and must never discharge the dispatcher's ci-ready track
+    /// (obligation loss). Real-entry test: drives `track_dispatch` (the gate), not
+    /// the resolver directly — the direct-resolver tests above can't see the gate.
+    #[test]
+    fn track_dispatch_resolves_delegated_only_for_task_kind_not_query_2667() {
+        let home = tmp_home("track-dispatch-kind-gate");
+        let mk = |kind: &str| crate::inbox::InboxMessage {
+            schema_version: 1,
+            id: Some(format!("m-{kind}")),
+            from: "lead".into(),
+            text: format!("[dispatch] {kind}"),
+            kind: Some(kind.into()),
+            correlation_id: Some("o/r@feat".into()),
+            task_id: if kind == "task" {
+                Some("t-x".into())
+            } else {
+                None
+            },
+            timestamp: "2026-07-06T00:00:00Z".into(),
+            ..Default::default()
+        };
+        let params = serde_json::json!({});
+        record(
+            &home,
+            "lead",
+            "o/r@feat",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-x"),
+        );
+
+        // kind=query with the SAME correlation → track MUST survive.
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &params,
+            "lead",
+            "reviewer",
+            &mk("query"),
+        );
+        assert_eq!(
+            list(&home).len(),
+            1,
+            "a kind=query is not a delegation — the dispatcher's ci-ready track must survive"
+        );
+
+        // kind=task with its canonical task_id IS the delegation → resolves it;
+        // the repo/branch correlation is display-only for task lifecycle.
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &params,
+            "lead",
+            "reviewer",
+            &mk("task"),
+        );
+        assert_eq!(
+            list(&home).len(),
+            0,
+            "a kind=task dispatch IS the delegation discharge — the dispatcher's own track resolves"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2667 F2 (reviewer5, isolation): the opportunistic branch fallback compares
+    /// only `ends_with(\"@{branch}\")` — NO repo dimension. A dispatcher holding a
+    /// same-named branch handoff in TWO repos would lose BOTH on one delegation
+    /// (silent cross-repo obligation loss). Mirror #2662's exactly-one fail-safe:
+    /// the branch signal resolves ONLY when it disambiguates to a single track;
+    /// 2+ branch matches = ambiguity → resolve none by branch (the precise task_id
+    /// path + explicit discharge back-stop the residual).
+    #[test]
+    fn resolve_delegated_branch_fallback_exactly_one_cross_repo_isolation_2667() {
+        let home = tmp_home("delegated-xrepo");
+        // Same branch name `shared` pending in two different repos.
+        record(
+            &home,
+            "lead",
+            "o/r1@shared",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-r1"),
+        );
+        record(
+            &home,
+            "lead",
+            "o/r2@shared",
+            "2026-07-06T00:00:00Z",
+            None,
+            Some("t-r2"),
+        );
+
+        // A delegation carrying only the AMBIGUOUS branch (corr matches neither):
+        // `@shared` matches both repos → ambiguous → resolve NOTHING (fail-safe).
+        assert_eq!(
+            resolve_delegated(&home, "lead", Some("t-unrelated"), Some("shared")),
+            0,
+            "ambiguous cross-repo branch match must resolve nothing (exactly-one fail-safe)"
+        );
+        assert_eq!(
+            list(&home).len(),
+            2,
+            "both same-branch tracks survive an ambiguous branch-only delegation"
+        );
+
+        // The PRECISE reused task_id names exactly one repo's work → resolves only
+        // that track, leaving the other repo's same-branch handoff intact.
+        assert_eq!(
+            resolve_delegated(&home, "lead", Some("t-r1"), Some("shared")),
+            1,
+            "the reused task_id disambiguates to exactly one repo's track"
+        );
+        let left = list(&home);
+        assert_eq!(
+            left.len(),
+            1,
+            "only r1's track resolved; r2's same-branch handoff survives"
+        );
+        assert_eq!(
+            left[0].1.correlation, "o/r2@shared",
+            "the surviving track must be the OTHER repo's (no cross-repo bleed)"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn resolve_by_correlation_clears_all_targets() {
         let home = tmp_home("resolve-corr");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer-2", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@other", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer-2",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer",
+            "o/r@other",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(resolve_by_correlation(&home, "o/r@b", "test"), 2);
         let left = list(&home);
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].1.correlation, "o/r@other");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2412-follow-up (ci-handoff correlation convention split): a standard
+    /// fleet `kind=report` carries `correlation_id=t-...` (Sprint 58 W4 PR-1),
+    /// NOT `repo@branch` — so a track must also resolve when the CALLER's
+    /// `correlation` arg is the dispatch's task id, not just when it matches
+    /// the track's `repo@branch` correlation field.
+    #[test]
+    fn resolve_by_correlation_also_matches_task_id() {
+        let home = tmp_home("resolve-taskid");
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            Some("t-20260622133030757281-1"),
+        );
+        assert_eq!(
+            resolve_by_correlation(&home, "t-20260622133030757281-1", "report_arrived"),
+            1,
+            "a standard report's task-id correlation must resolve the track \
+             recorded with that task_id, not just a repo@branch match"
+        );
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Sibling of the above: a track with NO recorded `task_id` (the common
+    /// case before this fix, or any dispatch path that never had one) must
+    /// still resolve normally by its `repo@branch` correlation — the new OR
+    /// clause must not require both keys.
+    #[test]
+    fn resolve_by_correlation_still_matches_repo_branch_when_task_id_absent() {
+        let home = tmp_home("resolve-repobranch-only");
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        assert_eq!(
+            resolve_by_correlation(&home, "o/r@b", "report_arrived"),
+            1,
+            "repo@branch matching must be unaffected by the task_id addition"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// task66: a task/analysis report can carry the same task correlation as a
+    /// review assignment, but correlation alone is not review authority. The
+    /// real `track_dispatch` entry point must leave the CI handoff intact.
+    #[test]
+    fn ordinary_report_task_id_correlation_does_not_resolve_ci_handoff_2760() {
+        let home = tmp_home("2760-untyped-taskid-wiring");
+        let task_id = "t-20260622133030757281-1";
+        record(
+            &home,
+            "gapfix-dev",
+            "owner/repo@branch",
+            "2026-06-10T00:00:00Z",
+            None,
+            Some(task_id),
+        );
+        assert_eq!(list(&home).len(), 1);
+
+        let msg = crate::inbox::InboxMessage::new_system("gapfix-dev", "report", "VERIFIED")
+            .with_correlation_id(task_id.to_string());
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &serde_json::json!({}),
+            "gapfix-dev",
+            "lead",
+            &msg,
+        );
+
+        assert!(
+            !list(&home).is_empty(),
+            "task66: an ordinary report's task correlation must not resolve a \
+             code-review CI handoff without a validated receipt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// task66 positive sibling: the same real entry point still resolves the
+    /// handoff when the API sink has attached a validated typed receipt.
+    #[test]
+    fn validated_review_receipt_resolves_ci_handoff_2760() {
+        let home = tmp_home("2760-typed-taskid-wiring");
+        let task_id = "t-20260622133030757281-1";
+        record(
+            &home,
+            "gapfix-dev",
+            "owner/repo@branch",
+            "2026-06-10T00:00:00Z",
+            None,
+            Some(task_id),
+        );
+
+        crate::api::handlers::messaging::track_dispatch(
+            &home,
+            &serde_json::json!({}),
+            "gapfix-dev",
+            "lead",
+            &typed_review_report(task_id),
+        );
+
+        assert!(
+            list(&home).is_empty(),
+            "task66: a validated typed receipt resolves the correlated CI handoff"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -539,9 +1425,23 @@ mod tests {
         // exact repo@branch — a co-subscriber's track (same correlation, different
         // target) and the caller's other-branch track both survive.
         let home = tmp_home("resolve-tc");
-        record(&home, "lead", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
-        record(&home, "lead", "o/r@other", "2026-06-10T00:00:00Z", None);
+        record(&home, "lead", "o/r@b", "2026-06-10T00:00:00Z", None, None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "lead",
+            "o/r@other",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(resolve_for_target_correlation(&home, "lead", "o/r@b"), 1);
         let left = list(&home);
         assert_eq!(left.len(), 2, "only lead's o/r@b cleared");
@@ -557,8 +1457,22 @@ mod tests {
     #[test]
     fn resolve_claimed_scopes_to_target_and_branch() {
         let home = tmp_home("resolve-claim");
-        record(&home, "reviewer", "o/r@fix/x", "2026-06-10T00:00:00Z", None);
-        record(&home, "other", "o/r@fix/x", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@fix/x",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "other",
+            "o/r@fix/x",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         assert_eq!(resolve_claimed(&home, "reviewer", "fix/x"), 1);
         let left = list(&home);
         assert_eq!(left.len(), 1, "other target's track untouched");
@@ -572,9 +1486,16 @@ mod tests {
         let now = chrono::Utc::now();
         let old = (now - chrono::Duration::hours(25)).to_rfc3339();
         let fresh = now.to_rfc3339();
-        record(&home, "reviewer", "o/r@old", &old, None);
-        record(&home, "reviewer", "o/r@fresh", &fresh, None);
-        record(&home, "reviewer", "o/r@broken", "not-a-timestamp", None);
+        record(&home, "reviewer", "o/r@old", &old, None, None);
+        record(&home, "reviewer", "o/r@fresh", &fresh, None, None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@broken",
+            "not-a-timestamp",
+            None,
+            None,
+        );
         assert_eq!(sweep_expired(&home, &now), 2, "old + broken swept");
         let left = list(&home);
         assert_eq!(left.len(), 1);
@@ -591,7 +1512,14 @@ mod tests {
     #[test]
     fn remove_if_unchanged_refuses_stale_delete_1963() {
         let home = tmp_home("cas");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         let path = file_for(&home, "reviewer", "o/r@b");
         // Same episode → delete succeeds.
         assert!(remove_if_unchanged(
@@ -608,8 +1536,22 @@ mod tests {
 
         // Re-record a NEW episode (new sent_at = a new CI pass), then a deleter
         // carrying the STALE listed sent_at must NOT delete it (the race).
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None); // S1
-        record(&home, "reviewer", "o/r@b", "2026-06-10T09:00:00Z", None); // S2
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        ); // S1
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T09:00:00Z",
+            None,
+            None,
+        ); // S2
         assert!(
             !remove_if_unchanged(&home, &path, "reviewer", "o/r@b", "2026-06-10T00:00:00Z"),
             "#1963: a delete carrying the STALE listed sent_at must be refused"
@@ -631,7 +1573,14 @@ mod tests {
     #[test]
     fn atomic_write_and_sidecars_excluded_from_list_1963() {
         let home = tmp_home("atomic");
-        record(&home, "reviewer", "o/r@b", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         let tracks = list(&home);
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].1.correlation, "o/r@b");
@@ -659,8 +1608,22 @@ mod tests {
     #[test]
     fn sanitize_colliding_keys_get_distinct_files_1969() {
         let home = tmp_home("collide");
-        record(&home, "reviewer", "o/r@a/b", "2026-06-10T00:00:00Z", None);
-        record(&home, "reviewer", "o/r@a_b", "2026-06-10T00:00:00Z", None);
+        record(
+            &home,
+            "reviewer",
+            "o/r@a/b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        record(
+            &home,
+            "reviewer",
+            "o/r@a_b",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
         let tracks = list(&home);
         assert_eq!(
             tracks.len(),
@@ -694,6 +1657,7 @@ mod tests {
             "reviewer",
             "o/r@active",
             "2026-06-10T00:00:00Z",
+            None,
             None,
         );
         let active_lock = lock_for(&home, "reviewer", "o/r@active");
@@ -767,6 +1731,16 @@ mod tests {
             correlation: "o/r@b".into(),
             sent_at: "2026-06-10T00:00:00Z".into(),
             head_sha: None,
+            task_id: None,
+            ci_handoff_episode: None,
+            ci_handoff_class: None,
+            last_renudged_at: None,
+            last_escalated_at: None,
+            deferred_by: None,
+            deferred_at: None,
+            wake_task_id: None,
+            defer_reason: None,
+            defer_expires_at: None,
         };
         std::fs::write(&old_path, serde_json::to_vec(&track).unwrap()).unwrap();
         assert_eq!(
@@ -797,6 +1771,7 @@ mod tests {
             "o/r@b",
             "2026-06-10T00:00:00Z",
             Some("HEAD_OLD"),
+            None,
         );
         assert_eq!(list(&home).len(), 1);
         let resolved = resolve_head_advanced(&home, "o/r@b", "HEAD_NEW");
@@ -822,6 +1797,7 @@ mod tests {
             "o/r@b",
             "2026-06-10T00:00:00Z",
             Some("HEAD_X"),
+            None,
         );
         let resolved = resolve_head_advanced(&home, "o/r@b", "HEAD_X");
         assert_eq!(resolved, 0, "an unchanged head must keep the track");
@@ -866,6 +1842,7 @@ mod tests {
             "o/r@b1",
             "2026-06-10T00:00:00Z",
             Some("HEAD_OLD"),
+            None,
         );
         record(
             &home,
@@ -873,12 +1850,386 @@ mod tests {
             "o/r@b2",
             "2026-06-10T00:00:00Z",
             Some("HEAD_OLD"),
+            None,
         );
         let resolved = resolve_head_advanced(&home, "o/r@b1", "HEAD_NEW");
         assert_eq!(resolved, 1, "only b1's track is for the moved head");
         let remaining = list(&home);
         assert_eq!(remaining.len(), 1, "b2's track is untouched");
         assert!(remaining.iter().all(|(_, t)| t.correlation == "o/r@b2"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── task167 RED-first R1-R15: protected-main episode settlement ────────
+    fn protected_message(
+        agent: &str,
+        correlation: &str,
+        episode: &str,
+    ) -> crate::inbox::InboxMessage {
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "system:ci",
+            "ci-ready-for-action",
+            format!("[ci-ready-for-action] {correlation}"),
+        )
+        .with_correlation_id(correlation.to_string());
+        msg.ci_handoff_episode = Some(episode.to_string());
+        msg.ci_handoff_class = Some(crate::inbox::CiHandoffClass::Protected);
+        msg.text = format!("{agent}:{correlation}");
+        msg
+    }
+    fn seed_protected(home: &Path, agent: &str, correlation: &str, episode: &str) {
+        crate::inbox::enqueue(home, agent, protected_message(agent, correlation, episode)).unwrap();
+        assert!(record_with_identity(
+            home,
+            agent,
+            correlation,
+            "2026-06-10T00:00:00Z",
+            Some("HEAD"),
+            None,
+            Some(episode),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+    }
+
+    #[test]
+    fn r1_episode_and_class_round_trip() {
+        let home = tmp_home("r1-identity");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let track = &list(&home)[0].1;
+        assert_eq!(track.ci_handoff_episode.as_deref(), Some("ep-1"));
+        assert_eq!(
+            track.ci_handoff_class,
+            Some(crate::inbox::CiHandoffClass::Protected)
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r2_resolver_requires_exact_episode() {
+        let home = tmp_home("r2-exact");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-old", "ack_protected"),
+            0
+        );
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"),
+            1
+        );
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r3_old_ack_after_rerecord_preserves_new_episode() {
+        let home = tmp_home("r3-rerecord");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("old"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T01:00:00Z",
+            None,
+            None,
+            Some("new"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "old", "ack_protected"),
+            0
+        );
+        assert_eq!(list(&home)[0].1.ci_handoff_episode.as_deref(), Some("new"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r4_target_isolation() {
+        let home = tmp_home("r4-target");
+        seed_protected(&home, "a", "o/r@main", "ep-a");
+        seed_protected(&home, "b", "o/r@main", "ep-b");
+        assert_eq!(
+            resolve_protected_episode(&home, "a", "o/r@main", "ep-a", "ack_protected"),
+            1
+        );
+        assert_eq!(list(&home)[0].1.target, "b");
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r5_cross_repo_correlation_isolation() {
+        let home = tmp_home("r5-repo");
+        seed_protected(&home, "reviewer", "one/r@main", "ep-1");
+        seed_protected(&home, "reviewer", "two/r@main", "ep-2");
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "one/r@main", "ep-1", "ack_protected"),
+            1
+        );
+        assert_eq!(list(&home)[0].1.correlation, "two/r@main");
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r6_legacy_classless_track_fails_closed() {
+        let home = tmp_home("r6-legacy");
+        record(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+        );
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"),
+            0
+        );
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r7_feature_class_fails_closed_for_protected_settlement() {
+        let home = tmp_home("r7-feature");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@feature",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Feature)
+        ));
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@feature", "ep-1", "ack_protected"),
+            0
+        );
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r8_explicit_single_ack_settles_exact_protected_track() {
+        let home = tmp_home("r8-single");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r9_explicit_batch_ack_settles_all_exact_rows() {
+        let home = tmp_home("r9-batch");
+        seed_protected(&home, "reviewer", "o/r@a", "ep-a");
+        seed_protected(&home, "reviewer", "o/r@b", "ep-b");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 2);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r10_implicit_next_drain_ack_settles_prior_batch() {
+        let home = tmp_home("r10-implicit");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::drain(&home, "reviewer");
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r11_new_delivery_does_not_resolve_track() {
+        let home = tmp_home("r11-new-delivery");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        assert_eq!(crate::inbox::drain(&home, "reviewer").len(), 1);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r12_reconciler_resolves_processed_row_after_grace() {
+        let home = tmp_home("r12-reconcile");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        assert!(matches!(
+            crate::inbox::storage::settle_ci_handoff_row_exact(
+                &home,
+                "reviewer",
+                "o/r@main",
+                "ep-1",
+                crate::inbox::CiHandoffClass::Protected,
+            ),
+            crate::inbox::storage::HandoffRowSettleOutcome::Settled
+        ));
+        // Recreate the sidecar to model a crash after row processing but before
+        // the resolver's delete completed.
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r12b_unknown_settlement_provenance_fails_closed_2870() {
+        let home = tmp_home("r12b-unknown-provenance");
+        let correlation = "o/r@main";
+        let episode = "ep-unknown";
+        let mut msg = protected_message("reviewer", correlation, episode);
+        msg.read_at = Some("2026-06-10T00:00:01Z".to_string());
+        msg.delivering_at = None;
+        // Inject a raw unknown provenance value via serde_json round-trip
+        let mut raw = serde_json::to_value(&msg).unwrap();
+        raw["ci_handoff_settlement"] = serde_json::json!("injected_garbage");
+        let tampered: crate::inbox::InboxMessage = serde_json::from_value(raw).unwrap();
+        assert!(
+            tampered.ci_handoff_settlement.is_none(),
+            "#2870: unknown settlement string must deserialize to None (fail closed)"
+        );
+        crate::inbox::enqueue(&home, "reviewer", tampered).unwrap();
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            correlation,
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some(episode),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            reconcile_processed(&home, &now),
+            0,
+            "#2870: unknown provenance must NOT authorize reconciler cleanup"
+        );
+        assert_eq!(
+            list(&home).len(),
+            1,
+            "track must survive unknown provenance"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn ack_handoff_reconciler_also_resolves_processed_feature_episode_2817() {
+        let home = tmp_home("2817-feature-reconcile");
+        let correlation = "o/r@feat/ack";
+        let episode = "ep-feature";
+        let mut msg = crate::inbox::InboxMessage::new_system(
+            "system:ci",
+            "ci-ready-for-action",
+            "feature handoff".to_string(),
+        )
+        .with_correlation_id(correlation.to_string());
+        msg.ci_handoff_episode = Some(episode.to_string());
+        msg.ci_handoff_class = Some(crate::inbox::CiHandoffClass::Feature);
+        crate::inbox::enqueue(&home, "lead", msg).unwrap();
+        assert_eq!(
+            crate::inbox::storage::settle_ci_handoff_row_exact(
+                &home,
+                "lead",
+                correlation,
+                episode,
+                crate::inbox::CiHandoffClass::Feature,
+            ),
+            crate::inbox::storage::HandoffRowSettleOutcome::Settled
+        );
+        assert!(record_with_identity(
+            &home,
+            "lead",
+            correlation,
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some(episode),
+            Some(crate::inbox::CiHandoffClass::Feature)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 1);
+        assert!(list(&home).is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r13_reconciler_missing_row_fails_closed() {
+        let home = tmp_home("r13-missing");
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r14_reconciler_ambiguous_rows_fails_closed() {
+        let home = tmp_home("r14-ambiguous");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        let mut duplicate = protected_message("reviewer", "o/r@main", "ep-1");
+        duplicate.id = Some("duplicate".into());
+        crate::inbox::enqueue(&home, "reviewer", duplicate).unwrap();
+        crate::inbox::drain(&home, "reviewer");
+        crate::inbox::ack(&home, "reviewer", None);
+        assert!(record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@main",
+            "2026-06-10T00:00:00Z",
+            None,
+            None,
+            Some("ep-1"),
+            Some(crate::inbox::CiHandoffClass::Protected)
+        ));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-10T00:01:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(reconcile_processed(&home, &now), 0);
+        assert_eq!(list(&home).len(), 1);
+        std::fs::remove_dir_all(&home).ok();
+    }
+    #[test]
+    fn r15_repeated_ack_and_resolution_are_idempotent() {
+        let home = tmp_home("r15-idempotent");
+        seed_protected(&home, "reviewer", "o/r@main", "ep-1");
+        crate::inbox::drain(&home, "reviewer");
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 1);
+        assert_eq!(crate::inbox::ack(&home, "reviewer", None), 0);
+        assert!(list(&home).is_empty());
+        assert_eq!(
+            resolve_protected_episode(&home, "reviewer", "o/r@main", "ep-1", "ack_protected"),
+            0
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

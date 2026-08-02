@@ -1,6 +1,3 @@
-//! Lease augmentation and retargeting for review bindings.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 /// Repair the one legitimate task-id drift for a disposable review binding:
@@ -35,6 +32,9 @@ pub(crate) fn retarget_disposable_review_binding_for_receipt(
             return Err(format!("review binding is opaque: {reason}"))
         }
     };
+    if !super::signature_valid(home, agent) {
+        return Err("review binding signature is invalid".to_string());
+    }
     if binding["agent"].as_str() != Some(agent) {
         return Err("review binding agent does not match the validated reviewer".to_string());
     }
@@ -74,14 +74,14 @@ pub(crate) fn retarget_disposable_review_binding_for_receipt(
 
     let predecessor = crate::tasks::load_routed(home, &predecessor_task)
         .map_err(|e| format!("predecessor review task is not uniquely routed: {e}"))?;
-    let predecessor_owner = predecessor
-        .task
-        .assignee
-        .as_deref()
-        .or(predecessor.task.routed_to.as_deref());
-    if predecessor.task.status != crate::task_events::TaskStatus::Cancelled
-        || predecessor_owner != Some(agent)
-        || predecessor.task.branch.as_deref() != Some(summary.branch.as_str())
+    if predecessor.record().status != crate::task_events::TaskStatus::Cancelled
+        || predecessor
+            .record()
+            .owner
+            .as_ref()
+            .map(|owner| owner.0.as_str())
+            != Some(agent)
+        || predecessor.record().branch.as_deref() != Some(summary.branch.as_str())
     {
         return Err(
             "stale binding predecessor is not a cancelled task owned by the reviewer".to_string(),
@@ -89,15 +89,15 @@ pub(crate) fn retarget_disposable_review_binding_for_receipt(
     }
     let successor = crate::tasks::load_routed(home, &summary.task_id)
         .map_err(|e| format!("successor review task is not uniquely routed: {e}"))?;
-    let successor_owner = successor
-        .task
-        .assignee
-        .as_deref()
-        .or(successor.task.routed_to.as_deref());
-    if successor_owner != Some(agent)
-        || successor.task.branch.as_deref() != Some(summary.branch.as_str())
+    if successor
+        .record()
+        .owner
+        .as_ref()
+        .map(|owner| owner.0.as_str())
+        != Some(agent)
+        || successor.record().branch.as_deref() != Some(summary.branch.as_str())
         || !matches!(
-            successor.task.status,
+            successor.record().status,
             crate::task_events::TaskStatus::Open
                 | crate::task_events::TaskStatus::Claimed
                 | crate::task_events::TaskStatus::InProgress
@@ -119,7 +119,7 @@ pub(crate) fn retarget_disposable_review_binding_for_receipt(
     binding["issued_at"] = serde_json::json!(chrono::Utc::now().to_rfc3339());
     let body = serde_json::to_string_pretty(&binding)
         .map_err(|e| format!("serialize retargeted review binding: {e}"))?;
-    let tag = crate::config_integrity::sign(home, body.as_bytes())
+    let tag = agentic_git_core::integrity_core::sign_binding(home, body.as_bytes())
         .map_err(|e| format!("sign retargeted review binding: {e}"))?;
     let dir = crate::paths::runtime_dir(home).join(agent);
     crate::store::atomic_write(&dir.join("binding.json"), body.as_bytes())
@@ -162,7 +162,7 @@ pub(crate) fn augment_binding_with_lease(
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     crate::store::atomic_write(&path, body.as_bytes())
         .map_err(|e| format!("write binding for lease augment: {e}"))?;
-    match crate::config_integrity::sign(home, body.as_bytes()) {
+    match agentic_git_core::integrity_core::sign_binding(home, body.as_bytes()) {
         Ok(tag) => {
             if let Err(e) =
                 crate::store::atomic_write(&super::binding_sig_path(&dir), tag.as_bytes())

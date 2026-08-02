@@ -56,20 +56,12 @@ pub fn teardown_workspace_worktree(home: &Path, agent: &str, working_dir: &Path)
 
     // Mirror `remove_worktree`'s git call, WITHOUT the marker veto: run from the
     // owning repo so the registration is cleared (not just the dir).
+    // #2550 W2: `git_worktree::remove_force` — defensive empty-source_repo
+    // fallback (effectively unreachable — a real gitlink always yields a
+    // common-dir) mirrors `remove_worktree`'s byte-identical arm; see
+    // git_worktree.rs module doc for the shared "lead ruling" rationale.
     let wt_str = working_dir.display().to_string();
-    let result = if source_repo.as_os_str().is_empty() {
-        // git-raw-allowed: defensive fallback when the owning repo can't be
-        // resolved (effectively unreachable — a real gitlink always yields a
-        // common-dir). Mirrors `remove_worktree`'s empty-source_repo arm: git
-        // must resolve the repo from the absolute `<wt>` itself, so this runs
-        // with NO `current_dir` — `git_bypass`/`git_cmd` both REQUIRE a cwd.
-        std::process::Command::new("git")
-            .args(["worktree", "remove", "--force", &wt_str])
-            .env("AGEND_GIT_BYPASS", "1")
-            .output()
-    } else {
-        crate::git_helpers::git_bypass(&source_repo, &["worktree", "remove", "--force", &wt_str])
-    };
+    let result = crate::git_worktree::remove_force(&source_repo, &wt_str);
     let removed = matches!(&result, Ok(o) if o.status.success());
     if !removed {
         if let Ok(o) = &result {
@@ -154,7 +146,7 @@ pub(crate) fn worktree_has_work_at_risk(wt: &Path) -> bool {
                 .ok()
         })
         .map(|n| n > 0)
-        .unwrap_or(true) // fail-closed
+        .unwrap_or(false)
 }
 
 /// Back up a worktree WHOLE to `<home>/reconcile-backups/<agent>-<epoch>/`,
@@ -411,9 +403,25 @@ pub fn prepare_workspace_worktree(
     source_repo: &Path,
     branch: &str,
 ) -> Result<PathBuf, String> {
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+    )
+    .map_err(|error| format!("workspace prepare refused: {error}"))?;
+    prepare_workspace_worktree_with_permit(home, agent, source_repo, branch, &permit)
+}
+
+pub(crate) fn prepare_workspace_worktree_with_permit(
+    home: &Path,
+    agent: &str,
+    source_repo: &Path,
+    branch: &str,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> Result<PathBuf, String> {
     let ws = crate::paths::workspace_dir(home).join(agent);
     reconcile_workspace_to_worktree(home, agent, &ws, source_repo, None)?;
-    release_stale_branch_holders(home, agent, source_repo, branch, &ws)?;
+    release_stale_branch_holders_with_permit(home, agent, source_repo, branch, &ws, permit)?;
     checkout_workspace_branch(&ws, branch)?;
     Ok(ws)
 }
@@ -434,6 +442,35 @@ pub fn release_stale_branch_holders(
     branch: &str,
     workspace_path: &Path,
 ) -> Result<(), String> {
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .map_err(|error| format!("stale-holder release refused: {error}"))?;
+    release_stale_branch_holders_with_permit(
+        home,
+        agent,
+        source_repo,
+        branch,
+        workspace_path,
+        &permit,
+    )
+}
+
+pub(crate) fn release_stale_branch_holders_with_permit(
+    home: &Path,
+    agent: &str,
+    source_repo: &Path,
+    branch: &str,
+    workspace_path: &Path,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> Result<(), String> {
+    if !permit.authorizes(home, agent) {
+        return Err(format!(
+            "stale-holder release refused: invalid lifecycle permit for '{agent}'"
+        ));
+    }
     let canon = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let ws = canon(workspace_path);
     for wt in enumerate_managed_worktrees(home, source_repo) {
@@ -441,7 +478,14 @@ pub fn release_stale_branch_holders(
         let holds_branch = wt.branch.as_deref() == Some(branch);
         let mine = wt.agent.as_deref() == Some(agent);
         if !is_self && mine && holds_branch {
-            release_one_stale_holder(home, agent, source_repo, branch, &wt.path)?;
+            release_one_stale_holder_with_permit(
+                home,
+                agent,
+                source_repo,
+                branch,
+                &wt.path,
+                permit,
+            )?;
         }
     }
     Ok(())
@@ -461,6 +505,28 @@ pub(crate) fn release_one_stale_holder(
     branch: &str,
     holder: &Path,
 ) -> Result<(), String> {
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .map_err(|error| format!("stale-holder release refused: {error}"))?;
+    release_one_stale_holder_with_permit(home, agent, source_repo, branch, holder, &permit)
+}
+
+pub(crate) fn release_one_stale_holder_with_permit(
+    home: &Path,
+    agent: &str,
+    source_repo: &Path,
+    branch: &str,
+    holder: &Path,
+    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
+) -> Result<(), String> {
+    if !permit.authorizes(home, agent) {
+        return Err(format!(
+            "stale-holder release refused: invalid lifecycle permit for '{agent}'"
+        ));
+    }
     if worktree_has_work_at_risk(holder) {
         backup_worktree_dir(home, agent, Some(branch), holder).map_err(|e| {
             format!(
@@ -525,6 +591,15 @@ pub fn detach_workspace_to_holding(workspace: &Path) -> Result<(), String> {
 /// Edge: a deleted (never re-leased) agent leaves its branch + commits in
 /// canonical (branch_sweep keeps unpushed branches) — recoverable, not lost.
 pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
+    // Reverse reconciliation is a release actor. Acquire the typed authority
+    // before inspecting binding/worktree state and retain it through backup,
+    // branch-lease acquisition, removal, and standalone restoration.
+    let lifecycle_permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        agent,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .map_err(|error| format!("reverse_reconcile refused: {error}"))?;
     let ws = crate::paths::workspace_dir(home).join(agent);
     // Only a real (B) worktree has a `.git` gitlink FILE. Standalone (dir) / plain
     // dir / absent are already OFF-compatible → nothing to revert.
@@ -568,8 +643,14 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
     // commits remain in canonical).
     let source_repo = resolve_owning_repo(home, agent, &ws);
     if let Some(fingerprint) = live_fingerprint {
-        let outcome =
-            super::release_bound_target_exact(home, agent, &fingerprint, &ws, &source_repo);
+        let outcome = super::release_bound_target_exact_with_permit(
+            home,
+            agent,
+            &fingerprint,
+            &ws,
+            &source_repo,
+            &lifecycle_permit,
+        );
         if !outcome.released {
             return Err(format!(
                 "reverse_reconcile: guarded release failed: {}",
@@ -597,7 +678,7 @@ pub fn reverse_reconcile(home: &Path, agent: &str) -> Result<(), String> {
     // next spawn's `ensure_project_root` would also do this, but doing it here
     // makes the revert self-contained + testable.
     let _ = std::fs::create_dir_all(&ws);
-    crate::instructions::ensure_project_root(&ws);
+    crate::instructions::ensure_project_root(&ws)?;
     Ok(())
 }
 
