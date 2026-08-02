@@ -1620,6 +1620,16 @@ mod tests {
             .env("AGEND_GIT_BYPASS", "1")
             .output()
             .ok();
+        std::process::Command::new("git")
+            .args([
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ])
+            .current_dir(&dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .ok();
         dir
     }
 
