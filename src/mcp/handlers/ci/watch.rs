@@ -203,14 +203,8 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if !subscribers.iter().any(|s| s == instance_name) && !instance_name.is_empty() {
         subscribers.push(instance_name.to_string());
     }
-    // Post-merge exact-head watches are armed by an anonymous privileged caller.
-    // The handoff target is communicated via `next_after_ci` (not the subscribers
-    // array) so the poller delivers the ci-ready message without the target being
-    // a durable watch subscriber. We surface the handoff targets in the MCP
-    // response only (for `has_subscribers` callers like post_merge_receipt_and_watch)
-    // but do NOT persist them into the watch-file subscribers array — that would
-    // cause duplicate delivery and break the `parse_subscribers.is_empty()` invariant
-    // that tests (and callers) rely on for operator-armed exact-head watches.
+    // Operator exact-head: handoff target goes in RESPONSE only (via next_after_ci),
+    // not file subscribers — prevents duplicate delivery and preserves is_empty() invariant.
     let exact_head_handoff_targets: Vec<String> = if exact_head_sha.is_some()
         && instance_name.is_empty()
         && !args["notification_only"].as_bool().unwrap_or(false)
@@ -343,15 +337,8 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["review_class"] = json!(rc);
     }
 
-    // #779 P2 Piece 3 site B: atomic_write failure (disk full,
-    // permission, etc.) previously surfaced as `let _ = ...` silent
-    // discard, returning happy-path Value with `watching: true` even
-    // when the watch file was never written. Now surface as structured
-    // error so callers don't act on phantom state. NOTE: site C
-    // (line ~362 `read_to_string(&watch_path).ok()`) is intentionally
-    // NOT hardened — its None case is the load-bearing fresh-watch
-    // init path; hardening there would block legitimate first
-    // subscribes.
+    // #779 P2: surface atomic_write failure as structured error so callers
+    // don't act on phantom state (was silent let _ = ... discard).
     if let Err(e) = crate::store::atomic_write(
         &watch_path,
         serde_json::to_string_pretty(&watch)
