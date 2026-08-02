@@ -131,13 +131,8 @@ fn assignee_completion_guard_with_review_branch(
     let remote = crate::git_helpers::primary_remote(source_repo);
     let remote_head_ref = format!("refs/remotes/{remote}/HEAD");
     let remote_default =
-        match crate::git_helpers::git_cmd(source_repo, &["symbolic-ref", &remote_head_ref]) {
-            Ok(ref_name) => ref_name,
-            Err(_) => {
-                let default_b = crate::git_helpers::default_branch(source_repo);
-                format!("refs/remotes/{remote}/{default_b}")
-            }
-        };
+        crate::git_helpers::git_cmd(source_repo, &["symbolic-ref", &remote_head_ref])
+            .map_err(|e| format!("assignee remote default ref is unavailable: {e}"))?;
     let remote_prefix = format!("refs/remotes/{remote}/");
     if !remote_default.starts_with(&remote_prefix) || remote_default == remote_prefix {
         return Err("assignee remote default ref is invalid".to_string());

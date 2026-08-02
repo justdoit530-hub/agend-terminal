@@ -1046,6 +1046,9 @@ mod tests {
             ("ci", "review_class", "ci/mod.rs dual-review gate (#972)"),
             ("ci", "ci_provider", "ci/mod.rs provider override"),
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
+            ("ci", "head_sha", "ci/watch.rs exact-head SHA gate (#3150)"),
+            ("ci", "task_id", "ci/watch.rs notification_only receipt + correlation (#3150)"),
+            ("ci", "notification_only", "ci/watch.rs post-merge self-notification gate (#3150)"),
             // ── repo ──
             ("repo", "action", "ci/mod.rs routing"),
             ("repo", "pr", "ci/mod.rs handle_merge_repo"),

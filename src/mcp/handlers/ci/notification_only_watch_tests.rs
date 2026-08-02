@@ -342,10 +342,8 @@ fn post_merge_operator_fallback_arms_assignee_handoff() {
     .unwrap();
     assert_eq!(watch["next_after_ci"], "dev");
     assert!(watch["notification_only"].is_null());
-    assert_eq!(
-        crate::daemon::ci_watch::parse_subscribers(&watch),
-        vec!["dev"]
-    );
+    // Operator case: poller routes via next_after_ci, not file subscribers.
+    assert!(crate::daemon::ci_watch::parse_subscribers(&watch).is_empty());
     std::fs::remove_dir_all(&home).ok();
 }
 
