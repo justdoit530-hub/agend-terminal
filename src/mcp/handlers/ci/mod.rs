@@ -36,6 +36,8 @@ pub(crate) use watch::{handle_status_ci, handle_unwatch_ci, handle_watch_ci};
 #[cfg(test)]
 pub(crate) use checkout::checkout_source;
 #[cfg(test)]
+pub(crate) use merge::post_merge_receipt_and_watch;
+#[cfg(test)]
 pub(crate) use merge::{base_drift_refusal, classify_merge_summary, MergeVerdict};
 #[cfg(test)]
 pub(crate) use release::validate_release_path;
@@ -114,6 +116,14 @@ fn resolve_repo_or_error(home: &Path, instance_name: &str, args: &Value) -> Resu
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_merge_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod exact_head_watch_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod notification_only_watch_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

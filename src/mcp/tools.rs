@@ -373,7 +373,10 @@ pub(crate) fn def_ci() -> Value {
             "next_after_ci": {"type": "string", "description": "Instance to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to this target."},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
             "ci_provider": {"type": "string", "description": "watch: CI provider override — `github` (default) or `bitbucket_cloud`. `bitbucket_server` is rejected (not yet supported). Persisted on the watch sidecar."},
-            "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."}
+            "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."},
+            "head_sha": {"type": "string", "description": "#3150 watch (protected branch only): full 40-hex commit SHA the watch is gated on. Required for protected-branch watches; bypasses the protected-ref rejection gate when provided."},
+            "task_id": {"type": "string", "description": "#3150 watch: task-board correlation ID. Required for privileged protected-branch watches; used to verify notification_only receipt."},
+            "notification_only": {"type": "boolean", "description": "#3150 watch: when true, arms a post-merge developer self-notification watch. Requires a merge receipt, caller=assignee, no next_after_ci. Protected branch only. The watch fires once then self-removes."}
         }, "required": ["action"]}})
 }
 
@@ -1043,6 +1046,9 @@ mod tests {
             ("ci", "review_class", "ci/mod.rs dual-review gate (#972)"),
             ("ci", "ci_provider", "ci/mod.rs provider override"),
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
+            ("ci", "head_sha", "ci/watch.rs exact-head SHA gate (#3150)"),
+            ("ci", "task_id", "ci/watch.rs notification_only receipt + correlation (#3150)"),
+            ("ci", "notification_only", "ci/watch.rs post-merge self-notification gate (#3150)"),
             // ── repo ──
             ("repo", "action", "ci/mod.rs routing"),
             ("repo", "pr", "ci/mod.rs handle_merge_repo"),

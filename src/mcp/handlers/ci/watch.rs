@@ -18,17 +18,117 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let branch = args["branch"].as_str().unwrap_or("main");
     let interval = args["interval_secs"].as_u64().unwrap_or(60);
 
-    // Sprint 57 Wave 2 Track B (#546 Item 3) — E4.5 protected-ref
-    // gate. Closes the bypass that let any agent subscribe to `main`
-    // (or `master`) CI by calling `ci action=watch` directly. Mirrors
-    // the worktree-lease gate in `worktree_pool::lease`; both go
-    // through `agent_ops::is_protected_ref` so the protected set is
-    // edited in exactly one place. The "main" default at the line
-    // above is the backstop the gate catches when callers omit both
-    // `branch` and explicit-protected branch — both flows land here.
-    if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
-        return e;
-    }
+    // S1 exact-head protected-ref gate: protected refs rejected except
+    // exact-head post-merge watches (full SHA + task_id + next_after_ci
+    // or notification_only). #2812 adds notification_only path.
+    let notification_only = args["notification_only"].as_bool().unwrap_or(false);
+    let exact_head_sha: Option<String> = if crate::agent_ops::is_protected_ref(branch) {
+        let head_sha = match args["head_sha"].as_str().filter(|s| !s.is_empty()) {
+            None => match crate::agent_ops::ensure_not_protected_json(branch) {
+                Err(e) => return e,
+                Ok(()) => unreachable!(),
+            },
+            Some(s) => s,
+        };
+        if !crate::daemon::ci_watch::is_full_commit_sha(head_sha) {
+            return json!({
+                "error": format!("exact-head protected watch requires a FULL immutable commit SHA (40- or 64-hex); got {head_sha:?}"),
+                "code": "protected_watch_invalid_sha",
+            });
+        }
+        let has_task_id = args["task_id"].as_str().is_some_and(|s| !s.is_empty());
+        let next_targets = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
+            args.get("next_after_ci").unwrap_or(&Value::Null),
+        );
+
+        if notification_only {
+            if !has_task_id {
+                return json!({
+                    "error": "notification_only watch requires `task_id`",
+                    "code": "notification_only_missing_task_id",
+                });
+            }
+            if !next_targets.is_empty() {
+                return json!({
+                    "error": "notification_only watch forbids `next_after_ci` — no privileged continuation allowed",
+                    "code": "notification_only_next_after_ci_forbidden",
+                });
+            }
+            let task_id = args["task_id"].as_str().unwrap_or("");
+            let Some(receipt) = crate::merge_receipt::find(home, repo, head_sha, task_id) else {
+                return json!({
+                    "error": "notification_only watch requires a matching merge receipt (repo + head_sha + task_id)",
+                    "code": "notification_only_no_receipt",
+                });
+            };
+            if instance_name.is_empty() {
+                return json!({
+                    "error": "notification_only watch requires an identified caller (not operator/empty)",
+                    "code": "notification_only_empty_caller",
+                });
+            }
+            if receipt.task_assignee != instance_name {
+                return json!({
+                    "error": format!(
+                        "notification_only watch: caller '{}' is not the task assignee '{}'",
+                        instance_name, receipt.task_assignee
+                    ),
+                    "code": "notification_only_unauthorized",
+                });
+            }
+            {
+                let binding = crate::binding::read(home, instance_name);
+                let bound_task = binding
+                    .as_ref()
+                    .and_then(|b| b["task_id"].as_str())
+                    .unwrap_or("");
+                if bound_task != task_id {
+                    return json!({
+                        "error": format!(
+                            "notification_only watch: caller binding task_id '{bound_task}' does not match watch task_id '{task_id}'"
+                        ),
+                        "code": "notification_only_binding_mismatch",
+                    });
+                }
+            }
+        } else if !has_task_id || next_targets.is_empty() {
+            return json!({
+                "error": "exact-head protected watch requires BOTH `task_id` and an explicit `next_after_ci` target",
+                "code": "protected_watch_missing_requirements",
+            });
+        } else {
+            // Authorized if: operator (empty caller), OR the caller is an
+            // orchestrator of every next_after_ci target, OR the caller IS the
+            // sole next_after_ci target (self-notification watch, e.g. named
+            // merge authority watching for their own post-merge CI).
+            let caller_is_sole_target =
+                !next_targets.is_empty() && next_targets.iter().all(|m| m == instance_name);
+            let authorized = instance_name.is_empty()
+                || caller_is_sole_target
+                || next_targets
+                    .iter()
+                    .all(|m| crate::teams::is_orchestrator_of(home, instance_name, m));
+            if !authorized {
+                return json!({
+                    "error": format!("'{instance_name}' may not arm a protected-branch exact-head watch — only the target team orchestrator or operator may"),
+                    "code": "protected_watch_unauthorized",
+                });
+            }
+        }
+        Some(crate::daemon::ci_watch::normalize_head_sha(head_sha))
+    } else {
+        // notification_only on a non-protected branch is rejected.
+        if notification_only {
+            return json!({
+                "error": "notification_only watch requires a protected branch (e.g. main)",
+                "code": "notification_only_non_protected",
+            });
+        }
+        if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
+            return e;
+        }
+        None
+    };
 
     // Reject unsupported providers early with operator-actionable error.
     if args["ci_provider"].as_str() == Some("bitbucket_server") {
@@ -45,7 +145,10 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             "code": "ci_watches_dir_create_failed",
         });
     }
-    let filename = crate::daemon::ci_watch::watch_filename(repo, branch);
+    let filename = match exact_head_sha.as_deref() {
+        Some(sha) => crate::daemon::ci_watch::watch_filename_exact_head(repo, branch, sha),
+        None => crate::daemon::ci_watch::watch_filename(repo, branch),
+    };
     let watch_path = ci_dir.join(&filename);
 
     // H5 (CR-2026-06-14): flock the read→mutate→atomic_write window (mirrors
@@ -100,6 +203,18 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if !subscribers.iter().any(|s| s == instance_name) && !instance_name.is_empty() {
         subscribers.push(instance_name.to_string());
     }
+    // Operator exact-head: handoff target goes in RESPONSE only (via next_after_ci),
+    // not file subscribers — prevents duplicate delivery and preserves is_empty() invariant.
+    let exact_head_handoff_targets: Vec<String> = if exact_head_sha.is_some()
+        && instance_name.is_empty()
+        && !args["notification_only"].as_bool().unwrap_or(false)
+    {
+        crate::daemon::ci_watch::watch_state::normalize_next_after_ci(
+            args.get("next_after_ci").unwrap_or(&Value::Null),
+        )
+    } else {
+        Vec::new()
+    };
     let subscribers_json: Vec<Value> = subscribers
         .iter()
         .map(|name| {
@@ -171,16 +286,37 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     watch["expires_at"] = json!((chrono::Utc::now()
         + chrono::Duration::hours(crate::daemon::ci_watch::WATCH_TTL_HOURS))
     .to_rfc3339());
-    // Issue #650 + CR-2026-06-14: set on non-empty; explicit empty CLEARS the
-    // stale handoff (re-arm with no chaining); absent leaves it untouched.
-    match args.get("next_after_ci").and_then(|v| v.as_str()) {
-        Some(next) if !next.is_empty() => watch["next_after_ci"] = json!(next),
-        Some(_) => {
-            if let Some(obj) = watch.as_object_mut() {
-                obj.remove("next_after_ci");
+    // #2812: notification_only watches must never carry next_after_ci.
+    // Privileged re-arms clear the notification_only flag.
+    if notification_only {
+        if let Some(obj) = watch.as_object_mut() {
+            obj.remove("next_after_ci");
+        }
+        watch["notification_only"] = json!(true);
+    } else {
+        // Privileged re-arm: clear stale notification_only flag.
+        if let Some(obj) = watch.as_object_mut() {
+            obj.remove("notification_only");
+        }
+        // Issue #650 + CR-2026-06-14: set on non-empty; explicit empty CLEARS the
+        // stale handoff (re-arm with no chaining); absent leaves it untouched.
+        // Accepts both string "target" and array ["a","b"] forms.
+        match args.get("next_after_ci") {
+            None => {}
+            Some(v) => {
+                let targets = crate::daemon::ci_watch::watch_state::normalize_next_after_ci(v);
+                if targets.is_empty() {
+                    if let Some(obj) = watch.as_object_mut() {
+                        obj.remove("next_after_ci");
+                    }
+                } else if targets.len() == 1 {
+                    watch["next_after_ci"] = json!(targets[0]);
+                } else {
+                    watch["next_after_ci"] =
+                        json!(targets.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                }
             }
         }
-        None => {}
     }
     // #1031: persist dispatch task_id when supplied (by
     // dispatch_auto_bind_lease) so the ci_check_repo emit site can
@@ -191,20 +327,18 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     if let Some(tid) = args["task_id"].as_str().filter(|s| !s.is_empty()) {
         watch["task_id"] = json!(tid);
     }
+    // S1: persist target_head_sha for exact-head watches so remove_watch can
+    // look it up for receipt consumption without re-parsing args.
+    if let Some(sha) = exact_head_sha.as_deref() {
+        watch["target_head_sha"] = json!(sha);
+    }
     // #972: persist review_class for §3.5 dual-review gate.
     if let Some(rc) = requested_review_class {
         watch["review_class"] = json!(rc);
     }
 
-    // #779 P2 Piece 3 site B: atomic_write failure (disk full,
-    // permission, etc.) previously surfaced as `let _ = ...` silent
-    // discard, returning happy-path Value with `watching: true` even
-    // when the watch file was never written. Now surface as structured
-    // error so callers don't act on phantom state. NOTE: site C
-    // (line ~362 `read_to_string(&watch_path).ok()`) is intentionally
-    // NOT hardened — its None case is the load-bearing fresh-watch
-    // init path; hardening there would block legitimate first
-    // subscribes.
+    // #779 P2: surface atomic_write failure as structured error so callers
+    // don't act on phantom state (was silent let _ = ... discard).
     if let Err(e) = crate::store::atomic_write(
         &watch_path,
         serde_json::to_string_pretty(&watch)
@@ -283,10 +417,19 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     };
     let next_poll_eta = super::compute_next_poll_eta(&watch);
 
+    // Build the response subscriber list: include actual subscribers plus
+    // exact-head handoff targets (for operator-armed watches where the target
+    // is routed via next_after_ci, not the subscribers array).
+    let mut resp_subscribers = subscribers.clone();
+    for target in &exact_head_handoff_targets {
+        if !resp_subscribers.iter().any(|s| s == target) {
+            resp_subscribers.push(target.clone());
+        }
+    }
     let mut resp = json!({
         "repo": repo,
         "watching": true,
-        "subscribers": subscribers,
+        "subscribers": resp_subscribers,
         "rate_limit_active": rate_limit_active,
         "rate_limit_until": rate_limit_until,
         "next_poll_eta": next_poll_eta,
@@ -582,12 +725,14 @@ mod tests {
             "o/r@b",
             "2026-06-10T00:00:00Z",
             None,
+            None,
         );
         crate::daemon::ci_handoff_track::record(
             &home,
             "reviewer",
             "o/r@b",
             "2026-06-10T00:00:00Z",
+            None,
             None,
         );
 

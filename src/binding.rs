@@ -312,6 +312,69 @@ pub fn bind_full(
     Ok(())
 }
 
+/// Typed provenance for a binding. Written into the binding JSON so lifecycle
+/// guards can verify that completion authority matches the original provisioner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum BindingProvenance<'a> {
+    DaemonProvisionedReview { provisioned_head: &'a str },
+}
+
+/// Write a full binding with optional typed provenance. Calls `bind_full` then
+/// augments the binding JSON with provenance fields and re-signs.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn bind_full_with_provenance(
+    home: &Path,
+    agent: &str,
+    task_id: &str,
+    branch: &str,
+    worktree: &std::path::Path,
+    source_repo: &std::path::Path,
+    is_self_claim: bool,
+    provenance: Option<BindingProvenance<'_>>,
+) -> Result<(), String> {
+    bind_full(
+        home,
+        agent,
+        task_id,
+        branch,
+        worktree,
+        source_repo,
+        is_self_claim,
+    )?;
+    let Some(BindingProvenance::DaemonProvisionedReview { provisioned_head }) = provenance else {
+        return Ok(());
+    };
+    let dir = crate::paths::runtime_dir(home).join(agent);
+    let path = dir.join("binding.json");
+    let _agent_lock = acquire_agent_mutation_lock(home, agent)?;
+    let _binding_lock = acquire_binding_file_lock(home, agent)?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("read binding for provenance: {e}"))?;
+    let mut binding: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("parse binding for provenance: {e}"))?;
+    binding["checkout_purpose"] = json!("disposable_review");
+    binding["provenance"] = json!("DaemonProvisionedReview");
+    binding["provisioned_head"] = json!(provisioned_head);
+    let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
+    crate::store::atomic_write(&path, body.as_bytes())
+        .map_err(|e| format!("atomic_write provenance: {e}"))?;
+    match crate::config_integrity::sign(home, body.as_bytes()) {
+        Ok(tag) => {
+            if let Err(e) = crate::store::atomic_write(&binding_sig_path(&dir), tag.as_bytes()) {
+                tracing::warn!(%agent, error = %e, "provenance augment: binding sidecar write failed");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%agent, error = %e, "provenance augment: binding HMAC sign failed")
+        }
+    }
+    if let Ok(mut map) = binding_index().write() {
+        map.insert(index_key(home, agent), binding);
+    }
+    Ok(())
+}
+
 mod review_lease;
 #[allow(unused_imports)]
 pub(crate) use review_lease::{

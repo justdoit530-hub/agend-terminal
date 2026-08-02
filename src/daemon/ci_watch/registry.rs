@@ -55,6 +55,17 @@ pub fn remove_watch(
     branch: &str,
     reason: &str,
 ) {
+    if let Ok(content) = std::fs::read_to_string(watch_path) {
+        if let Ok(ws) = serde_json::from_str::<super::watch_state::WatchState>(&content) {
+            if ws.notification_only == Some(true) {
+                if let (Some(sha), Some(tid)) =
+                    (ws.target_head_sha.as_deref(), ws.task_id.as_deref())
+                {
+                    crate::merge_receipt::remove(home, repo, sha, tid);
+                }
+            }
+        }
+    }
     let _ = std::fs::remove_file(watch_path);
     // #1750 A2: remove the sibling `<hash>.lock` too. The lock file is created by
     // `acquire_file_lock` on every poll/update and never had a deletion site, so
@@ -255,6 +266,15 @@ pub fn has_instance_anywhere(home: &Path, instance: &str) -> bool {
 /// is negligible (#942 dev-2 cross-audit Pushback 4).
 pub fn watch_filename(repo: &str, branch: &str) -> String {
     let composite = format!("{repo}:{branch}");
+    format!(
+        "{}.json",
+        crate::daemon::utils::sha256_hex(composite.as_bytes())
+    )
+}
+
+/// Filename for an exact-head (post-merge) CI watch keyed on repo + branch + head SHA.
+pub fn watch_filename_exact_head(repo: &str, branch: &str, head_sha: &str) -> String {
+    let composite = format!("{repo}:{branch}:{head_sha}");
     format!(
         "{}.json",
         crate::daemon::utils::sha256_hex(composite.as_bytes())

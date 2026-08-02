@@ -21,6 +21,11 @@ mod watcher;
 /// Watch TTL in hours. Used for both absolute expiry and inactivity threshold.
 pub const WATCH_TTL_HOURS: i64 = 72;
 
+/// Normalize a commit SHA to lowercase for consistent comparison.
+pub fn normalize_head_sha(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
 /// #1750 A2: absolute watch-age cap (anchored on the earliest `subscribed_at`,
 /// which is never refreshed by polling) as a backstop against a watch that keeps
 /// receiving "active" poll results and so never hits the refreshed `expires_at`
@@ -49,7 +54,7 @@ pub use provider::{
 #[allow(unused_imports)]
 pub use registry::{
     ci_watches_dir, cleanup_watches_for_instance, has_instance_anywhere, reassign_next_after_ci,
-    remove_watch, watch_filename,
+    remove_watch, watch_filename, watch_filename_exact_head,
 };
 #[allow(unused_imports)]
 pub use sweep::{gc_stale_watches, startup_sweep};
