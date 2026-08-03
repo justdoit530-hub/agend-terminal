@@ -3024,9 +3024,23 @@ fn tracked_tree_has_zero_trust_root_hits_persistent_guard_2379() {
 fn nonrepo_read_passthrough_action_matrix_3142() {
     use Action::*;
     // read-only + nonrepo → Passthrough
-    for subcmd in ["status", "log", "diff", "show", "blame", "ls-files", "ls-tree",
-                   "rev-parse", "fetch", "remote", "branch", "tag", "describe",
-                   "shortlog", "reflog"] {
+    for subcmd in [
+        "status",
+        "log",
+        "diff",
+        "show",
+        "blame",
+        "ls-files",
+        "ls-tree",
+        "rev-parse",
+        "fetch",
+        "remote",
+        "branch",
+        "tag",
+        "describe",
+        "shortlog",
+        "reflog",
+    ] {
         assert_eq!(
             apply_nonrepo_read_passthrough(ChdirPass("wt".into()), subcmd, true),
             Passthrough,

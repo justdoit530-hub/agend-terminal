@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 mod auto_watch;
 mod from_ref;
 mod live_binding;
-pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub use auto_watch::CiWatchOutcome;
+pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
 /// response shape for `repo action=checkout bind:true` so callers across
