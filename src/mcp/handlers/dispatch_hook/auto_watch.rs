@@ -12,6 +12,16 @@
 use serde_json::json;
 use std::path::Path;
 
+/// Result of an attempted dispatch-time ci-watch arm. `None` means no watch
+/// was attempted (bind:false, or unresolved repository).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiWatchOutcome {
+    /// Whether the watch sidecar was armed successfully.
+    pub armed: bool,
+    /// Normalized chain targets passed to the watch arm.
+    pub next_after_ci: Vec<String>,
+}
+
 /// Arm the dispatch ci-watch for `target` on `repo`+`branch`. Best-effort: a failed
 /// arm is logged (never fatal — the dispatch + lease already succeeded).
 /// Returns `true` when the arm failed (caller surfaces degraded warning).

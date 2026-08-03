@@ -1335,8 +1335,6 @@ fn maybe_clear_exact_head_terminal(
         Some(sha) => sha.as_str(),
         None => return false,
     };
-    // For exact-head watches poll_ci_runs populates pr with SHA-specific runs
-    // (current_sha == target_sha). Use target_sha directly to be explicit.
     if aggregate_conclusion_for_sha(&pr.runs, target_sha) != Some("success") {
         // Runless, pending, and non-success targets remain armed for reruns.
         return false;
