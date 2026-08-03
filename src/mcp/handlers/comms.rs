@@ -187,14 +187,8 @@ pub(super) fn handle_delegate_task(
             raw_target, sender.as_str()
         )});
     }
-    // CR-2026-06-14 (resource-leak): reject a plain self-dispatch BEFORE the
-    // auto-bind/lease. The qualified guard above only fires when team-orchestrator
-    // resolution COLLAPSED the target onto the sender; a plain self-dispatch
-    // (raw_target == resolved == sender) skipped it and fell through to
-    // `dispatch_auto_bind_lease_with_chain` (which leases a worktree + writes a
-    // binding) before the API-layer self-send check rejected the send — orphaning
-    // the leased worktree with no rollback on this path. Reject unconditionally
-    // here so no lease happens for a dispatch the send would reject anyway.
+    // CR-2026-06-14: reject plain self-dispatch BEFORE auto-bind/lease to prevent
+    // orphaning the leased worktree when the API-layer self-send check rejects it.
     if *sender == target {
         return json!({"error": "cannot delegate task to self — use a different instance"});
     }
@@ -203,11 +197,8 @@ pub(super) fn handle_delegate_task(
         None => return json!({"error": "missing 'task'"}),
     };
 
-    // Pre-send gates (busy / #1286 branch-dedup / #1496 enrich / §3.5
-    // second-reviewer / #812 test-name) — side-effect-free, short-circuit in
-    // order; see comms_gates::dispatch. The returned scalars (force /
-    // force_reason / second_reviewer) feed the message build, force_meta, and
-    // lease stages below, so they are derived exactly once.
+    // Pre-send gates: busy / branch-dedup / enrich / second-reviewer / test-name.
+    // Side-effect-free; force/second_reviewer scalars feed subsequent stages.
     let checks = match super::comms_gates::run_dispatch_pre_checks(home, sender, args, target, task)
     {
         Ok(checks) => checks,
@@ -243,7 +234,7 @@ pub(super) fn handle_delegate_task(
     };
 
     // Sprint 53 P0-1+P0-2: lease + watch_ci gate BEFORE send (Q2 ordering fix).
-    let mut ci_watch_arm_failed = false;
+    let mut ci_watch = None;
     if let Some(branch) = args["branch"].as_str() {
         let task_id_val = args["task_id"].as_str().unwrap_or("");
         if dispatch_should_skip_auto_bind(args) {
@@ -262,16 +253,13 @@ pub(super) fn handle_delegate_task(
                 args["next_after_ci"].as_str(),
                 if second_reviewer { Some("dual") } else { None },
             ) {
-                Ok(outcome) => ci_watch_arm_failed = outcome.ci_watch_arm_failed,
+                Ok(outcome) => ci_watch = outcome.ci_watch,
                 Err(e) => return json!({"ok": false, "error": format!("dispatch rejected: {e}")}),
             }
         }
     }
 
-    // #1050: auto-create board task after ALL rejectable checks pass
-    // (validation, busy gate, lease/bind). Only for single-target with
-    // empty task_id and sender != target. Task creation is the
-    // dispatch-commit step — no orphan tasks on any rejection path.
+    // #1050: auto-create board task after ALL rejectable checks pass.
     let (effective_task_id, auto_created_task_id): (Option<String>, Option<String>) =
         if args["task_id"].as_str().unwrap_or("").is_empty() && *sender != target {
             let auto_title = args["message"]
@@ -337,17 +325,27 @@ pub(super) fn handle_delegate_task(
     // #2454 Slice 2: in-process SEND (no socket loopback / inbox_fallback).
     let mut result =
         super::runtime_bridge::send_in_process(home, runtime, &env.to_send_params(), target);
-    if ci_watch_arm_failed && is_ok_result(&result) {
+    if let Some(watch) = ci_watch {
+        let degraded = !watch.armed && is_ok_result(&result);
         if let Some(obj) = result.as_object_mut() {
-            obj.insert("degraded".into(), json!(true));
             obj.insert(
-                "warning".into(),
+                "ci_watch".into(),
                 json!({
-                    "code": "ci_watch_arm_failed",
-                    "remediation": "CI watch could not be armed for this dispatch; \
-                        run `ci action=watch` manually to enable CI-ready notifications",
+                    "armed": watch.armed,
+                    "next_after_ci": watch.next_after_ci,
                 }),
             );
+            if degraded {
+                obj.insert("degraded".into(), json!(true));
+                obj.insert(
+                    "warning".into(),
+                    json!({
+                        "code": "ci_watch_arm_failed",
+                        "remediation": "CI watch could not be armed for this dispatch; \
+                        run `ci action=watch` manually to enable CI-ready notifications",
+                    }),
+                );
+            }
         }
     }
     if is_ok_result(&result) {

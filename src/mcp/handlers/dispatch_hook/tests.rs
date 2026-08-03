@@ -3751,6 +3751,14 @@ fn dispatch_surfaces_degraded_result_when_auto_watch_arm_fails() {
         !remediation.is_empty(),
         "F7 RED: warning.remediation must be a non-empty actionable string. Got warning: {warning}"
     );
+    assert_eq!(
+        result["ci_watch"],
+        serde_json::json!({
+            "armed": false,
+            "next_after_ci": []
+        }),
+        "#3145: failed auto-watch must echo armed:false without fabricating success: {result}"
+    );
 
     std::fs::remove_dir_all(&home).ok();
 }
@@ -3787,6 +3795,79 @@ fn dispatch_no_degraded_warning_on_successful_arm() {
         result.get("warning").is_none(),
         "F7 control: successful dispatch must NOT carry 'warning'. Got: {result}"
     );
+    assert_eq!(
+        result["ci_watch"],
+        serde_json::json!({"armed": true, "next_after_ci": []}),
+        "#3145: successful auto-watch must echo armed:true with empty targets: {result}"
+    );
 
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3145 RED: a skipped auto-bind (bind:false) must not claim a CI watch was armed.
+#[test]
+fn dispatch_omits_ci_watch_when_bind_is_false_3145() {
+    use crate::identity::Sender;
+    let home = std::env::temp_dir().join(format!(
+        "agend-3145-ci-watch-skipped-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "do not arm a watch",
+            "task_id": tid,
+            "branch": "feat/3145-skipped",
+            "repository": "owner/repo",
+            "bind": false
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+
+    assert!(
+        result.get("ci_watch").is_none(),
+        "#3145: bind:false must not report an armed watch: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3145 RED: a dispatch with no resolvable repo must not claim a CI watch was armed.
+#[test]
+fn dispatch_omits_ci_watch_when_repository_is_unresolved_3145() {
+    use crate::identity::Sender;
+    let home = std::env::temp_dir().join(format!(
+        "agend-3145-ci-watch-unresolved-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "do not claim an unresolved watch",
+            "task_id": tid,
+            "branch": "feat/3145-unresolved"
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+
+    assert!(
+        result.get("ci_watch").is_none(),
+        "#3145: unresolved repository must not report an armed watch: {result}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }

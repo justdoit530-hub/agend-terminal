@@ -9,6 +9,7 @@ mod auto_watch;
 mod from_ref;
 mod live_binding;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
+pub use auto_watch::CiWatchOutcome;
 
 /// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
 /// response shape for `repo action=checkout bind:true` so callers across
@@ -35,6 +36,9 @@ pub struct DispatchOutcome {
     /// `true` when the post-bind ci-watch arm failed (F7). The primary
     /// dispatch succeeded; callers surface a degraded warning.
     pub ci_watch_arm_failed: bool,
+    /// Truthful result of the dispatch-time ci-watch arm. `None` when no watch
+    /// was attempted (bind:false or unresolved repository). (#3145)
+    pub ci_watch: Option<CiWatchOutcome>,
 }
 
 /// #781 Piece 7: structured error. The string-only `Result<_, String>`
@@ -436,17 +440,9 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         });
     }
 
-    // Sprint 57 Wave 4 (#546 Item 4): same-agent different-branch
-    // conflict check. Pre-Wave-4 this was enforced implicitly by
-    // `worktree::create`'s reuse-path rejection — the legacy
-    // `<repo>/.worktrees/<agent>/` was a single path per agent, so
-    // a second create call on a different branch tripped the
-    // "exists + HEAD mismatch" guard. Wave 4's branch-segmented
-    // `<home>/worktrees/<agent>/<branch>/` puts each (agent, branch)
-    // at a distinct path, so the implicit guard no longer fires.
-    // The semantic is preserved here at the binding layer: if the
-    // target already holds a binding on a DIFFERENT branch, the new
-    // dispatch must reject (operator must `release_worktree` first).
+    // #546 Item 4: if the target holds a binding on a DIFFERENT branch, reject.
+    // Operator must `release_worktree` first (Wave 4 branch-segmented paths
+    // removed the implicit reuse-path collision guard that previously enforced this).
     let mut reuse_live_worktree: Option<PathBuf> = None; // #2158 partial-skip (set below)
     if let Some(existing) = crate::binding::read(home, target) {
         if let Some(existing_branch) = existing.get("branch").and_then(|v| v.as_str()) {
@@ -609,23 +605,25 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 .and_then(|s| canonicalize_repo_slug(&s))
         })
         .or_else(|| derive_repo_from_remote(&source_repo));
-    // #2158 GR1: auto-arm the dispatch ci-watch ONLY on an explicit dispatch intent
-    // (`arm_ci_watch`), NOT on task_id presence — a single-target `send kind=task`
-    // (auto-create-exempt) reaches here with task_id="" and MUST still arm. bind_self
-    // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1). The
-    // arming body lives in `auto_watch.rs` (file-size split).
+    // #2158 GR1: arm only on explicit dispatch intent; bind_self self-claims pass
+    // `arm_ci_watch=false`. #3145: result echoed in response via CiWatchOutcome.
     let mut ci_watch_arm_failed = false;
+    let mut ci_watch = None;
     if arm_ci_watch {
-        if let Some(r) = resolved_repo {
+        if let Some(ref r) = resolved_repo {
             ci_watch_arm_failed = auto_watch::arm(
                 home,
                 target,
-                &r,
+                r,
                 branch,
                 next_after_ci,
                 review_class,
                 task_id,
             );
+            ci_watch = Some(CiWatchOutcome {
+                armed: !ci_watch_arm_failed,
+                next_after_ci: next_after_ci.iter().map(|s| s.to_string()).collect(),
+            });
         }
     }
 
@@ -634,6 +632,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         auto_created_branch,
         fetch_attempted,
         ci_watch_arm_failed,
+        ci_watch,
     })
 }
 
