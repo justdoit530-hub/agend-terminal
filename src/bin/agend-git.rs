@@ -167,9 +167,8 @@ fn main() {
     // repo (separate object store — e.g. a test scratch repo) should operate on
     // THAT repo, not be redirected into the worktree. Post-process the classify
     // result so the (unchanged, unit-tested) `classify` stays cwd-agnostic.
-    // #3142: additionally passthrough read-only commands when cwd is not inside
-    // any repository — prevents false-repo reports from bound-worktree redirect.
-    let action = apply_nonrepo_read_passthrough(
+    // #3142: passthrough read-only git commands when cwd is not inside any repo.
+    let action = nonrepo::apply_nonrepo_read_passthrough(
         apply_foreign_repo_passthrough(
             classify(
                 subcommand,
@@ -184,7 +183,7 @@ fn main() {
             cwd_is_foreign_repo(&binding),
         ),
         subcommand,
-        cwd_is_nonrepo(),
+        nonrepo::cwd_is_nonrepo(),
     );
 
     // #1463 (B): on every ChdirPass, strip the caller's leading global target
@@ -583,18 +582,6 @@ fn cwd_is_foreign_repo(binding: &Binding) -> bool {
     paths_are_foreign(&cwd, Path::new(wt))
 }
 
-/// #3142: a bound agent's read-only git command must stay in a cwd that is not
-/// inside any repository. `paths_are_foreign` intentionally fails closed when
-/// the cwd has no commondir; that is correct for foreign-repo mutation policy,
-/// but a read-only `rev-parse`/`status` would otherwise be redirected into the
-/// bound worktree and report a false repository. Returns `true` when the process
-/// cwd is NOT inside any git repository.
-fn cwd_is_nonrepo() -> bool {
-    env::current_dir()
-        .map(|cwd| find_git_dir(&cwd).is_none())
-        .unwrap_or(false)
-}
-
 /// #1463 (A): the pure object-store-identity comparison behind
 /// `cwd_is_foreign_repo` — `true` iff both paths resolve to a commondir AND the
 /// two commondirs differ. Fail-closed (`false`) if either side is unresolvable.
@@ -855,37 +842,6 @@ fn apply_foreign_repo_passthrough(
             Action::Passthrough
         }
         other => other,
-    }
-}
-
-/// #3142: convert only the bound read-only commands to passthrough when the
-/// caller cwd is not inside a repository. Mutating commands retain their
-/// existing bound-worktree policy; leading `-C` routing is handled separately.
-fn apply_nonrepo_read_passthrough(action: Action, subcmd: &str, cwd_nonrepo: bool) -> Action {
-    if cwd_nonrepo
-        && matches!(action, Action::ChdirPass(_))
-        && matches!(
-            subcmd,
-            "status"
-                | "log"
-                | "diff"
-                | "show"
-                | "blame"
-                | "ls-files"
-                | "ls-tree"
-                | "rev-parse"
-                | "fetch"
-                | "remote"
-                | "branch"
-                | "tag"
-                | "describe"
-                | "shortlog"
-                | "reflog"
-        )
-    {
-        Action::Passthrough
-    } else {
-        action
     }
 }
 
@@ -2251,29 +2207,25 @@ fn exec_real_git(args: &[String], chdir: Option<&str>) -> ! {
 }
 
 fn resolve_real_git() -> String {
-    // Priority 1: AGEND_REAL_GIT env (injected by daemon at spawn).
-    if let Ok(path) = env::var("AGEND_REAL_GIT") {
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            return path;
+    // Priority 1: env vars injected at spawn (AGEND_REAL_GIT) or by agentic-git compat.
+    for var in ["AGEND_REAL_GIT", "AGENTIC_GIT_REAL_GIT"] {
+        if let Ok(path) = env::var(var) {
+            if !path.is_empty() && std::path::Path::new(&path).exists() {
+                return path;
+            }
         }
     }
-    if let Ok(path) = env::var("AGENTIC_GIT_REAL_GIT") {
-        if !path.is_empty() && std::path::Path::new(&path).exists() {
-            return path;
-        }
-    }
-    for known in &[
+    for known in [
         "/usr/bin/git",
         "/usr/local/bin/git",
         "/opt/homebrew/bin/git",
     ] {
         if std::path::Path::new(known).exists() {
-            return (*known).to_string();
+            return known.to_string();
         }
     }
-    // Priority 2: which excluding $AGEND_HOME/bin (shim dir). #1504 L2 uses
-    // canonical Path compare — string `format!("{h}/bin")` missed Windows PATH
-    // entries and recursed into this binary. AGEND_REAL_GIT usually short-circuits.
+    // Priority 2: which excluding $AGEND_HOME/bin (#1504 L2 canonical-Path compare;
+    // format!("{h}/bin") missed Windows entries and caused recursive-spawn storm).
     let agend_bin: Option<PathBuf> =
         env::var_os("AGEND_HOME").map(|h| PathBuf::from(h).join("bin"));
     let path_os = env::var_os("PATH").unwrap_or_default();
@@ -2540,6 +2492,8 @@ fn format_conflict_guidance() -> &'static str {
      Do NOT abandon and redo from scratch unless the conflict involves complex semantic changes you cannot resolve.\n"
 }
 
+#[path = "agend-git/nonrepo.rs"]
+mod nonrepo;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "agend-git/tests.rs"]

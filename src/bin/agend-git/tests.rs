@@ -1,3 +1,4 @@
+use super::nonrepo::apply_nonrepo_read_passthrough;
 use super::*;
 
 // ── CR-2026-06-14: shim is_protected_ref must mirror the lib-side
