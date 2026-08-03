@@ -150,6 +150,7 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     handle_tool_with_runtime(tool, args, instance_name, None)
 }
 
+<<<<<<< HEAD
 /// #2454 Slice 2: test helper — dispatch with a minimal in-process runtime
 /// so SEND/SPAWN paths use typed services instead of failing closed on
 /// `runtime=None`. Production MCP enters via `handle_tool_with_runtime`
@@ -168,8 +169,16 @@ pub fn handle_tool_rt(tool: &str, args: &Value, instance_name: &str) -> Value {
     handle_tool_with_runtime(tool, args, instance_name, Some(runtime))
 }
 
-/// #2454: tool dispatch with optional live RuntimeContext.
-pub fn handle_tool_with_runtime(
+#[cfg(test)]
+pub(crate) fn handle_reply_for_test(
+    home: &std::path::Path,
+    args: &Value,
+    instance_name: &str,
+) -> Value {
+    channel::handle_reply(home, args, instance_name)
+}
+
+pub(crate) fn handle_tool_with_runtime(
     tool: &str,
     args: &Value,
     instance_name: &str,
