@@ -3017,3 +3017,41 @@ fn tracked_tree_has_zero_trust_root_hits_persistent_guard_2379() {
              through silently."
     );
 }
+
+/// #3142 RED: read-only commands must passthrough when cwd is not inside any repo.
+/// Mutating commands retain existing ChdirPass policy regardless.
+#[test]
+fn nonrepo_read_passthrough_action_matrix_3142() {
+    use Action::*;
+    // read-only + nonrepo → Passthrough
+    for subcmd in ["status", "log", "diff", "show", "blame", "ls-files", "ls-tree",
+                   "rev-parse", "fetch", "remote", "branch", "tag", "describe",
+                   "shortlog", "reflog"] {
+        assert_eq!(
+            apply_nonrepo_read_passthrough(ChdirPass("wt".into()), subcmd, true),
+            Passthrough,
+            "#3142: {subcmd} in nonrepo cwd must passthrough"
+        );
+    }
+    // read-only + NOT nonrepo → unchanged ChdirPass
+    assert_eq!(
+        apply_nonrepo_read_passthrough(ChdirPass("wt".into()), "status", false),
+        ChdirPass("wt".into()),
+        "#3142: status in a repo cwd must not passthrough"
+    );
+    // mutating command + nonrepo → NOT changed (only foreign-repo path handles mutations)
+    assert_eq!(
+        apply_nonrepo_read_passthrough(ChdirPass("wt".into()), "commit", true),
+        ChdirPass("wt".into()),
+        "#3142: commit in nonrepo cwd must not be passthrough (foreign-repo path handles it)"
+    );
+    // non-ChdirPass inputs are returned verbatim regardless
+    assert_eq!(
+        apply_nonrepo_read_passthrough(Passthrough, "status", true),
+        Passthrough
+    );
+    assert_eq!(
+        apply_nonrepo_read_passthrough(Deny("x".into()), "status", true),
+        Deny("x".into())
+    );
+}

@@ -167,18 +167,24 @@ fn main() {
     // repo (separate object store — e.g. a test scratch repo) should operate on
     // THAT repo, not be redirected into the worktree. Post-process the classify
     // result so the (unchanged, unit-tested) `classify` stays cwd-agnostic.
-    let action = apply_foreign_repo_passthrough(
-        classify(
+    // #3142: additionally passthrough read-only commands when cwd is not inside
+    // any repository — prevents false-repo reports from bound-worktree redirect.
+    let action = apply_nonrepo_read_passthrough(
+        apply_foreign_repo_passthrough(
+            classify(
+                subcommand,
+                &args,
+                &binding,
+                parent_is_gh,
+                canonical_cwd,
+                is_agent_caller,
+            ),
             subcommand,
             &args,
-            &binding,
-            parent_is_gh,
-            canonical_cwd,
-            is_agent_caller,
+            cwd_is_foreign_repo(&binding),
         ),
         subcommand,
-        &args,
-        cwd_is_foreign_repo(&binding),
+        cwd_is_nonrepo(),
     );
 
     // #1463 (B): on every ChdirPass, strip the caller's leading global target
@@ -577,6 +583,18 @@ fn cwd_is_foreign_repo(binding: &Binding) -> bool {
     paths_are_foreign(&cwd, Path::new(wt))
 }
 
+/// #3142: a bound agent's read-only git command must stay in a cwd that is not
+/// inside any repository. `paths_are_foreign` intentionally fails closed when
+/// the cwd has no commondir; that is correct for foreign-repo mutation policy,
+/// but a read-only `rev-parse`/`status` would otherwise be redirected into the
+/// bound worktree and report a false repository. Returns `true` when the process
+/// cwd is NOT inside any git repository.
+fn cwd_is_nonrepo() -> bool {
+    env::current_dir()
+        .map(|cwd| find_git_dir(&cwd).is_none())
+        .unwrap_or(false)
+}
+
 /// #1463 (A): the pure object-store-identity comparison behind
 /// `cwd_is_foreign_repo` — `true` iff both paths resolve to a commondir AND the
 /// two commondirs differ. Fail-closed (`false`) if either side is unresolvable.
@@ -837,6 +855,37 @@ fn apply_foreign_repo_passthrough(
             Action::Passthrough
         }
         other => other,
+    }
+}
+
+/// #3142: convert only the bound read-only commands to passthrough when the
+/// caller cwd is not inside a repository. Mutating commands retain their
+/// existing bound-worktree policy; leading `-C` routing is handled separately.
+fn apply_nonrepo_read_passthrough(action: Action, subcmd: &str, cwd_nonrepo: bool) -> Action {
+    if cwd_nonrepo
+        && matches!(action, Action::ChdirPass(_))
+        && matches!(
+            subcmd,
+            "status"
+                | "log"
+                | "diff"
+                | "show"
+                | "blame"
+                | "ls-files"
+                | "ls-tree"
+                | "rev-parse"
+                | "fetch"
+                | "remote"
+                | "branch"
+                | "tag"
+                | "describe"
+                | "shortlog"
+                | "reflog"
+        )
+    {
+        Action::Passthrough
+    } else {
+        action
     }
 }
 
