@@ -33,6 +33,18 @@ pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
     let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, task_id);
     crate::dispatch_tracking::remove_all_for_task(home, task_id);
 }
+
+pub(crate) fn settle_completion_receipt(
+    home: &Path,
+    task_id: &str,
+    receipt: Option<&crate::merge_receipt::MergeReceipt>,
+) {
+    if let Some(receipt) = receipt {
+        if let Err(error) = crate::merge_receipt::settle_task_completion(home, receipt) {
+            tracing::warn!(%task_id, %error, "task completion receipt settlement failed");
+        }
+    }
+}
 /// Gate completion by the assignee's bound branch state. Non-assignees (the
 /// orchestrator/system paths) and branchless tasks retain their existing ACL.
 pub(crate) fn assignee_completion_guard(
@@ -40,7 +52,7 @@ pub(crate) fn assignee_completion_guard(
     task_id: &str,
     caller: &str,
     record: &crate::task_events::TaskRecord,
-) -> Result<(), String> {
+) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
     assignee_completion_guard_with_review_branch(home, task_id, caller, record, false)
 }
 
@@ -52,7 +64,7 @@ pub(crate) fn validated_review_completion_guard(
     task_id: &str,
     caller: &str,
     record: &crate::task_events::TaskRecord,
-) -> Result<(), String> {
+) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
     assignee_completion_guard_with_review_branch(home, task_id, caller, record, true)
 }
 
@@ -62,16 +74,22 @@ fn assignee_completion_guard_with_review_branch(
     caller: &str,
     record: &crate::task_events::TaskRecord,
     allow_disposable_review_branch_mismatch: bool,
-) -> Result<(), String> {
+) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
     let Some(branch) = record.branch.as_deref() else {
-        return Ok(());
+        return Ok(None);
     };
     if record.owner.as_ref().map(|owner| owner.0.as_str()) != Some(caller) {
-        return Ok(());
+        return Ok(None);
     }
 
-    let binding = crate::binding::read(home, caller)
-        .ok_or_else(|| "assignee completion requires an exact live binding".to_string())?;
+    let Some(binding) = crate::binding::read(home, caller) else {
+        return crate::merge_receipt::find_for_task_completion(home, task_id, caller)
+            .map(Some)
+            .ok_or_else(|| {
+                "assignee completion requires an exact live binding or unconsumed merge receipt"
+                    .to_string()
+            });
+    };
     let binding_agent = binding["agent"].as_str();
     let binding_task = binding["task_id"].as_str();
     let binding_branch = binding["branch"].as_str();
@@ -125,7 +143,7 @@ fn assignee_completion_guard_with_review_branch(
         if crate::worktree_pool::worktree_has_work_at_risk(worktree) {
             return Err("assignee worktree has dirty or unpushed work".to_string());
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let remote = crate::git_helpers::primary_remote(source_repo);
@@ -139,7 +157,7 @@ fn assignee_completion_guard_with_review_branch(
     }
 
     if crate::branch_sweep::is_squash_merged(source_repo, &remote_default, branch) {
-        return Ok(());
+        return Ok(None);
     }
     if crate::worktree_pool::worktree_has_work_at_risk(worktree) {
         return Err("assignee worktree has dirty or unpushed work".to_string());
@@ -163,7 +181,7 @@ fn assignee_completion_guard_with_review_branch(
             return Err("assignee feature branch is ahead of the remote default".to_string());
         }
     }
-    Ok(())
+    Ok(None)
 }
 /// Cancel the task owned by a reviewer-assignment authority mutation.
 ///

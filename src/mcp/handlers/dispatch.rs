@@ -1939,7 +1939,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn repeated_validation_constructs_definition_once_and_preserves_required_checks() {
         let entry = crate::mcp::registry::ToolEntry {
@@ -2319,12 +2318,8 @@ mod tests {
             registry: &registry,
             configs: &configs,
             externals: &externals,
-            notifier: Some(&notifier_trait),
+            notifier: Some(notifier_trait),
             home: &home,
-            capability: crate::api::RestartCapability::Unsupported,
-            app_restart: None,
-            post_flush: crate::api::app_restart::PostFlushSlot::new(),
-            shutdown: None,
         };
 
         let default = crate::api::handlers::instance::handle_move_pane(

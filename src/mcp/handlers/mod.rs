@@ -150,7 +150,6 @@ pub fn handle_tool(tool: &str, args: &Value, instance_name: &str) -> Value {
     handle_tool_with_runtime(tool, args, instance_name, None)
 }
 
-<<<<<<< HEAD
 /// #2454 Slice 2: test helper — dispatch with a minimal in-process runtime
 /// so SEND/SPAWN paths use typed services instead of failing closed on
 /// `runtime=None`. Production MCP enters via `handle_tool_with_runtime`

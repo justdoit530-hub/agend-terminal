@@ -622,9 +622,6 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         );
     } else {
         let notify_attachments = attachments.clone();
-<<<<<<< HEAD
-        let msg_obj = InboxMessage {
-=======
         // Reply-to correlation: if the operator quote-replied to a message the
         // bot previously sent, resolve it via the sent_ledger to surface who
         // sent it + its task context. Key is (quoted message_id, this chat_id) —
@@ -632,11 +629,10 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         // pre-ledger restart, or a non-bot quote) leaves `reply_target = None`;
         // the agent still gets `in_reply_to_excerpt` (graceful degrade).
         let reply_chat_id = msg.chat.id.0.to_string();
-        let reply_target = msg
+        let _reply_target = msg
             .reply_to_message()
             .and_then(|r| resolve_reply_target(&home, &r.id.0.to_string(), &reply_chat_id));
         let mut msg_obj = InboxMessage {
->>>>>>> 2eec535f (fix(telegram): settle generic replies before inbox drain (#3174))
             schema_version: 0,
             id: None,
             read_at: None,
