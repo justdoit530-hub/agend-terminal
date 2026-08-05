@@ -1201,8 +1201,6 @@ fn init_daemon_services(
                 api_configs,
                 api_externals,
                 None,
-                crate::api::RestartCapability::Daemon,
-                None,
                 api_ready_tx,
             )
         })?;

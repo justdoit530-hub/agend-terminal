@@ -222,17 +222,7 @@ pub fn serve(
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
 ) {
-    serve_inner(
-        home,
-        registry,
-        shutdown,
-        configs,
-        externals,
-        notifier,
-        RestartCapability::Daemon,
-        None,
-        None,
-    );
+    serve_inner(home, registry, shutdown, configs, externals, notifier, None);
 }
 
 /// Daemon-owned API server entry that reports when the listener is fully ready.
@@ -241,7 +231,6 @@ pub fn serve(
 /// and the authentication material has been loaded before it starts fleet
 /// agents. The bounded wait lives at the daemon composition root; this function
 /// reports either readiness or the exact startup failure once.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_with_ready(
     home: &Path,
     registry: AgentRegistry,
@@ -249,8 +238,6 @@ pub(crate) fn serve_with_ready(
     configs: ConfigRegistry,
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
-    host: RestartCapability,
-    app_restart: Option<crate::api::app_restart::AppRestart>,
     ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
     serve_inner(
@@ -260,8 +247,6 @@ pub(crate) fn serve_with_ready(
         configs,
         externals,
         notifier,
-        host,
-        app_restart,
         Some(ready_tx),
     );
 }
@@ -275,7 +260,6 @@ fn report_startup_failure(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn serve_inner(
     home: &Path,
     registry: AgentRegistry,
@@ -283,8 +267,6 @@ fn serve_inner(
     configs: ConfigRegistry,
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
-    host: RestartCapability,
-    app_restart: Option<crate::api::app_restart::AppRestart>,
     mut ready_tx: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
 ) {
     // #945 Phase 0: time the bind+port-publish step directly (not the

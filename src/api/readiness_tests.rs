@@ -34,15 +34,7 @@ fn daemon_ready_signal_follows_port_publication() {
         .name("test_daemon_ready_signal".into())
         .spawn(move || {
             serve_with_ready(
-                &api_home,
-                registry,
-                shutdown,
-                configs,
-                externals,
-                None,
-                RestartCapability::Daemon,
-                None,
-                ready_tx,
+                &api_home, registry, shutdown, configs, externals, None, ready_tx,
             );
         })
         .unwrap();
@@ -65,15 +57,7 @@ fn daemon_ready_signal_reports_auth_startup_failure() {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     serve_with_ready(
-        &home,
-        registry,
-        shutdown,
-        configs,
-        externals,
-        None,
-        RestartCapability::Daemon,
-        None,
-        ready_tx,
+        &home, registry, shutdown, configs, externals, None, ready_tx,
     );
 
     let error = ready_rx.recv().unwrap().unwrap_err();

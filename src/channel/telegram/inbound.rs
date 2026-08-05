@@ -629,9 +629,6 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         // pre-ledger restart, or a non-bot quote) leaves `reply_target = None`;
         // the agent still gets `in_reply_to_excerpt` (graceful degrade).
         let reply_chat_id = msg.chat.id.0.to_string();
-        let _reply_target = msg
-            .reply_to_message()
-            .and_then(|r| resolve_reply_target(&home, &r.id.0.to_string(), &reply_chat_id));
         let mut msg_obj = InboxMessage {
             schema_version: 0,
             id: None,
