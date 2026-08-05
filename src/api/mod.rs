@@ -305,18 +305,6 @@ fn serve_inner(
             return;
         }
     };
-    let operator_token = match crate::auth_cookie::read_operator_token(&run_dir) {
-        Ok(t) => t,
-        Err(e) => {
-            report_startup_failure(&mut ready_tx, &format!("api.operator token missing: {e}"));
-            tracing::error!(error = %e, "api.operator token missing; aborting serve");
-            return;
-        }
-    };
-    tracing::debug!(
-        isolation = ?crate::auth_cookie::SAME_UID_OPERATOR_ISOLATION,
-        "operator/agent same-uid secret-isolation status"
-    );
     tracing::info!(port, "API listening");
     if let Some(tx) = ready_tx.take() {
         let _ = tx.send(Ok(()));

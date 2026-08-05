@@ -669,30 +669,12 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             pr_number: None,
             terminal: None,
         };
-        // Stamp the durable row identity before enqueueing so a generic reply
-        // can settle this exact row even when the inline notification is
-        // consumed before the inbox drain arms its ledger obligation.
         crate::inbox::storage::ensure_msg_id(&mut msg_obj);
-        let inbound_msg_id = msg_obj.id.clone();
-        let inbound_from = format!("user:{username}");
-        match inbox::enqueue(&home, &instance_name, msg_obj) {
-            Ok(()) => crate::reply_ledger::arm_channel_turn(
-                &home,
-                &instance_name,
-                crate::channel::ChannelKind::Telegram,
-                inbound_msg_id,
-                Some(reply_chat_id),
-                None,
-                Some(&inbound_from),
-                Some(&text),
-            ),
-            Err(e) => tracing::error!(
-                error = %e,
-                op = "telegram_dispatch",
-                target = %instance_name,
-                "op failed — result dropped (silent-loss #1630/#1647)"
-            ),
-        }
+        persist_or_log!(
+            inbox::enqueue(&home, &instance_name, msg_obj),
+            "telegram_dispatch",
+            instance_name
+        );
         inbox::notify_agent_with_attachments(
             &home,
             &instance_name,

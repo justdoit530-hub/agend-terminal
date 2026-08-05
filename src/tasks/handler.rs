@@ -608,31 +608,23 @@ fn handle_done(
     // replay's `apply_done` does NOT re-guard transitions — so this precondition
     // is the authoritative gate (mirrors `handle_claim`'s `append_checked`).
     let done_id = id.clone();
-    // #2760 items 2+3: append the →Done under the per-id router lock with write-time
-    // route revalidation. The closure does ONLY the checked append; the cascade
-    // below (worktree cleanup / release recompute / obligation cleanup — each may
-    // self-IPC or take other locks) runs AFTER the per-id flock drops (#1629). The
-    // fingerprint match guarantees `routed.board()` still names the appended board,
-    // so the post-lock read-back reads the right board.
-    let append_result = routed.with_revalidated_board(home, |board| {
-        crate::task_events::append_checked_at(board, &emitter, event, |state| {
-            let tv = state
-                .tasks
-                .values()
-                .map(record_to_task)
-                .find(|t| t.id == done_id)
-                .ok_or_else(|| format!("task '{done_id}' not found"))?;
-            if !tv
-                .status
-                .can_transition_to(crate::task_events::TaskStatus::Done)
-            {
-                return Err(format!(
-                    "illegal transition: {} → done (task {done_id})",
-                    status_to_legacy_str(tv.status)
-                ));
-            }
-            Ok(())
-        })
+    let append_result = crate::task_events::append_checked_at(&board, &emitter, event, |state| {
+        let tv = state
+            .tasks
+            .values()
+            .map(record_to_task)
+            .find(|t| t.id == done_id)
+            .ok_or_else(|| format!("task '{done_id}' not found"))?;
+        if !tv
+            .status
+            .can_transition_to(crate::task_events::TaskStatus::Done)
+        {
+            return Err(format!(
+                "illegal transition: {} → done (task {done_id})",
+                status_to_legacy_str(tv.status)
+            ));
+        }
+        Ok(())
     });
     match append_result {
         Err(route_err) => serde_json::json!({
