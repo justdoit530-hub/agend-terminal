@@ -2682,7 +2682,6 @@ mod tests {
     /// (which retain a socket fallback).  This also covers helper indirection:
     /// it must snapshot the injected registries and call the typed task entry.
 
-
     #[test]
     fn source_region_is_brace_bounded_2454() {
         let source = concat!(
