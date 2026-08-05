@@ -2061,11 +2061,7 @@ mod tests {
                     },
                 )]),
             )),
-            capability: crate::api::RestartCapability::Unsupported,
-            app_restart: None,
-            post_flush: None,
             notifier: None,
-            shutdown: None,
         }
     }
 
@@ -2210,11 +2206,7 @@ mod tests {
             externals: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
             )),
-            capability: crate::api::RestartCapability::Unsupported,
-            app_restart: None,
-            post_flush: None,
             notifier: None,
-            shutdown: None,
         }
     }
 
