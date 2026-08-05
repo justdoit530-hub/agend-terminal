@@ -632,7 +632,7 @@ fn handle_done(
             "code": "task_route_unresolved",
         }),
         Ok(inner) => match inner {
-            Ok(Ok(_)) => {
+            Ok(_) => {
                 super::settle_completion_receipt(home, &id, completion_receipt.as_ref());
                 // #789: task-completion is a workflow boundary —
                 // clean any empty `init` commits the backend has
@@ -698,8 +698,7 @@ fn handle_done(
                     "status": "done",
                 })
             }
-            Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
-            Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+            Err(reason) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
         },
     }
 }

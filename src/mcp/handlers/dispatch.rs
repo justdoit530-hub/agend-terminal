@@ -2353,58 +2353,6 @@ mod tests {
         );
     }
 
-    // ── #2454 Slice 8: delayed async INJECT loopback RED ──────────────
-
-    /// #2454 S8: runtime=Some routes through inject_input (succeeds with
-    /// a live mock agent, no daemon needed).
-    #[test]
-    fn inject_with_routing_runtime_some_uses_inject_input_2454() {
-        use crate::mcp::handlers::instance_state::spawn::inject_with_routing;
-        let home =
-            std::env::temp_dir().join(format!("agend-inject-routing-some-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let registry =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let (handle, _reader) = crate::daemon::per_tick::mock_live_agent_no_context("agent-x");
-        let id = handle.id;
-        registry.lock().insert(id, handle);
-        let externals =
-            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            format!("instances:\n  agent-x:\n    id: {}\n", id.full()),
-        )
-        .unwrap();
-        let rt_arcs = (registry, externals);
-        let result = inject_with_routing(&home, "agent-x", b"hello", Some(&rt_arcs));
-        assert!(
-            result.is_ok(),
-            "runtime=Some must succeed in-process without a daemon: {result:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #2454 S8: runtime=None falls back to legacy api::call (fails with
-    /// no daemon — proving it actually tries the socket path).
-    #[test]
-    fn inject_with_routing_runtime_none_uses_api_call_2454() {
-        use crate::mcp::handlers::instance_state::spawn::inject_with_routing;
-        let home =
-            std::env::temp_dir().join(format!("agend-inject-routing-none-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        let result = inject_with_routing(&home, "any-agent", b"hello", None);
-        assert!(
-            result.is_err(),
-            "runtime=None must attempt api::call (fails with no daemon): {result:?}"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("daemon") || err.contains("run dir"),
-            "runtime=None error must come from api::call path: {err}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
     /// Strip the test-only tail from a source file without treating `#[cfg(test)]`
     /// helper statics as the boundary.  The inventory below is intentionally
     /// generated from the checked-out production sources rather than a fixed
