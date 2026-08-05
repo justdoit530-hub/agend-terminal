@@ -622,7 +622,14 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
         );
     } else {
         let notify_attachments = attachments.clone();
-        let msg_obj = InboxMessage {
+        // Reply-to correlation: if the operator quote-replied to a message the
+        // bot previously sent, resolve it via the sent_ledger to surface who
+        // sent it + its task context. Key is (quoted message_id, this chat_id) —
+        // Telegram message_ids repeat across chats. A miss (e.g. sent before a
+        // pre-ledger restart, or a non-bot quote) leaves `reply_target = None`;
+        // the agent still gets `in_reply_to_excerpt` (graceful degrade).
+        let reply_chat_id = msg.chat.id.0.to_string();
+        let mut msg_obj = InboxMessage {
             schema_version: 0,
             id: None,
             read_at: None,
@@ -662,10 +669,23 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             pr_number: None,
             terminal: None,
         };
+        crate::inbox::storage::ensure_msg_id(&mut msg_obj);
+        let inbound_msg_id = msg_obj.id.clone();
+        let from_sender = msg_obj.from.clone();
         persist_or_log!(
             inbox::enqueue(&home, &instance_name, msg_obj),
             "telegram_dispatch",
             instance_name
+        );
+        crate::reply_ledger::arm(
+            &home,
+            &instance_name,
+            crate::channel::ChannelKind::Telegram,
+            inbound_msg_id,
+            Some(reply_chat_id),
+            None,
+            Some(&from_sender),
+            Some(&text),
         );
         inbox::notify_agent_with_attachments(
             &home,
@@ -690,6 +710,11 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             agent: instance_name,
         });
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn handle_message_for_test(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
+    handle_message(state, msg).await;
 }
 
 /// Read the current `agent_state` of `instance_name` from the in-process

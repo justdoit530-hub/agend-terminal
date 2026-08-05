@@ -168,8 +168,16 @@ pub fn handle_tool_rt(tool: &str, args: &Value, instance_name: &str) -> Value {
     handle_tool_with_runtime(tool, args, instance_name, Some(runtime))
 }
 
-/// #2454: tool dispatch with optional live RuntimeContext.
-pub fn handle_tool_with_runtime(
+#[cfg(test)]
+pub(crate) fn handle_reply_for_test(
+    home: &std::path::Path,
+    args: &Value,
+    instance_name: &str,
+) -> Value {
+    channel::handle_reply(home, args, instance_name)
+}
+
+pub(crate) fn handle_tool_with_runtime(
     tool: &str,
     args: &Value,
     instance_name: &str,

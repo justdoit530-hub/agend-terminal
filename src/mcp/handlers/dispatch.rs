@@ -1939,22 +1939,976 @@ mod tests {
         );
     }
 
-    // Machine-checkable schema test: message/message_from_file must use
-    // anyOf so that "at least one is required" is expressible in JSON Schema.
-    #[test]
-    fn schema_has_anyof_message_from_file() {
-        use crate::mcp::tools::*;
-        let reply = def_reply();
-        let send = def_send();
-        for (name, def) in [("reply", &reply), ("send", &send)] {
-            let schema = &def["inputSchema"];
-            assert!(
-                schema.get("anyOf").is_some(),
-                "{name} schema must have an anyOf clause"
-            );
-            let any_of = schema["anyOf"].as_array().unwrap();
-            assert_eq!(any_of.len(), 2);
+    // #2454 Slice 5 RED: task health/sweep must consume the live registry
+    // forwarded through the real MCP task dispatcher.  The current handler
+    // still self-IPC's through the API (or reads runtime state from disk), so
+    // these tests deterministically fail with no daemon/socket listener.
+    fn runtime_with_external(name: &str) -> RuntimeContext {
+        RuntimeContext {
+            registry: std::sync::Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            configs: Default::default(),
+            externals: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::from([(
+                    name.to_string(),
+                    crate::agent::ExternalAgentHandle {
+                        backend_command: "codex".to_string(),
+                        pid: 4242,
+                    },
+                )]),
+            )),
+            notifier: None,
         }
+    }
+
+    fn task_runtime_ctx<'a>(
+        home: &'a Path,
+        args: &'a Value,
+        runtime: &'a RuntimeContext,
+    ) -> HandlerCtx<'a> {
+        static EMPTY_SENDER: Option<Sender> = None;
+        HandlerCtx {
+            home,
+            args,
+            instance_name: "operator",
+            sender: &EMPTY_SENDER,
+            runtime: Some(runtime),
+        }
+    }
+
+    fn backdate_task(home: &Path, task_id: &str) {
+        let path = home.join("task_events.jsonl");
+        let old = (chrono::Utc::now() - chrono::Duration::days(31)).to_rfc3339();
+        let content = std::fs::read_to_string(&path).expect("task event log");
+        let rewritten = content
+            .lines()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(line).expect("task event JSON");
+                if value["event"]["task_id"] == task_id {
+                    value["timestamp"] = json!(old);
+                }
+                serde_json::to_string(&value).expect("serialized task event")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, format!("{rewritten}\n")).expect("rewrite task event log");
+    }
+
+    #[test]
+    fn task_health_uses_supplied_runtime_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-task-health-runtime-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let created = crate::tasks::handle(
+            &home,
+            "operator",
+            &json!({
+                "action": "create",
+                "title": "runtime-owned task",
+                "assignee": "live-agent"
+            }),
+        );
+        let task_id = created["id"].as_str().expect("created task id");
+        backdate_task(&home, task_id);
+
+        let args = json!({"action": "health"});
+        let runtime = runtime_with_external("live-agent");
+        let ctx = task_runtime_ctx(&home, &args, &runtime);
+        let result = try_dispatch("task", &ctx).expect("task dispatch result");
+        assert_eq!(
+            result["live_agents_available"], true,
+            "health must use the supplied live RuntimeContext without API fallback: {result}"
+        );
+        let strict_owners = result["ghost_owners"]["strict_owners"]
+            .as_array()
+            .expect("strict owner list");
+        assert!(
+            !strict_owners.iter().any(|owner| owner == "live-agent"),
+            "a supplied live owner must not be classified as strict/ghost: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn task_sweep_uses_supplied_runtime_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-task-sweep-runtime-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let created = crate::tasks::handle(
+            &home,
+            "operator",
+            &json!({
+                "action": "create",
+                "title": "runtime-owned stale task",
+                "assignee": "live-agent"
+            }),
+        );
+        let task_id = created["id"].as_str().expect("created task id");
+        backdate_task(&home, task_id);
+
+        let args = json!({"action": "sweep"});
+        let runtime = runtime_with_external("live-agent");
+        let ctx = task_runtime_ctx(&home, &args, &runtime);
+        let result = try_dispatch("task", &ctx).expect("task dispatch result");
+        assert_eq!(
+            result["dry_run"], true,
+            "sweep must return a dry-run plan: {result}"
+        );
+        let disbanded = result["categories"]["team_disbanded"]
+            .as_array()
+            .expect("team_disbanded category");
+        assert!(
+            !disbanded.iter().any(|candidate| candidate["id"] == task_id),
+            "a supplied live owner must not be classified as team-disbanded: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn task_health_and_sweep_runtime_none_are_explicit_errors_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-task-runtime-none-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        for action in ["health", "sweep"] {
+            let args = json!({"action": action});
+            let ctx = ctx_for(&home, &args, "operator");
+            let result = try_dispatch("task", &ctx).expect("task dispatch result");
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("runtime unavailable"),
+                "task action={action} with runtime=None must fail explicitly, never socket-fallback: {result}"
+            );
+        }
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    // #2454 Slice 6 RED: move_pane must use the forwarded RuntimeContext
+    // directly. The current adapter still calls the daemon MOVE_PANE socket,
+    // so this real dispatch path deterministically fails without a listener.
+    fn move_pane_runtime() -> RuntimeContext {
+        RuntimeContext {
+            registry: std::sync::Arc::new(
+                parking_lot::Mutex::new(std::collections::HashMap::new()),
+            ),
+            configs: Default::default(),
+            externals: std::sync::Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            notifier: None,
+        }
+    }
+
+    fn move_pane_runtime_ctx<'a>(
+        home: &'a Path,
+        args: &'a Value,
+        runtime: &'a RuntimeContext,
+    ) -> HandlerCtx<'a> {
+        static EMPTY_SENDER: Option<Sender> = None;
+        HandlerCtx {
+            home,
+            args,
+            instance_name: "operator",
+            sender: &EMPTY_SENDER,
+            runtime: Some(runtime),
+        }
+    }
+
+    #[test]
+    fn move_pane_uses_supplied_runtime_without_api_listener_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-move-pane-runtime-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let args = json!({
+            "instance": "agent-a",
+            "target_tab": "team-x",
+        });
+        let runtime = move_pane_runtime();
+        let ctx = move_pane_runtime_ctx(&home, &args, &runtime);
+        let result = try_dispatch("move_pane", &ctx).expect("move_pane dispatch result");
+        assert_eq!(
+            result["ok"], true,
+            "move_pane must succeed through RuntimeContext without an API listener: {result}"
+        );
+        assert_eq!(
+            result["instance"], "agent-a",
+            "move_pane target must be echoed"
+        );
+        assert_eq!(
+            result["target_tab"], "team-x",
+            "move_pane tab must be echoed"
+        );
+
+        let log = std::fs::read_to_string(home.join("event-log.jsonl"))
+            .expect("runtime move_pane must emit one event-log record");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "move_pane must emit exactly one event: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("\"kind\":\"move_pane\"")
+                && lines[0].contains("agent-a")
+                && lines[0].contains("team-x")
+                && lines[0].contains("Horizontal"),
+            "move_pane event must preserve default split semantics: {lines:?}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn move_pane_vertical_split_and_notifier_contract_2454() {
+        use crate::api::{ApiEvent, ApiNotifier, PaneMoveSplitDir};
+
+        struct RecordingNotifier {
+            events: parking_lot::Mutex<Vec<ApiEvent>>,
+        }
+
+        impl RecordingNotifier {
+            fn new() -> Self {
+                Self {
+                    events: parking_lot::Mutex::new(Vec::new()),
+                }
+            }
+
+            fn take(&self) -> Vec<ApiEvent> {
+                std::mem::take(&mut *self.events.lock())
+            }
+        }
+
+        impl ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-move-pane-notifier-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let notifier = std::sync::Arc::new(RecordingNotifier::new());
+        let notifier_trait: std::sync::Arc<dyn crate::api::ApiNotifier> = notifier.clone();
+        let ctx = crate::api::handlers::HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: Some(notifier_trait),
+            home: &home,
+        };
+
+        let default = crate::api::handlers::instance::handle_move_pane(
+            &json!({"agent": "agent-a", "target_tab": "team-x"}),
+            &ctx,
+        );
+        assert_eq!(default["ok"], true, "API move_pane default must succeed");
+        let vertical = crate::api::handlers::instance::handle_move_pane(
+            &json!({
+                "agent": "agent-b",
+                "target_tab": "team-y",
+                "split_dir": "vertical",
+            }),
+            &ctx,
+        );
+        assert_eq!(vertical["ok"], true, "API move_pane vertical must succeed");
+
+        let events = notifier.take();
+        assert_eq!(events.len(), 2, "default + vertical must emit two events");
+        assert!(matches!(
+            &events[0],
+            ApiEvent::PaneMoved {
+                agent,
+                target_tab,
+                split_dir: PaneMoveSplitDir::Horizontal,
+            } if agent == "agent-a" && target_tab == "team-x"
+        ));
+        assert!(matches!(
+            &events[1],
+            ApiEvent::PaneMoved {
+                agent,
+                target_tab,
+                split_dir: PaneMoveSplitDir::Vertical,
+            } if agent == "agent-b" && target_tab == "team-y"
+        ));
+        let log = std::fs::read_to_string(home.join("event-log.jsonl"))
+            .expect("API move_pane must emit event-log records");
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "two move_pane calls must emit two records"
+        );
+        assert!(log
+            .lines()
+            .all(|line| line.contains("\"kind\":\"move_pane\"")));
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn move_pane_runtime_none_is_explicit_and_never_socket_fallback_2454() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-move-pane-runtime-none-red-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let args = json!({
+            "instance": "agent-a",
+            "target_tab": "team-x",
+        });
+        let ctx = ctx_for(&home, &args, "operator");
+        let result = try_dispatch("move_pane", &ctx).expect("move_pane dispatch result");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("runtime unavailable"),
+            "runtime=None must fail explicitly rather than use socket fallback: {result}"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn move_pane_shared_service_and_no_api_call_invariants_2454() {
+        let dispatch = include_str!("dispatch.rs");
+        let production_dispatch = dispatch
+            .split("#[cfg(test)]")
+            .next()
+            .expect("dispatch production source");
+        assert!(
+            !production_dispatch
+                .contains("adapter!(dispatch_move_pane, ha, instance::handle_move_pane)"),
+            "move_pane must use a runtime-aware custom dispatch adapter"
+        );
+        let runtime_start = production_dispatch
+            .find("pub(crate) struct RuntimeContext {")
+            .expect("RuntimeContext declaration");
+        let runtime_end = production_dispatch[runtime_start..]
+            .find("/// One MCP tool's dispatcher")
+            .map(|offset| runtime_start + offset)
+            .expect("RuntimeContext end marker");
+        let runtime_region = &production_dispatch[runtime_start..runtime_end];
+        assert!(
+            runtime_region.contains("notifier"),
+            "RuntimeContext must own a notifier for MCP move_pane"
+        );
+        let move_start = production_dispatch
+            .find("pub(crate) fn dispatch_move_pane(")
+            .expect("runtime-aware dispatch_move_pane declaration");
+        let move_end = production_dispatch[move_start..]
+            .find("pub(crate) fn dispatch_usage_limit_takeover(")
+            .map(|offset| move_start + offset)
+            .expect("dispatch_move_pane end marker");
+        let move_region = &production_dispatch[move_start..move_end];
+        assert!(
+            move_region.contains("notifier"),
+            "dispatch_move_pane must forward RuntimeContext notifier"
+        );
+
+        let mcp = include_str!("instance_metadata.rs");
+        let mcp_start = mcp
+            .find("pub(super) fn handle_move_pane(")
+            .expect("MCP move_pane handler");
+        let mcp_end = mcp[mcp_start..]
+            .find("pub(super) fn handle_pane_snapshot(")
+            .map(|offset| mcp_start + offset)
+            .expect("MCP pane_snapshot handler");
+        let mcp_region = &mcp[mcp_start..mcp_end];
+        assert!(
+            mcp_region.contains("agent_ops::move_pane"),
+            "MCP move_pane must call the shared neutral service"
+        );
+        assert!(
+            !mcp_region.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with("//") && trimmed.contains("api::call")
+            }),
+            "MCP move_pane production region must contain no api::call"
+        );
+
+        let api = include_str!("../../api/handlers/instance.rs");
+        let api_start = api
+            .find("pub(crate) fn handle_move_pane(")
+            .expect("API move_pane handler");
+        let api_end = api[api_start..]
+            .find("pub(crate) fn handle_set_blocked_reason(")
+            .map(|offset| api_start + offset)
+            .expect("API blocked-reason handler");
+        let api_region = &api[api_start..api_end];
+        assert!(
+            api_region.contains("agent_ops::move_pane"),
+            "API move_pane must call the same shared neutral service"
+        );
+    }
+
+    /// Strip the test-only tail from a source file without treating `#[cfg(test)]`
+    /// helper statics as the boundary.  The inventory below is intentionally
+    /// generated from the checked-out production sources rather than a fixed
+    /// syntax budget: compatibility transports are valid when their runtime
+    /// branch is absent, and the successor STATUS call is cross-daemon.
+    fn production_tail(source: &str) -> &str {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut boundary = lines.len();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim() != "#[cfg(test)]" {
+                continue;
+            }
+            let next = lines
+                .iter()
+                .skip(index + 1)
+                .take(4)
+                .map(|line| line.trim())
+                .find(|line| !line.starts_with('#'))
+                .unwrap_or("");
+            let module_name = next
+                .strip_prefix("mod ")
+                .and_then(|name| name.split_whitespace().next())
+                .unwrap_or("");
+            if module_name == "tests" || module_name.ends_with("_tests") {
+                boundary = index;
+                break;
+            }
+        }
+        // Reconstruct the byte boundary from the original source chunks so
+        // CRLF checkouts and non-ASCII lines cannot drift into the middle of a
+        // UTF-8 code point. `str::len()` is byte-based, and each inclusive
+        // chunk carries its exact newline width (`\n` or `\r\n`).
+        let end: usize = source
+            .split_inclusive('\n')
+            .take(boundary)
+            .map(str::len)
+            .sum();
+        &source[..end]
+    }
+
+    fn code_without_strings_or_comments(line: &str) -> String {
+        let mut result = String::with_capacity(line.len());
+        let mut quoted = false;
+        let mut escaped = false;
+        let bytes = line.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+                result.push(' ');
+            } else if byte == b'"' {
+                quoted = true;
+                result.push(' ');
+            } else if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                break;
+            } else {
+                result.push(byte as char);
+            }
+            index += 1;
+        }
+        result
+    }
+
+    fn function_name(line: &str) -> Option<String> {
+        let marker = line.find("fn ")? + 3;
+        let name: String = line[marker..]
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn source_region<'a>(source: &'a str, function: &str) -> &'a str {
+        let marker = format!("fn {function}");
+        let start = source
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing source function {function}"));
+        let body_start = source[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .unwrap_or_else(|| panic!("missing body for source function {function}"));
+        let bytes = source.as_bytes();
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut char_literal = false;
+        let mut raw_hashes = None;
+        let mut line_comment = false;
+        let mut block_comment_depth = 0usize;
+        let mut index = body_start;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let next = bytes.get(index + 1).copied();
+            if line_comment {
+                if byte == b'\n' {
+                    line_comment = false;
+                }
+            } else if block_comment_depth > 0 {
+                if byte == b'/' && next == Some(b'*') {
+                    block_comment_depth += 1;
+                    index += 1;
+                } else if byte == b'*' && next == Some(b'/') {
+                    block_comment_depth -= 1;
+                    index += 1;
+                }
+            } else if let Some(hashes) = raw_hashes {
+                if byte == b'"'
+                    && bytes[index + 1..]
+                        .iter()
+                        .take_while(|candidate| **candidate == b'#')
+                        .count()
+                        == hashes
+                {
+                    raw_hashes = None;
+                    index += hashes;
+                }
+            } else if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                }
+            } else if char_literal {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'\'' {
+                    char_literal = false;
+                }
+            } else if byte == b'/' && next == Some(b'/') {
+                line_comment = true;
+                index += 1;
+            } else if byte == b'/' && next == Some(b'*') {
+                block_comment_depth = 1;
+                index += 1;
+            } else if let Some((quote_index, hashes)) = {
+                let (prefix_index, prefix_len) = if byte == b'r' {
+                    (index, 1)
+                } else if byte == b'b' && next == Some(b'r') {
+                    (index, 2)
+                } else {
+                    (index, 0)
+                };
+                if prefix_len == 0 {
+                    None
+                } else {
+                    let mut cursor = prefix_index + prefix_len;
+                    while bytes.get(cursor) == Some(&b'#') {
+                        cursor += 1;
+                    }
+                    (bytes.get(cursor) == Some(&b'"'))
+                        .then_some((cursor, cursor - prefix_index - prefix_len))
+                }
+            } {
+                raw_hashes = Some(hashes);
+                index = quote_index;
+            } else if byte == b'\'' && (next == Some(b'\\') || bytes.get(index + 2) == Some(&b'\''))
+            {
+                char_literal = true;
+            } else if byte == b'"' {
+                quoted = true;
+            } else if byte == b'{' {
+                depth += 1;
+            } else if byte == b'}' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return &source[start..=index];
+                }
+            }
+            index += 1;
+        }
+        panic!("unterminated body for source function {function}");
+    }
+
+    fn transport_inventory() -> Vec<(String, usize, String, String)> {
+        fn walk(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, files);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    files.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        files.sort();
+        let mut inventory = Vec::new();
+        for path in files {
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let production = production_tail(&source);
+            let relative = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap_or(&path)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            let mut current_function = String::from("<module>");
+            for (line_number, line) in production.lines().enumerate() {
+                let code = code_without_strings_or_comments(line);
+                if let Some(name) = function_name(&code) {
+                    current_function = name;
+                }
+                let kind = if code.contains("api::call_at(") {
+                    "call_at"
+                } else if code.contains("api::call(") {
+                    "call"
+                } else if code.contains("request_local(") {
+                    "request_local"
+                } else {
+                    continue;
+                };
+                inventory.push((
+                    relative.clone(),
+                    line_number + 1,
+                    current_function.clone(),
+                    kind.to_string(),
+                ));
+            }
+        }
+        inventory
+    }
+
+    fn classify_transport(path: &str, function: &str, kind: &str) -> &'static str {
+        if path == "src/mcp/handlers/restart.rs" && function == "phase1_gate" && kind == "call_at" {
+            return "cross_daemon_successor_status";
+        }
+        if path == "src/mcp/handlers/instance_state/lifecycle.rs"
+            && function == "delete_with_runtime_or_legacy"
+        {
+            return "runtime_none_instance_delete";
+        }
+        if path == "src/mcp/handlers/instance_state/spawn.rs" && function == "inject_with_routing" {
+            return "runtime_none_instance_inject";
+        }
+        if path == "src/mcp/handlers/instance_state/spawn.rs" && function == "legacy_spawn" {
+            return "runtime_none_instance_spawn";
+        }
+        if path == "src/deployments.rs" && function == "spawn_instances_legacy" {
+            return "runtime_none_deployment_spawn";
+        }
+        if path == "src/deployments.rs" && function == "create_deployment_team_legacy" {
+            return "runtime_none_deployment_create_team";
+        }
+        if path == "src/deployments.rs" && function == "delete_instances_legacy" {
+            return "runtime_none_deployment_delete";
+        }
+        if path == "src/agent_ops.rs" && function == "send_via_api_bridge" {
+            return "runtime_none_send_bridge";
+        }
+        if path == "src/tasks/handler.rs" && function == "handle_sweep" {
+            return "runtime_none_task_sweep_wrapper";
+        }
+        if path == "src/runtime.rs" && function == "list_live_agents" {
+            return "shared_runtime_none_list_wrapper";
+        }
+        if path == "src/inbox/notify.rs" && function == "inject_with_submit_direct" {
+            return "async_delivery_worker_inject";
+        }
+        if path == "src/agent/mod.rs" {
+            return "agent_lifecycle_shell_fallback";
+        }
+        if path.starts_with("src/channel/telegram/") {
+            return "telegram_channel_caller";
+        }
+        if matches!(
+            path,
+            "src/connect.rs"
+                | "src/bugreport.rs"
+                | "src/main.rs"
+                | "src/tray/mod.rs"
+                | "src/verify.rs"
+        ) {
+            return "standalone_or_operator_client";
+        }
+        panic!("unclassified production transport candidate: {path}:{function} ({kind})");
+    }
+
+    /// #2454 closure RED: generated inventory must classify every production
+    /// transport candidate by runtime/process reachability.  The counts are
+    /// derived from the scan; only the six compatibility sites and the one
+    /// explicitly cross-daemon call are pinned by disposition.
+    #[test]
+    fn generated_production_transport_inventory_is_classified_2454() {
+        let inventory = transport_inventory();
+        assert!(
+            !inventory.is_empty(),
+            "production transport inventory is empty"
+        );
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for (path, _line, function, kind) in &inventory {
+            *counts
+                .entry(classify_transport(path, function, kind))
+                .or_default() += 1;
+        }
+        assert_eq!(counts.get("cross_daemon_successor_status"), Some(&1));
+        assert_eq!(counts.get("runtime_none_instance_delete"), Some(&1));
+        assert_eq!(counts.get("runtime_none_instance_inject"), Some(&1));
+        assert_eq!(counts.get("runtime_none_instance_spawn"), Some(&1));
+        assert_eq!(counts.get("runtime_none_deployment_spawn"), Some(&1));
+        assert_eq!(counts.get("runtime_none_deployment_create_team"), Some(&1));
+        assert_eq!(counts.get("runtime_none_deployment_delete"), Some(&1));
+        assert_eq!(counts.get("runtime_none_send_bridge"), Some(&1));
+        assert_eq!(counts.get("runtime_none_task_sweep_wrapper"), Some(&1));
+        assert_eq!(counts.get("shared_runtime_none_list_wrapper"), Some(&1));
+    }
+
+    /// The in-process MCP task adapter must never call the public LIST wrappers
+    /// (which retain a socket fallback).  This also covers helper indirection:
+    /// it must snapshot the injected registries and call the typed task entry.
+
+    #[test]
+    fn source_region_is_brace_bounded_2454() {
+        let source = concat!(
+            "fn first() {\n",
+            " let char_brace = '}';\n",
+            " let after_char = \"AFTER_CHAR\";\n",
+            " let raw = r###\"{ raw }\"###;\n",
+            " let after_raw = \"AFTER_RAW\";\n",
+            " /* outer { /* nested } */ still } */\n",
+            " let after_comment = \"AFTER_COMMENT\";\n",
+            " let sentinel = \"FIRST_SENTINEL\";\n",
+            "}\n",
+            "pub async fn second() { panic!(\"SECOND_SENTINEL\") }\n"
+        );
+        let first = source_region(source, "first");
+        assert!(first.contains("AFTER_CHAR"));
+        assert!(first.contains("AFTER_RAW"));
+        assert!(first.contains("AFTER_COMMENT"));
+        assert!(first.contains("FIRST_SENTINEL"));
+        assert!(!first.contains("SECOND_SENTINEL"));
+    }
+
+    #[test]
+    fn production_tail_preserves_utf8_crlf_boundary_2454() {
+        let source = "pub fn first() {\r\n    let marker = \"—\";\r\n} // —\r\n#[cfg(test)]\r\nmod tests {\r\n    fn ignored() {}\r\n}\r\n";
+        let production = production_tail(source);
+        assert!(production.contains("let marker = \"—\""));
+        assert!(!production.contains("mod tests"));
+    }
+
+    /// All team actions are part of the MCP runtime-present closure.  The
+    /// current exact-main adapters drop RuntimeContext for list/delete; this
+    /// guard intentionally stays RED until those two synchronous paths are
+    /// routed through typed owners as well.
+    #[test]
+    fn runtime_present_team_actions_forward_runtime_2454() {
+        let source = include_str!("dispatch.rs");
+        let dispatch = source
+            .split("pub(crate) fn dispatch_team")
+            .nth(1)
+            .and_then(|region| region.split("// `inbox` —").next())
+            .expect("dispatch_team source region");
+        assert!(
+            dispatch.contains("handle_delete_team(ctx.home, ctx.args, ctx.runtime)"),
+            "team delete must retain runtime context for the in-process cascade"
+        );
+        assert!(
+            dispatch.contains("handle_list_teams(ctx.home, ctx.runtime)"),
+            "team list must retain runtime context for the in-process live snapshot"
+        );
+    }
+
+    /// The stale dispatch_interrupt comment must describe the typed injection
+    /// route, not claim that INJECT remains a loopback after runtime forwarding.
+    #[test]
+    fn dispatch_interrupt_comment_matches_runtime_inject_route_2454() {
+        let source = include_str!("dispatch.rs");
+        let obsolete = ["its INJECT", " stays a loopback"].concat();
+        assert!(
+            !source.contains(&obsolete),
+            "dispatch_interrupt still documents an obsolete INJECT loopback"
+        );
+    }
+
+    /// #2454 Slice 13 RED: the neutral typed CREATE_TEAM service must own
+    /// the team-creation logic, and both MCP and API handlers must route
+    /// through thin adapters to it — not call teams::create directly.
+    #[test]
+    fn create_team_neutral_service_owns_logic_2454() {
+        let task_src = include_str!("task.rs");
+        let test_boundary = task_src
+            .rfind("#[cfg(test)]\nmod ")
+            .unwrap_or(task_src.len());
+        let production = &task_src[..test_boundary];
+        let create_fn_start = production
+            .find("fn handle_create_team(")
+            .expect("MCP handle_create_team must exist");
+        let create_fn_end = production[create_fn_start..]
+            .find("\n}\n")
+            .map(|o| create_fn_start + o)
+            .unwrap_or(production.len());
+        let create_fn = &production[create_fn_start..create_fn_end];
+        assert!(
+            !create_fn.contains("api::call"),
+            "#2454: MCP handle_create_team must not contain api::call: \
+             it must route through the neutral typed service"
+        );
+        assert!(
+            !create_fn.contains("teams::create("),
+            "#2454: MCP handle_create_team must not call teams::create directly: \
+             it must route through the neutral typed service"
+        );
+    }
+
+    /// #2454 Slice 13 RED: both API and MCP CREATE_TEAM handlers must route
+    /// through one shared neutral typed service. The neutral service must NOT
+    /// take HandlerCtx or raw serde_json::Value as its primary boundary type
+    /// — it must own a typed domain interface. Wrapping old logic behind a
+    /// same-named raw-Value helper cannot pass this guard.
+    #[test]
+    fn create_team_both_adapters_share_neutral_typed_owner_2454() {
+        let neutral_marker = "team_ops::create";
+
+        // ── Adapter convergence: both MCP and API must call the same owner ──
+
+        let mcp_src = include_str!("task.rs");
+        let mcp_boundary = mcp_src.rfind("#[cfg(test)]\nmod ").unwrap_or(mcp_src.len());
+        let mcp_prod = &mcp_src[..mcp_boundary];
+        let mcp_fn_start = mcp_prod
+            .find("fn handle_create_team(")
+            .expect("MCP handle_create_team");
+        let mcp_fn_end = mcp_prod[mcp_fn_start..]
+            .find("\n}\n")
+            .map(|o| mcp_fn_start + o)
+            .unwrap_or(mcp_prod.len());
+        let mcp_fn = &mcp_prod[mcp_fn_start..mcp_fn_end];
+
+        let api_src = include_str!("../../api/handlers/team.rs");
+        let api_boundary = api_src
+            .rfind("#[cfg(test)]\n#[allow")
+            .unwrap_or(api_src.len());
+        let api_prod = &api_src[..api_boundary];
+        let api_fn_start = api_prod
+            .find("fn handle_create_team(")
+            .expect("API handle_create_team");
+        let api_fn_end = api_prod[api_fn_start..]
+            .find("\n}\n")
+            .map(|o| api_fn_start + o)
+            .unwrap_or(api_prod.len());
+        let api_fn = &api_prod[api_fn_start..api_fn_end];
+
+        assert!(
+            mcp_fn.contains(neutral_marker),
+            "#2454: MCP handle_create_team must call neutral typed service \
+             `{neutral_marker}`, not own the logic"
+        );
+        assert!(
+            api_fn.contains(neutral_marker),
+            "#2454: API handle_create_team must call neutral typed service \
+             `{neutral_marker}`, not own the logic"
+        );
+        assert!(
+            !mcp_fn.contains("HandlerCtx"),
+            "#2454: MCP CREATE_TEAM adapter must not pass HandlerCtx to the service"
+        );
+
+        // ── Owner boundary: the neutral service's definition must be typed ──
+        // Scan the module that should own the neutral service. Its `pub fn
+        // create` (or `pub(crate) fn create`) signature must NOT accept
+        // `HandlerCtx` or raw `Value`/`&Value` as a parameter — the boundary
+        // must be typed domain types. A same-named helper that just wraps
+        // teams::create with a raw Value interface cannot pass.
+
+        // team_ops module must exist as a file
+        let team_ops_exists =
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")).exists()
+                || std::path::Path::new(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/src/team_ops/mod.rs"
+                ))
+                .exists();
+        assert!(
+            team_ops_exists,
+            "#2454: neutral typed service module `team_ops` must exist as src/team_ops.rs or src/team_ops/mod.rs"
+        );
+
+        // Read the module and inspect the create function signature
+        let team_ops_path =
+            if std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs"))
+                .exists()
+            {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")
+            } else {
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops/mod.rs")
+            };
+        let team_ops_src =
+            std::fs::read_to_string(team_ops_path).expect("read team_ops module source");
+        let create_fn_start = team_ops_src
+            .find("fn create(")
+            .or_else(|| team_ops_src.find("fn create_team("))
+            .expect("team_ops must define a create/create_team function");
+        // Extract the signature line (up to the opening brace)
+        let sig_end = team_ops_src[create_fn_start..]
+            .find('{')
+            .map(|o| create_fn_start + o)
+            .unwrap_or(team_ops_src.len());
+        let signature = &team_ops_src[create_fn_start..sig_end];
+        assert!(
+            !signature.contains("HandlerCtx"),
+            "#2454: team_ops::create signature must not accept HandlerCtx \
+             (framework-coupled boundary): {signature}"
+        );
+        assert!(
+            !signature.contains("&Value") && !signature.contains(": Value"),
+            "#2454: team_ops::create signature must not accept raw serde_json::Value \
+             (untyped boundary — wrapping old logic behind a same-named helper): {signature}"
+        );
+    }
+
+    /// Wiring pin: both fire-and-forget thread bodies must call the shared
+    /// `inject_with_routing` helper (not inline api::call or inject_input).
+    #[test]
+    fn both_delayed_inject_threads_call_shared_helper_2454() {
+        let helper = concat!("inject_with_", "routing");
+        let mod_src = include_str!("instance_state/mod.rs");
+        let team_start = mod_src
+            .find("\"team_task_inject\"")
+            .expect("team_task_inject thread marker");
+        let team_end = team_start + 400.min(mod_src.len() - team_start);
+        let team_begin = team_start.saturating_sub(400);
+        let team_region = &mod_src[team_begin..team_end];
+        assert!(
+            team_region.contains(helper),
+            "team_task_inject region must call inject_with_routing"
+        );
+
+        let spawn_src = include_str!("instance_state/spawn.rs");
+        let task_start = spawn_src
+            .find("\"task_inject\"")
+            .expect("task_inject thread marker");
+        let task_end = task_start + 400.min(spawn_src.len() - task_start);
+        let task_begin = task_start.saturating_sub(1000);
+        let task_region = &spawn_src[task_begin..task_end];
+        assert!(
+            task_region.contains(helper),
+            "task_inject region must call inject_with_routing"
+        );
     }
 }
 

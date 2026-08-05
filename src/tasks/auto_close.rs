@@ -83,9 +83,10 @@ fn auto_close_on_report_with_mode(
     } else {
         super::assignee_completion_guard
     };
-    if completion_guard(home, correlation_id, reporter, record).is_err() {
-        return Ok(false);
-    }
+    let completion_receipt = match completion_guard(home, correlation_id, reporter, record) {
+        Ok(receipt) => receipt,
+        Err(_) => return Ok(false),
+    };
     let summary = if report_text.chars().count() > 200 {
         let truncated: String = report_text.chars().take(200).collect();
         format!("{truncated}…")
@@ -110,6 +111,19 @@ fn auto_close_on_report_with_mode(
         crate::task_events::append_done_if_legal(home, &emitter, correlation_id, vec![event])?;
     if closed {
         let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
+        super::settle_completion_receipt(home, correlation_id, completion_receipt.as_ref());
+        // #1018/#78445-2 (d): terminal auto-close — shared cleanup of both stores.
+        super::task_terminal_cleanup(home, correlation_id);
+        if let Some(binding) = crate::binding::read(home, reporter) {
+            if let Some(branch) = binding["branch"].as_str() {
+                crate::daemon::auto_release::enqueue_release_recompute(
+                    home,
+                    "",
+                    branch,
+                    "task_done",
+                );
+            }
+        }
     }
     Ok(closed)
 }
@@ -163,6 +177,42 @@ mod tests {
             ],
         )
         .expect("seed task");
+    }
+
+    fn seed_claimed_task_on_board(task_id: &str, assignee: &str, board: &Path) {
+        let emitter = InstanceName::from("test:seed");
+        let tid = TaskId(task_id.into());
+        crate::task_events::append_batch_at(
+            board,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: tid.clone(),
+                    title: "test task".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: tid,
+                    by: InstanceName::from(assignee),
+                },
+            ],
+        )
+        .expect("seed task");
+    }
+
+    fn task_status_on_board(task_id: &str, board: &Path) -> Option<crate::task_events::TaskStatus> {
+        let state = crate::task_events::replay_at(board).unwrap();
+        state.tasks.get(&TaskId(task_id.into())).map(|r| r.status)
     }
 
     fn seed_done_task(home: &Path, task_id: &str, assignee: &str) {
@@ -258,6 +308,236 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_report_uses_and_settles_merge_receipt_after_binding_release() {
+        let home = tmp_home("receipt_after_release");
+        let task_id = "t-receipt-auto-close";
+        let assignee = "dev-agent";
+        let emitter = InstanceName::from("test:seed");
+        crate::task_events::append_batch_at(
+            &home,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: TaskId(task_id.into()),
+                    title: "merged task".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from(assignee)),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: Some("feat/merged".into()),
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Claimed {
+                    task_id: TaskId(task_id.into()),
+                    by: InstanceName::from(assignee),
+                },
+            ],
+        )
+        .unwrap();
+        let created_at = chrono::Utc::now();
+        let receipt = crate::merge_receipt::MergeReceipt {
+            repo: "owner/repo".into(),
+            merge_sha: "c".repeat(40),
+            task_id: task_id.into(),
+            task_assignee: assignee.into(),
+            merge_authority: "lead".into(),
+            pr_number: 42,
+            created_at: created_at.to_rfc3339(),
+            expires_at: (created_at + chrono::TimeDelta::hours(1)).to_rfc3339(),
+        };
+        crate::merge_receipt::persist(&home, &receipt).unwrap();
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            task_id,
+            assignee,
+            "Task completed successfully",
+            true,
+        )
+        .unwrap();
+        assert!(closed, "receipt-backed terminal report must auto-close");
+        assert!(
+            crate::merge_receipt::find_for_task_completion(&home, task_id, assignee).is_none(),
+            "auto-close must settle its completion proof"
+        );
+        assert!(
+            crate::merge_receipt::find(&home, &receipt.repo, &receipt.merge_sha, &receipt.task_id)
+                .is_some(),
+            "CI lifecycle must retain the underlying receipt"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A completed child is not a reason to block a legitimate terminal report
+    /// for its still-open parent. Auto-close must not grow a has-children guard.
+    #[test]
+    fn parent_with_completed_child_still_auto_closes() {
+        let home = tmp_home("parent_completed_child");
+        let emitter = InstanceName::from("test:seed");
+        let parent = TaskId("t-parent-correlation".into());
+        let child = TaskId("t-child-correlation".into());
+        crate::task_events::append_batch_at(
+            &home,
+            &emitter,
+            vec![
+                TaskEvent::Created {
+                    task_id: parent.clone(),
+                    title: "parent".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from("dev-agent")),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                },
+                TaskEvent::Created {
+                    task_id: child.clone(),
+                    title: "child".into(),
+                    description: String::new(),
+                    priority: "normal".into(),
+                    owner: Some(InstanceName::from("dev-agent")),
+                    due_at: None,
+                    depends_on: Vec::new(),
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: Some(parent.clone()),
+                },
+                TaskEvent::Done {
+                    task_id: child,
+                    by: InstanceName::from("dev-agent"),
+                    source: crate::task_events::DoneSource::OperatorManual {
+                        authored_at: "2026-01-01T00:00:00Z".into(),
+                        result: Some("child complete".into()),
+                    },
+                },
+            ],
+        )
+        .expect("seed parent and completed child");
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            &parent.0,
+            "dev-agent",
+            "parent complete",
+            true,
+        )
+        .unwrap();
+        assert!(closed, "parent terminal report should auto-close");
+        assert_eq!(
+            task_status(&home, &parent.0),
+            Some(crate::task_events::TaskStatus::Done),
+            "completed child must not block its parent from closing"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #78445-2 PR-C (defect d) RED-first: closing a task must SETTLE its
+    /// `dispatch_tracking` rows (matched by task_id) so the stuck-dispatch sweep
+    /// stops nagging about a dispatch whose task the board already closed (the
+    /// reviewer4 double "dispatch stuck check"). Isolation (lead reminder): a
+    /// DIFFERENT task's row — even from the SAME dispatcher — must SURVIVE.
+    /// Pre-fix: the closed task's row lingered → still active/nagged.
+    #[test]
+    fn task_close_settles_dispatch_tracking_rows_78445_2() {
+        use crate::dispatch_tracking::{active_target_names, track_dispatch, DispatchEntry};
+        let home = tmp_home("pc_settle_dispatch");
+        let now = chrono::Utc::now().to_rfc3339();
+        // A review dispatch (lead → rev-a) for the task we will close …
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-close-me".into()),
+                from: "lead".into(),
+                to: "rev-a".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: now.clone(),
+                status: "pending".into(),
+            },
+        );
+        // … and one for a DIFFERENT task from the SAME dispatcher (isolation guard).
+        track_dispatch(
+            &home,
+            DispatchEntry {
+                task_id: Some("t-keep-me".into()),
+                from: "lead".into(),
+                to: "rev-b".into(),
+                from_id: None,
+                to_id: None,
+                delegated_at: now,
+                status: "pending".into(),
+            },
+        );
+
+        seed_claimed_task(&home, "t-close-me", "dev-agent");
+        let closed =
+            auto_close_on_report(&home, "report", "t-close-me", "dev-agent", "done", true).unwrap();
+        assert!(
+            closed,
+            "precondition: assignee terminal report auto-closes the task"
+        );
+
+        let active = active_target_names(&home);
+        assert!(
+            !active.contains(&"rev-a".to_string()),
+            "#78445-2 (d): closing the task must settle its dispatch_tracking row (rev-a): {active:?}"
+        );
+        assert!(
+            active.contains(&"rev-b".to_string()),
+            "#78445-2 (d) isolation: a DIFFERENT task's row (rev-b, same dispatcher) must SURVIVE: {active:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn assignee_terminal_report_auto_closes_non_default_board_task_2498() {
+        let home = tmp_home("assignee_close_project");
+        let board = crate::task_events::board_root(&home, "proj-2498");
+        seed_claimed_task_on_board("t-2498-project", "dev-agent", &board);
+        super::super::board_router::record_task_project(&home, "t-2498-project", "proj-2498")
+            .expect("record project index");
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-2498-project",
+            "dev-agent",
+            "Task completed successfully",
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            closed,
+            "terminal assignee report should auto-close across project boards"
+        );
+        assert_eq!(
+            task_status_on_board("t-2498-project", &board),
+            Some(crate::task_events::TaskStatus::Done),
+            "task status should be Done on its non-default board after auto-close"
+        );
+        assert_eq!(
+            task_status(&home, "t-2498-project"),
+            None,
+            "auto-close must not create or mutate a default-board copy"
+        );
+    }
     #[test]
     fn non_terminal_report_does_not_close() {
         let home = tmp_home("non_terminal");

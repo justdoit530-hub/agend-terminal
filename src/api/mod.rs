@@ -222,6 +222,53 @@ pub fn serve(
     externals: ExternalRegistry,
     notifier: Option<Arc<dyn ApiNotifier>>,
 ) {
+    serve_inner(home, registry, shutdown, configs, externals, notifier, None);
+}
+
+/// Daemon-owned API server entry that reports when the listener is fully ready.
+///
+/// Unlike [`serve`], this lets `run_core` wait until the port has been published
+/// and the authentication material has been loaded before it starts fleet
+/// agents. The bounded wait lives at the daemon composition root; this function
+/// reports either readiness or the exact startup failure once.
+pub(crate) fn serve_with_ready(
+    home: &Path,
+    registry: AgentRegistry,
+    shutdown: Arc<AtomicBool>,
+    configs: ConfigRegistry,
+    externals: ExternalRegistry,
+    notifier: Option<Arc<dyn ApiNotifier>>,
+    ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
+) {
+    serve_inner(
+        home,
+        registry,
+        shutdown,
+        configs,
+        externals,
+        notifier,
+        Some(ready_tx),
+    );
+}
+
+fn report_startup_failure(
+    ready_tx: &mut Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+    error: &str,
+) {
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Err(error.to_string()));
+    }
+}
+
+fn serve_inner(
+    home: &Path,
+    registry: AgentRegistry,
+    shutdown: Arc<AtomicBool>,
+    configs: ConfigRegistry,
+    externals: ExternalRegistry,
+    notifier: Option<Arc<dyn ApiNotifier>>,
+    mut ready_tx: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+) {
     // #945 Phase 0: time the bind+port-publish step directly (not the
     // spawn of api::serve thread — that's sub-ms). Operators care about
     // "when did api.port appear" for cold-start latency tracking.
@@ -229,6 +276,7 @@ pub fn serve(
     let listener: TcpListener = match crate::ipc::bind_loopback() {
         Ok(l) => l,
         Err(e) => {
+            report_startup_failure(&mut ready_tx, &format!("failed to bind API socket: {e}"));
             tracing::warn!(error = %e, "failed to bind API socket");
             return;
         }
@@ -236,6 +284,7 @@ pub fn serve(
     let port = crate::ipc::local_port(&listener);
     let run_dir = crate::daemon::run_dir(home);
     if let Err(e) = crate::ipc::write_port(&run_dir, crate::ipc::API_NAME, port) {
+        report_startup_failure(&mut ready_tx, &format!("failed to publish API port: {e}"));
         tracing::warn!(error = %e, "failed to publish API port");
         return;
     }
@@ -251,11 +300,15 @@ pub fn serve(
     let cookie = match crate::auth_cookie::read_cookie(&run_dir) {
         Ok(c) => c,
         Err(e) => {
+            report_startup_failure(&mut ready_tx, &format!("api.cookie missing: {e}"));
             tracing::error!(error = %e, "api.cookie missing; aborting serve");
             return;
         }
     };
     tracing::info!(port, "API listening");
+    if let Some(tx) = ready_tx.take() {
+        let _ = tx.send(Ok(()));
+    }
 
     // #1189: write `.ready` in app (TUI) mode after confirmed bind success.
     // Daemon mode writes `.ready` later (after spawn loop) with richer semantics.
@@ -821,6 +874,10 @@ fn api_call_read_timeout() -> std::time::Duration {
     const API_CALL_READ_TIMEOUT_SECS: u64 = 90;
     std::time::Duration::from_secs(API_CALL_READ_TIMEOUT_SECS)
 }
+
+#[cfg(test)]
+#[path = "readiness_tests.rs"]
+mod readiness_tests;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

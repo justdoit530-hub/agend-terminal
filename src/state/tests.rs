@@ -1854,6 +1854,11 @@ fn test_classify_fixtures() {
             Some(BlockedReason::QuotaExceeded),
         ),
         (
+            "claude_fable5_quota.txt",
+            &Backend::ClaudeCode,
+            Some(BlockedReason::QuotaExceeded),
+        ),
+        (
             "kiro_throttle.txt",
             &Backend::KiroCli,
             Some(BlockedReason::RateLimit {
@@ -2754,6 +2759,10 @@ fn usage_limit_fixture_triggers_usage_limit_per_backend() {
             "tests/fixtures/state-replay/claude-session-limit.raw",
         ),
         (
+            Backend::ClaudeCode,
+            "tests/backend_error_fixtures/claude_fable5_quota.txt",
+        ),
+        (
             Backend::OpenCode,
             "tests/fixtures/state-replay/opencode-usage-limit-typical.raw",
         ),
@@ -2773,6 +2782,25 @@ fn usage_limit_fixture_triggers_usage_limit_per_backend() {
             "{backend:?} fixture {path} must trigger UsageLimit"
         );
     }
+}
+
+/// The captured Fable 5 quota wall must be recognized only with the real
+/// Claude box-draw banner chrome; a bare quoted sentence is not a live wall.
+#[test]
+fn claude_fable5_plain_quoted_limit_is_not_usage_limit() {
+    let mut t = tracker_at(&Backend::ClaudeCode, AgentState::Idle, 0);
+    let prose = "⏺ reviewing the incident\nYou've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model.";
+    t.feed(prose);
+    assert_ne!(
+        t.get_state(),
+        AgentState::UsageLimit,
+        "a bare quoted Fable 5 sentence must not latch UsageLimit"
+    );
+    assert_eq!(
+        super::classify_pty_output(&Backend::ClaudeCode, prose),
+        None,
+        "a bare quoted Fable 5 sentence must not produce QuotaExceeded"
+    );
 }
 
 /// **CRITICAL**: discussion prose containing rate_limit / rate-limit /
