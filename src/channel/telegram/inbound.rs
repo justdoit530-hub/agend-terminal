@@ -670,10 +670,22 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             terminal: None,
         };
         crate::inbox::storage::ensure_msg_id(&mut msg_obj);
+        let inbound_msg_id = msg_obj.id.clone();
+        let from_sender = msg_obj.from.clone();
         persist_or_log!(
             inbox::enqueue(&home, &instance_name, msg_obj),
             "telegram_dispatch",
             instance_name
+        );
+        crate::reply_ledger::arm(
+            &home,
+            &instance_name,
+            crate::channel::ChannelKind::Telegram,
+            inbound_msg_id,
+            Some(reply_chat_id),
+            None,
+            Some(&from_sender),
+            Some(text),
         );
         inbox::notify_agent_with_attachments(
             &home,
