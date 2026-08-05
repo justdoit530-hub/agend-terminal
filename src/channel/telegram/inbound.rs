@@ -685,7 +685,7 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
             Some(reply_chat_id),
             None,
             Some(&from_sender),
-            Some(text),
+            Some(&text),
         );
         inbox::notify_agent_with_attachments(
             &home,
