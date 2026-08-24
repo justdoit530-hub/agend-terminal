@@ -182,6 +182,20 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         crate::channel::AgentOutboundOp::Reply { text, buttons },
     ) {
         Ok(msg) => {
+            // #3174: a generic (non-targeted) reply also settles the
+            // currently-armed turn's persistent row(s) — read BEFORE
+            // `record_reply_outcome` takes `pending_user_turn`, otherwise a
+            // late inbox drain would still see the row as unread even
+            // though it was just answered.
+            if message_id.is_none() {
+                if let Some(turn) =
+                    crate::daemon::heartbeat_pair::snapshot_for(instance_name).pending_user_turn
+                {
+                    for id in &turn.group_msg_ids {
+                        crate::inbox::storage::settle_read_by_id(home, instance_name, id);
+                    }
+                }
+            }
             // #1665: reply delivered — closes the user-turn (no warn at sweep).
             crate::reply_ledger::record_reply_outcome(instance_name, true);
             // #2622 PR-3 Fork C: a targeted reply also settles the persistent
