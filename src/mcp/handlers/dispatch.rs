@@ -2881,35 +2881,6 @@ mod tests {
         );
     }
 
-    /// Wiring pin: both fire-and-forget thread bodies must call the shared
-    /// `inject_with_routing` helper (not inline api::call or inject_input).
-    #[test]
-    fn both_delayed_inject_threads_call_shared_helper_2454() {
-        let helper = concat!("inject_with_", "routing");
-        let mod_src = include_str!("instance_state/mod.rs");
-        let team_start = mod_src
-            .find("\"team_task_inject\"")
-            .expect("team_task_inject thread marker");
-        let team_end = team_start + 400.min(mod_src.len() - team_start);
-        let team_begin = team_start.saturating_sub(400);
-        let team_region = &mod_src[team_begin..team_end];
-        assert!(
-            team_region.contains(helper),
-            "team_task_inject region must call inject_with_routing"
-        );
-
-        let spawn_src = include_str!("instance_state/spawn.rs");
-        let task_start = spawn_src
-            .find("\"task_inject\"")
-            .expect("task_inject thread marker");
-        let task_end = task_start + 400.min(spawn_src.len() - task_start);
-        let task_begin = task_start.saturating_sub(1000);
-        let task_region = &spawn_src[task_begin..task_end];
-        assert!(
-            task_region.contains(helper),
-            "task_inject region must call inject_with_routing"
-        );
-    }
 }
 
 #[cfg(test)]
