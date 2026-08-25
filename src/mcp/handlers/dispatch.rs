@@ -2880,7 +2880,6 @@ mod tests {
              (untyped boundary — wrapping old logic behind a same-named helper): {signature}"
         );
     }
-
 }
 
 #[cfg(test)]
