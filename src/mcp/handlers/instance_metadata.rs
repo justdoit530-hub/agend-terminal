@@ -136,20 +136,19 @@ pub(super) fn handle_move_pane(
         "target_tab": args["target_tab"],
         "split_dir": args["split_dir"],
     });
-    if let Some(rt) = runtime {
-        let ctx = crate::mcp::handlers::runtime_bridge::api_ctx(home, rt);
-        return crate::api::handlers::instance::handle_move_pane(&params, &ctx);
+    let Some(rt) = runtime else {
+        return json!({"error": "move_pane: runtime unavailable"});
+    };
+    let ctx = crate::mcp::handlers::runtime_bridge::api_ctx(home, rt);
+    let resp = crate::api::handlers::instance::handle_move_pane(&params, &ctx);
+    if resp["ok"].as_bool() == Some(true) {
+        return json!({
+            "ok": true,
+            "instance": instance,
+            "target_tab": args["target_tab"],
+        });
     }
-    match crate::api::call(
-        home,
-        &json!({"method": crate::api::method::MOVE_PANE, "params": params}),
-    ) {
-        Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-            json!({"ok": true, "instance": instance, "target_tab": args["target_tab"]})
-        }
-        Ok(resp) => json!({"error": resp["error"].as_str().unwrap_or("move_pane failed")}),
-        Err(e) => json!({"error": format!("move_pane: {e}")}),
-    }
+    resp
 }
 
 pub(super) fn handle_pane_snapshot(

@@ -98,11 +98,15 @@ pub(super) fn handle_create_team(
     crate::teams::create(home, args)
 }
 
-pub(super) fn handle_delete_team(home: &Path, args: &Value) -> Value {
+pub(super) fn handle_delete_team(
+    home: &Path,
+    args: &Value,
+    _runtime: Option<&RuntimeContext>,
+) -> Value {
     crate::teams::delete(home, args)
 }
 
-pub(super) fn handle_list_teams(home: &Path) -> Value {
+pub(super) fn handle_list_teams(home: &Path, _runtime: Option<&RuntimeContext>) -> Value {
     crate::teams::list(home)
 }
 

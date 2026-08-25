@@ -535,14 +535,19 @@ fn handle_done(
             )
         });
     }
-    if !force {
-        if let Err(reason) = super::assignee_completion_guard(home, &id, &caller, &record) {
-            return serde_json::json!({
-                "error": reason,
-                "code": "assignee_completion_blocked",
-            });
+    let completion_receipt = if force {
+        None
+    } else {
+        match super::assignee_completion_guard(home, &id, &caller, &record) {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                return serde_json::json!({
+                    "error": reason,
+                    "code": "assignee_completion_blocked",
+                })
+            }
         }
-    }
+    };
     // #1265: transition enforcement for done action.
     if !record
         .status
@@ -603,7 +608,7 @@ fn handle_done(
     // replay's `apply_done` does NOT re-guard transitions — so this precondition
     // is the authoritative gate (mirrors `handle_claim`'s `append_checked`).
     let done_id = id.clone();
-    match crate::task_events::append_checked_at(&board, &emitter, event, |state| {
+    let append_result = crate::task_events::append_checked_at(&board, &emitter, event, |state| {
         let tv = state
             .tasks
             .values()
@@ -620,58 +625,81 @@ fn handle_done(
             ));
         }
         Ok(())
-    }) {
-        Ok(Ok(_)) => {
-            // #789: task-completion is a workflow boundary —
-            // clean any empty `init` commits the backend has
-            // accumulated in the agent's bound worktree since
-            // the last cleanup at `dispatch_auto_bind_lease`.
-            // Best-effort: failure is logged inside the helper
-            // but never blocks the done response (the task
-            // event already appended successfully — cleanup is
-            // a polish step, not load-bearing).
-            let owner = record
-                .owner
-                .as_ref()
-                .map(|o| o.0.clone())
-                .unwrap_or_else(|| caller.clone());
-            if let Some(binding) = crate::binding::read(home, &owner) {
-                if let Some(wt) = binding["worktree"].as_str().map(std::path::PathBuf::from) {
-                    let _ = crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt).ok();
+    });
+    match append_result {
+        Err(route_err) => serde_json::json!({
+            "error": format!("task '{id}' route revalidation failed: {route_err}"),
+            "code": "task_route_unresolved",
+        }),
+        Ok(inner) => match inner {
+            Ok(_) => {
+                super::settle_completion_receipt(home, &id, completion_receipt.as_ref());
+                // #789: task-completion is a workflow boundary —
+                // clean any empty `init` commits the backend has
+                // accumulated in the agent's bound worktree since
+                // the last cleanup at `dispatch_auto_bind_lease`.
+                // Best-effort: failure is logged inside the helper
+                // but never blocks the done response (the task
+                // event already appended successfully — cleanup is
+                // a polish step, not load-bearing).
+                let owner = record
+                    .owner
+                    .as_ref()
+                    .map(|o| o.0.clone())
+                    .unwrap_or_else(|| caller.clone());
+                if let Some(binding) = crate::binding::read(home, &owner) {
+                    // P0 cross-lease identity guard: only touch the owner's
+                    // worktree / enqueue release when the binding's task_id
+                    // matches the completed task. A stale task_done for an OLD
+                    // task must never clean or release the owner's CURRENT WIP.
+                    let binding_task = binding["task_id"].as_str().unwrap_or("");
+                    if binding_task != id {
+                        tracing::debug!(
+                            owner = %owner, completed_task = %id,
+                            binding_task = %binding_task,
+                            "task_done: binding.task_id != completed task — skipping cleanup/release"
+                        );
+                    } else {
+                        if let Some(wt) = binding["worktree"].as_str().map(std::path::PathBuf::from)
+                        {
+                            let _ =
+                                crate::mcp::handlers::dispatch_hook::clean_empty_init_commits(&wt)
+                                    .ok();
+                        }
+                        // t-worktree-leak (PR-1): task-done is one of the 3 release
+                        // events. Enqueue a release-invariant recompute — if the
+                        // branch has no open PR and all its tasks are done, the
+                        // sweeper releases the worktree (covers tasks that never
+                        // produce a PR: RCA / design / spike). An open PR holds the
+                        // release until it terminates. (repo="" → sweeper derives it.)
+                        if let Some(branch) = binding["branch"].as_str() {
+                            crate::daemon::auto_release::enqueue_release_recompute(
+                                home,
+                                "",
+                                branch,
+                                "task_done",
+                            );
+                        }
+                    }
                 }
-                // t-worktree-leak (PR-1): task-done is one of the 3 release
-                // events. Enqueue a release-invariant recompute — if the
-                // branch has no open PR and all its tasks are done, the
-                // sweeper releases the worktree (covers tasks that never
-                // produce a PR: RCA / design / spike). An open PR holds the
-                // release until it terminates. (repo="" → sweeper derives it.)
-                if let Some(branch) = binding["branch"].as_str() {
-                    crate::daemon::auto_release::enqueue_release_recompute(
-                        home,
-                        "",
-                        branch,
-                        "task_done",
-                    );
-                }
+                // #1018 (B): eager cleanup of pending dispatch
+                // sidecars whose correlation_id matches this
+                // closed task. Prevents the watchdog from firing
+                // `dispatch_idle_threshold_exceeded` later for
+                // work the task board already confirmed done.
+                let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
+                // #807 Item 1: see create arm note.
+                let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
+                serde_json::json!({
+                    "id": id,
+                    "event": "done",
+                    "task": task,
+                    // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
+                    "status": "done",
+                })
             }
-            // #1018 (B): eager cleanup of pending dispatch
-            // sidecars whose correlation_id matches this
-            // closed task. Prevents the watchdog from firing
-            // `dispatch_idle_threshold_exceeded` later for
-            // work the task board already confirmed done.
-            let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, &id);
-            // #807 Item 1: see create arm note.
-            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
-            serde_json::json!({
-                "id": id,
-                "event": "done",
-                "task": task,
-                // #807 deprecated alias kept for back-compat — see task.status for lifecycle.
-                "status": "done",
-            })
-        }
-        Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
-        Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
+            Err(reason) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
+        },
     }
 }
 
@@ -1075,27 +1103,6 @@ fn handle_update(
 }
 
 fn handle_sweep(home: &Path, args: &Value) -> Value {
-    // #806 manual board-hygiene sweep — distinct from the
-    // daemon-ticked `task_sweep` (which auto-Dones tasks via
-    // `Closes t-XXX-N` PR markers). This action is operator-
-    // triggered, scans for 4 stale categories, returns a
-    // dry-run plan, then applies on a confirm round-trip.
-    let apply = args["apply"].as_bool().unwrap_or(false);
-    let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let audit_reason = args["audit_reason"].as_str().unwrap_or("");
-    // Repo resolution: explicit arg → SweepConfig fallback →
-    // None (shipped/superseded categories skipped without repo).
-    let repo_owned: Option<String> = args["repository"]
-        .as_str()
-        .map(String::from)
-        .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
     let live_instances: std::collections::HashSet<String> = crate::api::call(
         home,
         &serde_json::json!({"method": crate::api::method::LIST}),
@@ -1109,12 +1116,34 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
         })
     })
     .unwrap_or_default();
+    handle_sweep_internal(home, args, &live_instances)
+}
+
+fn handle_sweep_internal(
+    home: &Path,
+    args: &Value,
+    live_instances: &std::collections::HashSet<String>,
+) -> Value {
+    let apply = args["apply"].as_bool().unwrap_or(false);
+    let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let audit_reason = args["audit_reason"].as_str().unwrap_or("");
+    let repo_owned: Option<String> = args["repository"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
     let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
     let categories = super::sweep::scan_categories(
         home,
-        &live_instances,
+        live_instances,
         pr_lookup,
         issue_lookup,
         repo_owned.as_deref(),
@@ -1158,6 +1187,30 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
         }),
         Err(e) => serde_json::json!({"error": format!("sweep apply failed: {e}")}),
     }
+}
+
+pub(crate) fn handle_health_with_live(home: &Path, live: &[String]) -> Value {
+    let live_set: std::collections::HashSet<String> = live.iter().cloned().collect();
+    let fleet_instances: std::collections::HashSet<String> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|c| c.instances.keys().cloned().collect())
+            .unwrap_or_default();
+    let state = match super::board_router::replay_all_boards(home) {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task_events replay failed: {e}"),
+                "code": "replay_failed",
+            });
+        }
+    };
+    build_health_response(&state, Some(&live_set), &fleet_instances)
+}
+
+pub(crate) fn handle_sweep_with_live(home: &Path, args: &Value, live: &[String]) -> Value {
+    let live_instances: std::collections::HashSet<String> = live.iter().cloned().collect();
+    handle_sweep_internal(home, args, &live_instances)
 }
 
 fn handle_health(home: &Path) -> Value {
