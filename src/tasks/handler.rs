@@ -1103,27 +1103,6 @@ fn handle_update(
 }
 
 fn handle_sweep(home: &Path, args: &Value) -> Value {
-    // #806 manual board-hygiene sweep — distinct from the
-    // daemon-ticked `task_sweep` (which auto-Dones tasks via
-    // `Closes t-XXX-N` PR markers). This action is operator-
-    // triggered, scans for 4 stale categories, returns a
-    // dry-run plan, then applies on a confirm round-trip.
-    let apply = args["apply"].as_bool().unwrap_or(false);
-    let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let audit_reason = args["audit_reason"].as_str().unwrap_or("");
-    // Repo resolution: explicit arg → SweepConfig fallback →
-    // None (shipped/superseded categories skipped without repo).
-    let repo_owned: Option<String> = args["repository"]
-        .as_str()
-        .map(String::from)
-        .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
     let live_instances: std::collections::HashSet<String> = crate::api::call(
         home,
         &serde_json::json!({"method": crate::api::method::LIST}),
@@ -1137,12 +1116,34 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
         })
     })
     .unwrap_or_default();
+    handle_sweep_internal(home, args, &live_instances)
+}
+
+fn handle_sweep_internal(
+    home: &Path,
+    args: &Value,
+    live_instances: &std::collections::HashSet<String>,
+) -> Value {
+    let apply = args["apply"].as_bool().unwrap_or(false);
+    let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let audit_reason = args["audit_reason"].as_str().unwrap_or("");
+    let repo_owned: Option<String> = args["repository"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
     let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
     let categories = super::sweep::scan_categories(
         home,
-        &live_instances,
+        live_instances,
         pr_lookup,
         issue_lookup,
         repo_owned.as_deref(),
@@ -1186,6 +1187,30 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
         }),
         Err(e) => serde_json::json!({"error": format!("sweep apply failed: {e}")}),
     }
+}
+
+pub(crate) fn handle_health_with_live(home: &Path, live: &[String]) -> Value {
+    let live_set: std::collections::HashSet<String> = live.iter().cloned().collect();
+    let fleet_instances: std::collections::HashSet<String> =
+        crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|c| c.instances.keys().cloned().collect())
+            .unwrap_or_default();
+    let state = match super::board_router::replay_all_boards(home) {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("task_events replay failed: {e}"),
+                "code": "replay_failed",
+            });
+        }
+    };
+    build_health_response(&state, Some(&live_set), &fleet_instances)
+}
+
+pub(crate) fn handle_sweep_with_live(home: &Path, args: &Value, live: &[String]) -> Value {
+    let live_instances: std::collections::HashSet<String> = live.iter().cloned().collect();
+    handle_sweep_internal(home, args, &live_instances)
 }
 
 fn handle_health(home: &Path) -> Value {

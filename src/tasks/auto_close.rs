@@ -53,7 +53,7 @@ fn auto_close_on_report_with_mode(
     if !correlation_id.starts_with("t-") {
         return Ok(false);
     }
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let state = super::board_router::replay_all_boards(home).unwrap_or_default();
     let tid = crate::task_events::TaskId(correlation_id.to_string());
     let Some(record) = state.tasks.get(&tid) else {
         return Ok(false);
@@ -107,8 +107,9 @@ fn auto_close_on_report_with_mode(
     let emitter = crate::task_events::InstanceName::from("system:auto_close");
     // #1873: re-validate →Done UNDER the lock — a concurrent cancel between the
     // out-of-lock status check above and this append must not be flipped to Done.
+    let board = super::board_router::board_for_task(home, correlation_id);
     let closed =
-        crate::task_events::append_done_if_legal(home, &emitter, correlation_id, vec![event])?;
+        crate::task_events::append_done_if_legal_at(&board, &emitter, correlation_id, vec![event])?;
     if closed {
         let _ = crate::daemon::dispatch_idle::cleanup_pending_for_task_id(home, correlation_id);
         super::settle_completion_receipt(home, correlation_id, completion_receipt.as_ref());

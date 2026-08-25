@@ -2885,6 +2885,20 @@ fn task_done_cleans_post_lease_empty_init_commits() {
         &serde_json::json!({"action": "create", "title": "p789 anchor"}),
     );
     let id = created["id"].as_str().expect("task id");
+    std::fs::write(
+        runtime.join("binding.json"),
+        serde_json::to_string(&serde_json::json!({
+            "version": 1,
+            "agent": "dev",
+            "task_id": id,
+            "branch": "feat/p789",
+            "worktree": worktree.display().to_string(),
+            "source_repo": worktree.display().to_string(),
+            "issued_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     handle(
         &home,
         "dev",

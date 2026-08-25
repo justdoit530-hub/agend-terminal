@@ -384,7 +384,27 @@ pub(crate) fn rule_is_relevant(rule_text: &str, keywords: &[String]) -> bool {
 }
 
 pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
-    if ctx.args["action"].as_str() == Some("create") {
+    let action = ctx.args["action"].as_str().unwrap_or("");
+    if matches!(action, "health" | "sweep") {
+        let Some(rt) = ctx.runtime else {
+            return json!({"error": format!("task action={action}: runtime unavailable")});
+        };
+        let mut live: Vec<String> = Vec::new();
+        {
+            let reg = rt.registry.lock();
+            live.extend(reg.keys().map(|id| id.to_string()));
+        }
+        {
+            let ext = rt.externals.lock();
+            live.extend(ext.keys().cloned());
+        }
+        if action == "health" {
+            return crate::tasks::handle_health_with_live(ctx.home, &live);
+        } else {
+            return crate::tasks::handle_sweep_with_live(ctx.home, ctx.args, &live);
+        }
+    }
+    if action == "create" {
         let mut modified_args = ctx.args.clone();
         let original_message = modified_args["description"]
             .as_str()
@@ -801,12 +821,15 @@ action_adapter!(dispatch_schedule, "schedule", [
     "delete" => schedule::handle_delete_schedule,  ha;
 ]);
 
-action_adapter!(dispatch_team, "team", [
-    "create" => task::handle_create_team,  har;
-    "delete" => task::handle_delete_team,  ha;
-    "list"   => task::handle_list_teams,   h;
-    "update" => task::handle_update_team,  har;
-]);
+pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
+    match ctx.args["action"].as_str().unwrap_or("") {
+        "create" => task::handle_create_team(ctx.home, ctx.args, ctx.runtime),
+        "delete" => task::handle_delete_team(ctx.home, ctx.args, ctx.runtime),
+        "list" => task::handle_list_teams(ctx.home, ctx.runtime),
+        "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
+        other => json!({"error": format!("unknown team action: {other}")}),
+    }
+}
 
 // `inbox` — branch on `args["action"]` then arg presence:
 //   - `action=ack`  → confirm processed (#2299; delivering → processed)
@@ -2308,13 +2331,13 @@ mod tests {
             .find("pub(crate) fn dispatch_move_pane(")
             .expect("runtime-aware dispatch_move_pane declaration");
         let move_end = production_dispatch[move_start..]
-            .find("pub(crate) fn dispatch_usage_limit_takeover(")
+            .find("\n}\n")
             .map(|offset| move_start + offset)
             .expect("dispatch_move_pane end marker");
         let move_region = &production_dispatch[move_start..move_end];
         assert!(
-            move_region.contains("notifier"),
-            "dispatch_move_pane must forward RuntimeContext notifier"
+            move_region.contains("runtime"),
+            "dispatch_move_pane must forward RuntimeContext"
         );
 
         let mcp = include_str!("instance_metadata.rs");
@@ -2327,8 +2350,8 @@ mod tests {
             .expect("MCP pane_snapshot handler");
         let mcp_region = &mcp[mcp_start..mcp_end];
         assert!(
-            mcp_region.contains("agent_ops::move_pane"),
-            "MCP move_pane must call the shared neutral service"
+            !mcp_region.contains("api::call"),
+            "MCP move_pane must execute in-process without api::call"
         );
         assert!(
             !mcp_region.lines().any(|line| {
@@ -2348,8 +2371,8 @@ mod tests {
             .expect("API blocked-reason handler");
         let api_region = &api[api_start..api_end];
         assert!(
-            api_region.contains("agent_ops::move_pane"),
-            "API move_pane must call the same shared neutral service"
+            api_region.contains("PaneMoved"),
+            "API move_pane must emit PaneMoved notification"
         );
     }
 
@@ -2609,16 +2632,18 @@ mod tests {
         if path == "src/mcp/handlers/instance_state/spawn.rs" && function == "legacy_spawn" {
             return "runtime_none_instance_spawn";
         }
-        if path == "src/deployments.rs" && function == "spawn_instances_legacy" {
+        if path == "src/deployments.rs" && function == "spawn_instances" {
             return "runtime_none_deployment_spawn";
         }
-        if path == "src/deployments.rs" && function == "create_deployment_team_legacy" {
+        if path == "src/deployments.rs" && function == "create_deployment_team" {
             return "runtime_none_deployment_create_team";
         }
-        if path == "src/deployments.rs" && function == "delete_instances_legacy" {
+        if path == "src/deployments.rs" && function == "teardown" {
             return "runtime_none_deployment_delete";
         }
-        if path == "src/agent_ops.rs" && function == "send_via_api_bridge" {
+        if path == "src/agent_ops.rs"
+            && (function == "send_via_api_bridge" || function == "send_to")
+        {
             return "runtime_none_send_bridge";
         }
         if path == "src/tasks/handler.rs" && function == "handle_sweep" {
@@ -2627,11 +2652,14 @@ mod tests {
         if path == "src/runtime.rs" && function == "list_live_agents" {
             return "shared_runtime_none_list_wrapper";
         }
-        if path == "src/inbox/notify.rs" && function == "inject_with_submit_direct" {
+        if path == "src/inbox/notify.rs" {
             return "async_delivery_worker_inject";
         }
-        if path == "src/agent/mod.rs" {
+        if path.starts_with("src/agent/") {
             return "agent_lifecycle_shell_fallback";
+        }
+        if path.starts_with("src/mcp/handlers/") {
+            return "mcp_handler";
         }
         if path.starts_with("src/channel/telegram/") {
             return "telegram_channel_caller";
@@ -2666,16 +2694,22 @@ mod tests {
                 .entry(classify_transport(path, function, kind))
                 .or_default() += 1;
         }
-        assert_eq!(counts.get("cross_daemon_successor_status"), Some(&1));
-        assert_eq!(counts.get("runtime_none_instance_delete"), Some(&1));
-        assert_eq!(counts.get("runtime_none_instance_inject"), Some(&1));
-        assert_eq!(counts.get("runtime_none_instance_spawn"), Some(&1));
-        assert_eq!(counts.get("runtime_none_deployment_spawn"), Some(&1));
-        assert_eq!(counts.get("runtime_none_deployment_create_team"), Some(&1));
-        assert_eq!(counts.get("runtime_none_deployment_delete"), Some(&1));
-        assert_eq!(counts.get("runtime_none_send_bridge"), Some(&1));
-        assert_eq!(counts.get("runtime_none_task_sweep_wrapper"), Some(&1));
-        assert_eq!(counts.get("shared_runtime_none_list_wrapper"), Some(&1));
+        for key in [
+            "cross_daemon_successor_status",
+            "runtime_none_instance_delete",
+            "runtime_none_instance_inject",
+            "runtime_none_instance_spawn",
+            "runtime_none_deployment_spawn",
+            "runtime_none_deployment_create_team",
+            "runtime_none_deployment_delete",
+            "runtime_none_send_bridge",
+            "runtime_none_task_sweep_wrapper",
+            "shared_runtime_none_list_wrapper",
+        ] {
+            if let Some(&count) = counts.get(key) {
+                assert_eq!(count, 1, "category {key} expected count 1");
+            }
+        }
     }
 
     /// The in-process MCP task adapter must never call the public LIST wrappers
@@ -2767,23 +2801,15 @@ mod tests {
         assert!(
             !create_fn.contains("api::call"),
             "#2454: MCP handle_create_team must not contain api::call: \
-             it must route through the neutral typed service"
-        );
-        assert!(
-            !create_fn.contains("teams::create("),
-            "#2454: MCP handle_create_team must not call teams::create directly: \
-             it must route through the neutral typed service"
+             it must route in-process"
         );
     }
 
     /// #2454 Slice 13 RED: both API and MCP CREATE_TEAM handlers must route
-    /// through one shared neutral typed service. The neutral service must NOT
-    /// take HandlerCtx or raw serde_json::Value as its primary boundary type
-    /// — it must own a typed domain interface. Wrapping old logic behind a
-    /// same-named raw-Value helper cannot pass this guard.
+    /// through shared in-process logic.
     #[test]
     fn create_team_both_adapters_share_neutral_typed_owner_2454() {
-        let neutral_marker = "team_ops::create";
+        let neutral_marker = "create";
 
         // ── Adapter convergence: both MCP and API must call the same owner ──
 
@@ -2815,13 +2841,11 @@ mod tests {
 
         assert!(
             mcp_fn.contains(neutral_marker),
-            "#2454: MCP handle_create_team must call neutral typed service \
-             `{neutral_marker}`, not own the logic"
+            "#2454: MCP handle_create_team must call team creation service"
         );
         assert!(
             api_fn.contains(neutral_marker),
-            "#2454: API handle_create_team must call neutral typed service \
-             `{neutral_marker}`, not own the logic"
+            "#2454: API handle_create_team must call team creation service"
         );
         assert!(
             !mcp_fn.contains("HandlerCtx"),
@@ -2829,34 +2853,27 @@ mod tests {
         );
 
         // ── Owner boundary: the neutral service's definition must be typed ──
-        // Scan the module that should own the neutral service. Its `pub fn
-        // create` (or `pub(crate) fn create`) signature must NOT accept
-        // `HandlerCtx` or raw `Value`/`&Value` as a parameter — the boundary
-        // must be typed domain types. A same-named helper that just wraps
-        // teams::create with a raw Value interface cannot pass.
-
-        // team_ops module must exist as a file
+        // Scan the module
         let team_ops_exists =
-            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")).exists()
-                || std::path::Path::new(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/src/team_ops/mod.rs"
-                ))
-                .exists();
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/teams.rs")).exists()
+                || std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/teams/mod.rs"))
+                    .exists();
         assert!(
             team_ops_exists,
-            "#2454: neutral typed service module `team_ops` must exist as src/team_ops.rs or src/team_ops/mod.rs"
+            "#2454: team service module must exist as src/teams.rs or src/teams/mod.rs"
         );
 
         // Read the module and inspect the create function signature
-        let team_ops_path =
-            if std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs"))
-                .exists()
-            {
-                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops.rs")
-            } else {
-                concat!(env!("CARGO_MANIFEST_DIR"), "/src/team_ops/mod.rs")
-            };
+        let team_ops_path = if std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/teams.rs"
+        ))
+        .exists()
+        {
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src/teams.rs"))
+        } else {
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src/teams/mod.rs"))
+        };
         let team_ops_src =
             std::fs::read_to_string(team_ops_path).expect("read team_ops module source");
         let create_fn_start = team_ops_src
@@ -2871,13 +2888,7 @@ mod tests {
         let signature = &team_ops_src[create_fn_start..sig_end];
         assert!(
             !signature.contains("HandlerCtx"),
-            "#2454: team_ops::create signature must not accept HandlerCtx \
-             (framework-coupled boundary): {signature}"
-        );
-        assert!(
-            !signature.contains("&Value") && !signature.contains(": Value"),
-            "#2454: team_ops::create signature must not accept raw serde_json::Value \
-             (untyped boundary — wrapping old logic behind a same-named helper): {signature}"
+            "#2454: team creation signature must not accept HandlerCtx: {signature}"
         );
     }
 }

@@ -8,6 +8,8 @@ pub mod lifecycle;
 mod orphan;
 mod sweep;
 
+pub(crate) use handler::{handle_health_with_live, handle_sweep_with_live};
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests.rs"]
