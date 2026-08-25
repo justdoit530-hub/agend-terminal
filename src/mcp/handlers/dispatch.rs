@@ -2332,6 +2332,8 @@ mod tests {
             .expect("runtime-aware dispatch_move_pane declaration");
         let move_end = production_dispatch[move_start..]
             .find("\n}\n")
+            .or_else(|| production_dispatch[move_start..].find("\r\n}\r\n"))
+            .or_else(|| production_dispatch[move_start..].find("\n}\r\n"))
             .map(|offset| move_start + offset)
             .expect("dispatch_move_pane end marker");
         let move_region = &production_dispatch[move_start..move_end];
@@ -2788,6 +2790,7 @@ mod tests {
         let task_src = include_str!("task.rs");
         let test_boundary = task_src
             .rfind("#[cfg(test)]\nmod ")
+            .or_else(|| task_src.rfind("#[cfg(test)]\r\nmod "))
             .unwrap_or(task_src.len());
         let production = &task_src[..test_boundary];
         let create_fn_start = production
@@ -2795,6 +2798,8 @@ mod tests {
             .expect("MCP handle_create_team must exist");
         let create_fn_end = production[create_fn_start..]
             .find("\n}\n")
+            .or_else(|| production[create_fn_start..].find("\r\n}\r\n"))
+            .or_else(|| production[create_fn_start..].find("\n}\r\n"))
             .map(|o| create_fn_start + o)
             .unwrap_or(production.len());
         let create_fn = &production[create_fn_start..create_fn_end];
@@ -2814,13 +2819,18 @@ mod tests {
         // ── Adapter convergence: both MCP and API must call the same owner ──
 
         let mcp_src = include_str!("task.rs");
-        let mcp_boundary = mcp_src.rfind("#[cfg(test)]\nmod ").unwrap_or(mcp_src.len());
+        let mcp_boundary = mcp_src
+            .rfind("#[cfg(test)]\nmod ")
+            .or_else(|| mcp_src.rfind("#[cfg(test)]\r\nmod "))
+            .unwrap_or(mcp_src.len());
         let mcp_prod = &mcp_src[..mcp_boundary];
         let mcp_fn_start = mcp_prod
             .find("fn handle_create_team(")
             .expect("MCP handle_create_team");
         let mcp_fn_end = mcp_prod[mcp_fn_start..]
             .find("\n}\n")
+            .or_else(|| mcp_prod[mcp_fn_start..].find("\r\n}\r\n"))
+            .or_else(|| mcp_prod[mcp_fn_start..].find("\n}\r\n"))
             .map(|o| mcp_fn_start + o)
             .unwrap_or(mcp_prod.len());
         let mcp_fn = &mcp_prod[mcp_fn_start..mcp_fn_end];
@@ -2828,6 +2838,7 @@ mod tests {
         let api_src = include_str!("../../api/handlers/team.rs");
         let api_boundary = api_src
             .rfind("#[cfg(test)]\n#[allow")
+            .or_else(|| api_src.rfind("#[cfg(test)]\r\n#[allow"))
             .unwrap_or(api_src.len());
         let api_prod = &api_src[..api_boundary];
         let api_fn_start = api_prod
@@ -2835,6 +2846,8 @@ mod tests {
             .expect("API handle_create_team");
         let api_fn_end = api_prod[api_fn_start..]
             .find("\n}\n")
+            .or_else(|| api_prod[api_fn_start..].find("\r\n}\r\n"))
+            .or_else(|| api_prod[api_fn_start..].find("\n}\r\n"))
             .map(|o| api_fn_start + o)
             .unwrap_or(api_prod.len());
         let api_fn = &api_prod[api_fn_start..api_fn_end];
