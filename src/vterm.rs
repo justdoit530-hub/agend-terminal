@@ -11,6 +11,8 @@ use parking_lot::Mutex;
 use std::io::Write;
 use std::sync::Arc;
 
+mod cursor_anchor;
+
 /// Fallback cell for snapshot out-of-bounds (should never happen, but
 /// defense-in-depth against arithmetic bugs in snapshot indexing).
 static DEFAULT_CELL: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
@@ -20,7 +22,7 @@ static DEFAULT_CELL: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
 /// resize races where `self.cols` diverges from `grid.columns()`.
 ///
 /// Sprint 25 P0 HOTFIX: replaces all 5 raw `grid[Point::new(...)]` sites.
-fn safe_cell(grid: &alacritty_terminal::grid::Grid<Cell>, line: Line, col: usize) -> &Cell {
+pub(super) fn safe_cell(grid: &alacritty_terminal::grid::Grid<Cell>, line: Line, col: usize) -> &Cell {
     use alacritty_terminal::grid::Dimensions;
     if col < grid.columns() && line >= grid.topmost_line() && line <= grid.bottommost_line() {
         &grid[Point::new(line, Column(col))]

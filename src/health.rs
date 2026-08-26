@@ -213,6 +213,11 @@ pub enum BlockedReason {
     /// see `auto_clears_on` / `suppresses_hang_check`.
     ModelUnsupported,
     ContextHigh,
+    /// #3175: a LegacyPty typed injection left a draft whose delivery or submit
+    /// could not be confirmed. The per-process injection fence remains closed
+    /// until the agent handle is replaced; surface that fail-closed state instead
+    /// of silently dropping every later nudge behind the same fence.
+    TypedInjectContaminated,
 }
 
 /// #1638: which recovery signal a [`BlockedReason`] is being tested against.
@@ -242,6 +247,7 @@ impl BlockedReason {
             "crash" => Some(Self::Crash),
             "model_unsupported" => Some(Self::ModelUnsupported),
             "context_high" => Some(Self::ContextHigh),
+            "typed_inject_contaminated" => Some(Self::TypedInjectContaminated),
             _ => None,
         }
     }
@@ -256,6 +262,7 @@ impl BlockedReason {
             Self::Crash => "crash",
             Self::ModelUnsupported => "model_unsupported",
             Self::ContextHigh => "context_high",
+            Self::TypedInjectContaminated => "typed_inject_contaminated",
         }
     }
 
@@ -294,7 +301,8 @@ impl BlockedReason {
             | Self::Hang
             | Self::Crash
             | Self::ModelUnsupported
-            | Self::ContextHigh => false,
+            | Self::ContextHigh
+            | Self::TypedInjectContaminated => false,
         }
     }
 
@@ -316,7 +324,8 @@ impl BlockedReason {
             Self::RateLimit { .. }
             | Self::QuotaExceeded
             | Self::AwaitingOperator
-            | Self::ModelUnsupported => true,
+            | Self::ModelUnsupported
+            | Self::TypedInjectContaminated => true,
             Self::PermissionPrompt | Self::Hang | Self::Crash | Self::ContextHigh => false,
         }
     }
@@ -1937,6 +1946,7 @@ mod tests {
             BlockedReason::PermissionPrompt,
             BlockedReason::Crash,
             BlockedReason::ModelUnsupported,
+            BlockedReason::TypedInjectContaminated,
         ];
         for reason in cases {
             let json = serde_json::to_string(&reason).expect("serialize");
@@ -2416,6 +2426,7 @@ mod tests {
             // (true) combination — manual-clear-only like Crash, but suppresses
             // hang-check like RateLimit (stuck-but-not-hung).
             (ModelUnsupported, false, false, true),
+            (TypedInjectContaminated, false, false, true),
         ];
         for (reason, on_rl, on_op, suppress) in table {
             assert_eq!(

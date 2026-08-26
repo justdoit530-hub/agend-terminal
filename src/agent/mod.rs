@@ -29,6 +29,11 @@ pub mod deleting;
 #[cfg(unix)]
 mod write_actor;
 
+mod typed_inject;
+#[cfg(test)]
+use typed_inject::{inject_sentinel, observe_post_submit_with, readback_confirm_typed_with};
+use typed_inject::{observe_post_submit, readback_confirm_typed};
+
 pub use env_isolation::{env_isolation_enabled, is_sensitive_env_key, resolve_child_env};
 pub(crate) use env_isolation::{env_key_in, warn_env_isolation_disabled_once};
 
@@ -96,6 +101,10 @@ pub struct AgentHandle {
     pub(crate) submit_key: String,
     pub(crate) inject_prefix: String,
     pub(crate) typed_inject: bool,
+    /// Sticky per-process fence set after an unconfirmed typed write. A later
+    /// payload must not append to and submit the stranded draft; replacing the
+    /// agent handle creates a fresh fence.
+    pub(crate) typed_inject_contaminated: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) spawned_at: std::time::Instant,
     pub(crate) spawned_at_epoch_ms: u64,
     /// The `SpawnMode` this handle's process was spawned with (#t-777-3). Stamped
@@ -1232,6 +1241,7 @@ pub fn spawn_agent(
                     .as_ref()
                     .map(|b| b.preset().typed_inject)
                     .unwrap_or(false),
+                typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 spawned_at: std::time::Instant::now(),
                 spawned_at_epoch_ms: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2782,42 +2792,79 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
+    if target.typed_inject
+        && target
+            .typed_inject_contaminated
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        latch_typed_inject_contamination(target);
+        return Err(crate::error::AgendError::PtyWrite(std::io::Error::other(
+            "typed inject blocked after a prior unconfirmed draft",
+        )));
+    }
     let prefix = target.inject_prefix.as_bytes();
     let submit = target.submit_key.as_bytes();
 
     // S54 fix: strip ANSI sequences before injection to avoid ESC conflict in typed_inject.
     let text_str = String::from_utf8_lossy(text);
-    let stripped = strip_ansi(&text_str);
+    let stripped_owned = strip_ansi(&text_str);
+    // #3175: the cursor anchor must observe exactly the same logical tail that was
+    // written. Trailing whitespace has no notification semantics, but retaining it
+    // would put the cursor after bytes that inject_sentinel intentionally trims.
+    let stripped = if target.typed_inject {
+        stripped_owned.trim_end()
+    } else {
+        stripped_owned.as_str()
+    };
     let text_bytes = stripped.as_bytes();
 
     if target.typed_inject {
-        let all_bytes: Vec<u8> = prefix.iter().chain(text_bytes.iter()).copied().collect();
+        let write_payload = || -> crate::error::Result<()> {
+            let all_bytes: Vec<u8> = prefix.iter().chain(text_bytes.iter()).copied().collect();
 
-        // Issue #658: system headers must be written atomically.
-        let is_system_header = stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX)
-            || stripped.starts_with(crate::inbox::AGENT_MSG_PREFIX);
-        let (atomic_part, chunk_part) = if is_system_header {
-            match all_bytes.iter().position(|&b| b == b'\n') {
-                Some(pos) => all_bytes.split_at(pos + 1),
-                None => (all_bytes.as_slice(), &[] as &[u8]),
+            // Issue #658: system headers must be written atomically.
+            let is_system_header = stripped.starts_with(crate::inbox::SYSTEM_MSG_PREFIX)
+                || stripped.starts_with(crate::inbox::AGENT_MSG_PREFIX);
+            let (atomic_part, chunk_part) = if is_system_header {
+                match all_bytes.iter().position(|&b| b == b'\n') {
+                    Some(pos) => all_bytes.split_at(pos + 1),
+                    None => (all_bytes.as_slice(), &[] as &[u8]),
+                }
+            } else {
+                (&[] as &[u8], all_bytes.as_slice())
+            };
+
+            if !atomic_part.is_empty() {
+                write_with_timeout(&target.pty_writer, atomic_part)?;
+                std::thread::sleep(std::time::Duration::from_millis(
+                    2 * atomic_part.len() as u64,
+                ));
             }
-        } else {
-            (&[] as &[u8], all_bytes.as_slice())
+
+            for chunk in chunk_part.chunks(64) {
+                if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(());
+                }
+                write_with_timeout(&target.pty_writer, chunk)?;
+                std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
+            }
+            Ok(())
         };
 
-        if !atomic_part.is_empty() {
-            write_with_timeout(&target.pty_writer, atomic_part)?;
-            std::thread::sleep(std::time::Duration::from_millis(
-                2 * atomic_part.len() as u64,
-            ));
+        if let Err(error) = write_payload() {
+            latch_typed_inject_contamination(target);
+            return Err(error);
         }
-
-        for chunk in chunk_part.chunks(64) {
-            if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
-                return Ok(());
-            }
-            write_with_timeout(&target.pty_writer, chunk)?;
-            std::thread::sleep(std::time::Duration::from_millis(2 * chunk.len() as u64));
+        if !readback_confirm_typed(target, stripped) {
+            latch_typed_inject_contamination(target);
+            tracing::warn!(
+                tag = "#3175-readback-fail-closed",
+                "typed inject was not cursor-confirmed; leaving draft unsubmitted"
+            );
+            return Err(crate::error::AgendError::PtyWrite(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "typed inject was not cursor-confirmed; draft left unsubmitted",
+            )));
         }
     } else {
         let mut combined = Vec::with_capacity(prefix.len() + text_bytes.len());
@@ -2829,20 +2876,16 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    // #1912: gate the pre-submit wait on the backend's input-widget style.
-    if target.typed_inject {
-        // Readback-confirm (#1912): poll the RENDERED input area until the typed
-        // line's tail-sentinel appears, THEN submit. Replaces the fixed-sleep
-        // "guess" that racing codex's re-rendering `›` widget required (every codex
-        // version re-tuned the magic number). FAIL-OPEN: on timeout we submit
-        // anyway (the helper warns) — this is the agent-wake lifeline, so an
-        // unconfirmed readback must never become "don't submit" (= agent never wakes).
-        let _confirmed = readback_confirm_typed(target, &stripped);
-    } else {
+    if !target.typed_inject {
         // claude `❯` bulk fast path — tolerates bulk bytes + `\r`; keep byte-identical.
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    write_with_timeout(&target.pty_writer, submit)?;
+    if let Err(error) = write_with_timeout(&target.pty_writer, submit) {
+        if target.typed_inject {
+            latch_typed_inject_contamination(target);
+        }
+        return Err(error.into());
+    }
     // #1912: post-submit observability (log/metric-only, NEVER retries — a second
     // `\r` would risk double-submit). Typed-inject only; bulk's fast path stays lean.
     if target.typed_inject {
@@ -2851,115 +2894,17 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     Ok(())
 }
 
-/// #1912: tail-sentinel of a (possibly multi-line) injected payload — the last
-/// run of up to `MAX` chars on the final non-empty line, the line the submit `\r`
-/// commits. Short + drawn from the bottom line so it stays robust to input-box
-/// wrapping. Empty when the payload has no non-blank line (nothing to confirm).
-fn inject_sentinel(stripped: &str) -> String {
-    const MAX: usize = 24;
-    let last_line = stripped
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    let take_from = last_line
-        .char_indices()
-        .rev()
-        .take(MAX)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    last_line[take_from..].to_string()
-}
-
-const READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(15);
-const POSTSUBMIT_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
-/// Bottom rows scanned for the input area — the prompt + a few wrapped input rows.
-const READBACK_TAIL_ROWS: usize = 8;
-
-/// #1912: poll the rendered input area until the typed line's tail-sentinel
-/// renders, then return `true`. Returns `false` (FAIL-OPEN: caller submits anyway,
-/// this warns) if unconfirmed within the timeout. Acquires the core lock only
-/// briefly per poll (read `tail_lines`, drop) so the `pty_read_loop` renders the
-/// backend's echo of the typed chars between polls.
-fn readback_confirm_typed(target: &InjectTarget, stripped: &str) -> bool {
-    readback_confirm_typed_with(target, stripped, READBACK_TIMEOUT, READBACK_POLL)
-}
-
-fn readback_confirm_typed_with(
-    target: &InjectTarget,
-    stripped: &str,
-    timeout: std::time::Duration,
-    poll: std::time::Duration,
-) -> bool {
-    let sentinel = inject_sentinel(stripped);
-    if sentinel.is_empty() {
-        return true; // nothing to confirm (empty/whitespace payload)
-    }
-    let start = std::time::Instant::now();
-    let mut polls = 0u32;
-    loop {
-        if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        let visible = target.core.lock().vterm.tail_lines(READBACK_TAIL_ROWS);
-        if visible.contains(&sentinel) {
-            tracing::debug!(
-                tag = "#1912-readback-confirmed",
-                polls,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "typed inject line rendered in input area before submit"
-            );
-            return true;
-        }
-        if start.elapsed() >= timeout {
-            tracing::warn!(
-                tag = "#1912-readback-timeout",
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                sentinel_len = sentinel.len(),
-                "typed inject line not confirmed in input area within timeout — submitting anyway (fail-open)"
-            );
-            return false;
-        }
-        std::thread::sleep(poll);
-        polls += 1;
-    }
-}
-
-/// #1912: post-submit observability (no retry). A successful submit clears the
-/// input line / grows the transcript, so the rendered tail CHANGES; returns `true`
-/// the moment it does. If it stays byte-identical for `POSTSUBMIT_WINDOW`, the
-/// submit likely didn't take — warn (log/metric only) and return `false`. NEVER
-/// retries the submit: a second `\r` would risk double-submit.
-fn observe_post_submit(target: &InjectTarget) -> bool {
-    observe_post_submit_with(target, POSTSUBMIT_WINDOW, READBACK_POLL)
-}
-
-fn observe_post_submit_with(
-    target: &InjectTarget,
-    window: std::time::Duration,
-    poll: std::time::Duration,
-) -> bool {
-    let before = target.core.lock().vterm.tail_lines(READBACK_TAIL_ROWS);
-    let start = std::time::Instant::now();
-    loop {
-        if target.deleted.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
-        }
-        std::thread::sleep(poll);
-        if target.core.lock().vterm.tail_lines(READBACK_TAIL_ROWS) != before {
-            return true;
-        }
-        if start.elapsed() >= window {
-            tracing::warn!(
-                tag = "#1912-postsubmit-nochange",
-                "input area unchanged after submit — a readback-confirmed line may not have submitted"
-            );
-            return false;
-        }
-    }
+fn latch_typed_inject_contamination(target: &InjectTarget) {
+    target
+        .typed_inject_contaminated
+        .store(true, std::sync::atomic::Ordering::Release);
+    let mut core = target.core.lock();
+    core.health
+        .set_blocked_reason(crate::health::BlockedReason::TypedInjectContaminated);
+    core.health.set_blocked_note(Some(
+        "Typed injection is fenced after an unconfirmed draft; restart this agent process to clear the composer and fence."
+            .to_string(),
+    ));
 }
 
 /// #1146: lightweight clone of the fields `inject_to_agent` reads from
@@ -2973,6 +2918,7 @@ pub(crate) struct InjectTarget {
     pub inject_prefix: String,
     pub submit_key: String,
     pub typed_inject: bool,
+    pub typed_inject_contaminated: Arc<std::sync::atomic::AtomicBool>,
     pub deleted: Arc<std::sync::atomic::AtomicBool>,
     /// #1912: the agent's core, so the typed-inject readback-confirm can poll the
     /// RENDERED input line (`core.vterm.tail_lines`) before sending the submit key —
@@ -2989,6 +2935,7 @@ impl InjectTarget {
             inject_prefix: h.inject_prefix.clone(),
             submit_key: h.submit_key.clone(),
             typed_inject: h.typed_inject,
+            typed_inject_contaminated: Arc::clone(&h.typed_inject_contaminated),
             deleted: Arc::clone(&h.deleted),
             core: Arc::clone(&h.core),
         }
@@ -3008,6 +2955,7 @@ impl InjectTarget {
             inject_prefix: preset.inject_prefix.to_string(),
             submit_key: preset.submit_key.to_string(),
             typed_inject: preset.typed_inject,
+            typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             core: Arc::clone(&h.core),
         }
@@ -3137,6 +3085,7 @@ pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentH
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
