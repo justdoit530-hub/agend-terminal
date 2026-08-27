@@ -43,7 +43,6 @@ const GRANDFATHERED: &[(&str, usize)] = &[
     ("src/state/mod.rs", 2695),
     ("src/app/mod.rs", 2587),
     ("src/worktree.rs", 2578),
-    ("src/health.rs", 2510),
 ];
 
 /// True for files allowed to be large because they are test code, not
