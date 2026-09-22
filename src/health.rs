@@ -1154,6 +1154,52 @@ impl HealthTracker {
         self.error_events.clear();
         self.current_reason = None;
     }
+
+    /// Clear per-episode recovery/escalation bookkeeping after a **successful
+    /// restart** of the underlying agent process (crash respawn or an
+    /// operator-initiated manual restart of a `Paused` agent).
+    ///
+    /// The bug this fixes: `crash_respawn.rs`'s `saved_health` path clones the
+    /// PRE-crash `HealthTracker` wholesale onto the new (successfully
+    /// respawned) session. That clone carries `recovery_stage_state` /
+    /// `hung_since` / `failed_escalated` / `last_stage{1,2,3}_fired_at`
+    /// forward unchanged — state describing an in-flight Hung/escalation
+    /// episode against the PROCESS INSTANCE that no longer exists. Left
+    /// stale (e.g. `Stage3Pending` from just before the crash), the brand-new
+    /// session can be immediately misjudged as `Stage3Eligible` before it has
+    /// had a chance to prove itself healthy. `full_reset()` reverses exactly
+    /// the writes [`Self::enter_paused`] makes (`state`, `recovery_stage_state`,
+    /// `last_stage3_fired_at`), plus the sibling Stage 1/2 timestamps and the
+    /// Hung/failed-escalation latches, so a freshly-restarted process always
+    /// starts this bookkeeping clean.
+    ///
+    /// Deliberately does **NOT** touch:
+    /// - `crash_times` / `total_crashes` — the crash-loop backoff/notify-gate
+    ///   history that callers explicitly carry across a respawn (that's the
+    ///   entire purpose of `crash_respawn.rs`'s `saved_health`); `reset()`
+    ///   above is the call for wiping those on an operator-confirmed
+    ///   "start clean" restart.
+    /// - `recovery_restart_count` — the Stage 2 cumulative-restart cap
+    ///   counter, intentionally preserved across every restart it counts
+    ///   (mirrors the "NOT reset" invariant already documented on
+    ///   [`Self::enter_paused`]) so the operator-intervention cap survives
+    ///   the very restarts it is counting.
+    /// - `last_crash_notification` / `last_hung_notification` — per-class
+    ///   notify cooldowns, preserved by both `crash_respawn.rs` and the
+    ///   Stage 2 restart arm specifically to avoid a duplicate page
+    ///   immediately after a respawn.
+    pub fn full_reset(&mut self) {
+        self.state = HealthState::Healthy;
+        self.error_events.clear();
+        self.current_reason = None;
+        self.current_note = None;
+        self.hung_since = None;
+        self.failed_escalated = false;
+        self.recovery_stage_state = RecoveryStageState::None;
+        self.last_stage1_fired_at = None;
+        self.last_stage2_fired_at = None;
+        self.last_stage3_fired_at = None;
+    }
 }
 
 #[cfg(test)]
