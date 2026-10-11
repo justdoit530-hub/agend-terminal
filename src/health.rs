@@ -620,14 +620,22 @@ impl HealthTracker {
     /// Lighter-weight than [`Self::full_reset`]: it only flips `state` back
     /// to `Healthy` when there is a live handle and the current state is
     /// `Recovering` or `Absent` — `Unstable` is left alone until the crash
-    /// window clears. It does not touch any recovery/escalation bookkeeping
-    /// (`recovery_stage_state`, `hung_since`, `failed_escalated`, the
-    /// `last_stage*_fired_at` timestamps, or the Stage 2 cap/notify-cooldown
-    /// counters), so calling it on its own cannot clear a stale
-    /// `Stage3Eligible` episode. The crash-respawn path calls `full_reset()`
-    /// first (which does clear those fields) and `respawn_ok()` second —
-    /// by the time `respawn_ok()` runs there, `state` is already `Healthy`
-    /// and its `Unstable`-preserving branch is a no-op on that path.
+    /// window clears. It does not touch any other recovery/escalation
+    /// bookkeeping, so calling it alone cannot clear a stale
+    /// `Stage3Eligible` episode: not the episode fields `full_reset()`
+    /// clears (`recovery_stage_state`, `hung_since`, `failed_escalated`,
+    /// the `last_stage*_fired_at` timestamps), and not the fields
+    /// `full_reset()` deliberately preserves (the Stage 2 cap counter
+    /// `recovery_restart_count`, or the crash/hung notify-cooldown
+    /// timestamps).
+    ///
+    /// On the crash-respawn path, `full_reset()` is only called when
+    /// `saved_health` carried forward across the respawn (i.e. is `Some`);
+    /// in that branch it runs before `respawn_ok()`, so by the time
+    /// `respawn_ok()` executes `state` is already `Healthy` and its
+    /// `Unstable`-preserving branch is a no-op there. When `saved_health`
+    /// is `None`, the freshly constructed tracker already starts out
+    /// `Healthy`, so `respawn_ok()` is a no-op for an unrelated reason.
     pub fn respawn_ok(&mut self, has_live_handle: bool) {
         if has_live_handle
             && (self.state == HealthState::Recovering || self.state == HealthState::Absent)
