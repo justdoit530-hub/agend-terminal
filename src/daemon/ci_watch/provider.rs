@@ -288,6 +288,12 @@ impl MergeableState {
 /// Each method corresponds to one provider-specific HTTP call.
 /// Return types are provider-neutral — all schema parsing happens
 /// inside the impl, not in the ci_watch state machine.
+///
+/// clippy 1.99 `double_must_use`: `async_trait` stamps a messageless
+/// `#[must_use]` onto every async method, and the boxed future it returns
+/// is already `#[must_use]`. The attribute belongs to the macro, not this
+/// trait. Silencing the lint here does not change the API.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait CiProvider: Send + Sync {
     /// Poll workflow/pipeline runs for `repo@branch`.
