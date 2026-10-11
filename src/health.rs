@@ -616,6 +616,18 @@ impl HealthTracker {
     }
 
     /// Mark successful respawn.
+    ///
+    /// Lighter-weight than [`Self::full_reset`]: it only flips `state` back
+    /// to `Healthy` when there is a live handle and the current state is
+    /// `Recovering` or `Absent` — `Unstable` is left alone until the crash
+    /// window clears. It does not touch any recovery/escalation bookkeeping
+    /// (`recovery_stage_state`, `hung_since`, `failed_escalated`, the
+    /// `last_stage*_fired_at` timestamps, or the Stage 2 cap/notify-cooldown
+    /// counters), so calling it on its own cannot clear a stale
+    /// `Stage3Eligible` episode. The crash-respawn path calls `full_reset()`
+    /// first (which does clear those fields) and `respawn_ok()` second —
+    /// by the time `respawn_ok()` runs there, `state` is already `Healthy`
+    /// and its `Unstable`-preserving branch is a no-op on that path.
     pub fn respawn_ok(&mut self, has_live_handle: bool) {
         if has_live_handle
             && (self.state == HealthState::Recovering || self.state == HealthState::Absent)
