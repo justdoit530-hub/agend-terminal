@@ -342,6 +342,16 @@ fn respawn_agent_worker(
                     let mut core = handle.core.lock();
                     if let Some(ref old_health) = saved_health {
                         core.health = old_health.clone();
+                        // #685/health-full-reset: `old_health` is the PRE-crash
+                        // tracker, cloned wholesale to preserve the crash-loop
+                        // history (crash_times/total_crashes/notify cooldowns).
+                        // But that clone also carries forward mid-episode
+                        // recovery/escalation bookkeeping (recovery_stage_state,
+                        // hung_since, failed_escalated, last_stage*_fired_at)
+                        // against the process instance that just crashed — stale
+                        // state that could misjudge this brand-new session as
+                        // Stage3Eligible before it proves itself. Clear it.
+                        core.health.full_reset();
                     }
                     core.health.respawn_ok(is_alive);
                 }

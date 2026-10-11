@@ -1361,3 +1361,101 @@ fn test_check_hang_suppressed_by_recent_mcp_activity() {
     );
     assert_eq!(h.state, HealthState::Hung, "state must transition to Hung");
 }
+
+/// #685/health-full-reset: `full_reset()` reverses exactly the writes
+/// `enter_paused` made — a `Paused` agent that gets manually restarted must
+/// come back with `recovery_stage_state == None`, not a stale
+/// `Stage3Pending` that would immediately misjudge the fresh session as
+/// needing escalation again.
+#[test]
+fn full_reset_clears_paused_agent_recovery_state() {
+    let mut h = HealthTracker::new();
+    let paused_at = ago(60);
+    h.enter_paused(paused_at);
+    assert_eq!(h.state, HealthState::Paused);
+    assert!(matches!(
+        h.recovery_stage_state,
+        RecoveryStageState::Stage3Pending { .. }
+    ));
+    assert!(h.last_stage3_fired_at.is_some());
+
+    h.full_reset();
+
+    assert_eq!(
+        h.state,
+        HealthState::Healthy,
+        "manual restart must bring a Paused agent back Healthy"
+    );
+    assert_eq!(
+        h.recovery_stage_state,
+        RecoveryStageState::None,
+        "recovery_stage_state must be None after a manual restart clears Stage 3"
+    );
+    assert!(
+        h.last_stage3_fired_at.is_none(),
+        "last_stage3_fired_at must be cleared"
+    );
+}
+
+/// #685/health-full-reset: the crash_respawn.rs bug this fixes — cloning
+/// `saved_health` wholesale onto a freshly-respawned session carries forward
+/// stale Hung/escalation bookkeeping from the process that just crashed.
+/// `full_reset()` must clear all of it while leaving the crash-loop and
+/// Stage-2-cap counters (which callers intentionally preserve across a
+/// respawn) untouched.
+#[test]
+fn full_reset_clears_stale_hung_and_escalation_state_but_preserves_crash_counters() {
+    let mut h = HealthTracker::new();
+    h.state = HealthState::Hung;
+    h.hung_since = Some(ago(30));
+    h.failed_escalated = true;
+    h.recovery_stage_state = RecoveryStageState::Stage2Pending {
+        entered_at: ago(15),
+    };
+    h.last_stage1_fired_at = Some(ago(20));
+    h.last_stage2_fired_at = Some(ago(10));
+    h.current_reason = Some(BlockedReason::RateLimit {
+        retry_after_secs: None,
+    });
+    h.current_note = Some("stale note".to_string());
+
+    // Fields a respawn is meant to CARRY FORWARD — must survive full_reset().
+    h.total_crashes = 3;
+    h.crash_times.push_back(ago(5));
+    h.recovery_restart_count = 2;
+    h.last_crash_notification = Some(ago(5));
+    h.last_hung_notification = Some(ago(5));
+
+    h.full_reset();
+
+    assert_eq!(h.state, HealthState::Healthy);
+    assert!(h.hung_since.is_none());
+    assert!(!h.failed_escalated);
+    assert_eq!(h.recovery_stage_state, RecoveryStageState::None);
+    assert!(h.last_stage1_fired_at.is_none());
+    assert!(h.last_stage2_fired_at.is_none());
+    assert!(h.current_reason.is_none());
+    assert!(h.current_note.is_none());
+
+    assert_eq!(
+        h.total_crashes, 3,
+        "crash-loop history must survive full_reset()"
+    );
+    assert_eq!(
+        h.crash_times.len(),
+        1,
+        "crash_times must survive full_reset()"
+    );
+    assert_eq!(
+        h.recovery_restart_count, 2,
+        "Stage 2 cap counter must survive full_reset()"
+    );
+    assert!(
+        h.last_crash_notification.is_some(),
+        "crash notify cooldown must survive full_reset()"
+    );
+    assert!(
+        h.last_hung_notification.is_some(),
+        "hung notify cooldown must survive full_reset()"
+    );
+}
