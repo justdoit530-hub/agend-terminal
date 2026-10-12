@@ -358,12 +358,36 @@ fn terse_task_value(v: &mut Value) {
 /// SAME axis as the owner-ACL `can_mutate_record` — bypasses it on the paths that
 /// carry it. Single-project → caller project == task board project (both DEFAULT)
 /// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
-fn cross_board_denied(home: &Path, caller: &str, id: &str, force: bool) -> Option<Value> {
+///
+/// Ported from upstream agend-terminal #3511/#3516 (re-implemented against our
+/// current structure rather than cherry-picked — upstream's diff depends on a
+/// later `routed`/`append_at` refactor we don't have): `owner` is the row's
+/// assignee, when the caller site has one to offer and the action is eligible for
+/// the exception. A row created on board A and assigned to an agent acting on
+/// board B was closable by NOBODY: the assignee cleared `can_mutate_record` but
+/// was stopped here, while everyone on board A cleared this gate but was stopped
+/// by `can_mutate_record`. Acting on a row that NAMES you as owner is not
+/// reaching into another board's work; it is collecting your own tail.
+///
+/// The exception is gated on `super::acl::caller_project_resolvable` so it can
+/// only override a genuine cross-board MISMATCH, never a hard fleet.yaml read
+/// failure (#2133's fail-closed state) — in that case nothing about the caller's
+/// authority is knowable, so the exception must not apply.
+fn cross_board_denied(
+    home: &Path,
+    caller: &str,
+    id: &str,
+    force: bool,
+    owner: Option<&str>,
+) -> Option<Value> {
     if force {
         return None;
     }
     let board_project = super::board_router::resolve_task_project(home, id);
     if super::acl::can_mutate_on_board(home, caller, &board_project) {
+        return None;
+    }
+    if owner == Some(caller) && super::acl::caller_project_resolvable(home, caller) {
         return None;
     }
     Some(serde_json::json!({
@@ -391,7 +415,10 @@ fn handle_claim(
     // #2117 P3a: board-isolation gate — a caller may only claim tasks on its own
     // project's board (claim has no `force`/owner-ACL — an open task is claimable
     // by anyone, but only within the board). Single-project → allow.
-    if let Some(deny) = cross_board_denied(home, &iname, &id, false) {
+    // #3511: claim is the one gated action with no owner-ACL behind it, so the
+    // board boundary is its only authority — an exception here would remove the
+    // gate rather than defer it. Settlement needs no prior claim.
+    if let Some(deny) = cross_board_denied(home, &iname, &id, false, None) {
         return deny;
     }
     // #t-21: validate + append in ONE critical section to close the
@@ -524,7 +551,15 @@ fn handle_done(
         });
     }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+    // #3511: a row's own assignee settles it across boards; the owner-ACL
+    // below is still the authority on WHO may do it.
+    if let Some(deny) = cross_board_denied(
+        home,
+        &caller,
+        &id,
+        force,
+        record.owner.as_ref().map(|o| o.0.as_str()),
+    ) {
         return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
@@ -811,7 +846,17 @@ fn handle_update(
         });
     }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, force) {
+    // #3511: cancellation rides `update` (there is no separate `cancel`), so the
+    // exception is offered ONLY for a pure cancellation via
+    // acl::update_settlement_owner — every other update mutation stays
+    // board-isolated.
+    if let Some(deny) = cross_board_denied(
+        home,
+        &caller,
+        &id,
+        force,
+        super::acl::update_settlement_owner(&record, args),
+    ) {
         return deny;
     }
     if !force && !can_mutate_record(home, &caller, &record) {
@@ -1276,7 +1321,10 @@ fn handle_metadata_set(
     };
     // #2117 P3a: board-isolation gate (no force on metadata_set — mirror its
     // unconditional owner-ACL below).
-    if let Some(deny) = cross_board_denied(home, instance_name, id, false) {
+    // #3511 passes `None`: metadata is not settlement — the deadlock being fixed
+    // is a row nobody can CLOSE, and arbitrary metadata writes are more than that
+    // needs.
+    if let Some(deny) = cross_board_denied(home, instance_name, id, false, None) {
         return deny;
     }
     if !can_mutate_record(home, instance_name, &record) {
