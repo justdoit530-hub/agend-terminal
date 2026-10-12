@@ -154,6 +154,51 @@ pub(crate) fn can_mutate_on_board(home: &Path, caller: &str, board_project: &str
     }
 }
 
+/// #3511 — can the caller's OWN project be resolved at all? The owner exception
+/// in `handler::cross_board_denied` must never fire while the fleet is
+/// unreadable. `can_mutate_on_board` collapses two different states into
+/// `false`: "resolved, and it is a different board" (a real cross-board
+/// mismatch, which the exception is allowed to override) and "could not
+/// resolve — hard fleet.yaml read failure" (#2117 P3a / #2133's fail-closed
+/// state, where nothing about the caller's authority is known). Letting an
+/// exception through the second one would smuggle a mutation past a deliberate
+/// hardening, so it is gated on a clean resolve. Mirrors `can_mutate_on_board`'s
+/// resolver so the two can never disagree about what "unresolvable" means.
+pub(super) fn caller_project_resolvable(home: &Path, caller: &str) -> bool {
+    super::board_router::resolve_current_project_checked(home, caller).is_ok()
+}
+
+/// #3511 — which `update` requests may use the cross-board owner exception at
+/// all. `update` is the GENERAL mutation verb: `priority`, `assignee`,
+/// `description`, `tags` and `result` all ride the same call as `status`.
+/// Handing the exception unconditionally would turn "close your own tail" into
+/// general write authority over a row on someone else's board — a third party
+/// assignee could reach in and rewrite priority/description on a row they do
+/// not own the board for. So the exception is operation-aware: it is offered
+/// only for a pure terminal cancellation, expressed as an allow-list of the
+/// keys such a request may carry. Any extra key — even alongside a genuine
+/// `status=cancelled` — puts the whole call back behind board isolation.
+///
+/// `done` needs no equivalent: it is terminal by construction and carries no
+/// other mutable fields.
+pub(super) fn update_settlement_owner<'a>(
+    record: &'a crate::task_events::TaskRecord,
+    args: &serde_json::Value,
+) -> Option<&'a str> {
+    const PURE_CANCELLATION_KEYS: &[&str] = &["action", "id", "task_id", "status", "project"];
+    if args["status"].as_str() != Some("cancelled") {
+        return None;
+    }
+    let only_settlement_keys = args.as_object().is_some_and(|obj| {
+        obj.keys()
+            .all(|k| PURE_CANCELLATION_KEYS.contains(&k.as_str()))
+    });
+    if !only_settlement_keys {
+        return None;
+    }
+    record.owner.as_ref().map(|o| o.0.as_str())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

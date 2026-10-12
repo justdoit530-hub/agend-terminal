@@ -1805,6 +1805,161 @@ fn fleet_read_failure_denies_mutation_fail_closed_2117_p3a() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3511 — RED→GREEN: a row created on board A and assigned to an agent acting
+/// on board B was closable by NOBODY. The assignee (devB) clears the ownership
+/// ACL but was stopped by board isolation; everyone standing on board A clears
+/// board isolation but is stopped by the ownership ACL. `done` must let the
+/// row's own assignee settle it across the boundary.
+#[test]
+fn owner_settles_own_cross_board_row_3511() {
+    let home = tmp_home("p3a-owner-settles-3511");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+"#,
+    )
+    .unwrap();
+
+    // devA creates a row on ITS OWN board (orgA_projA), assigned to devB (teamB).
+    let ta = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "A", "assignee": "devB"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // devB (the row's own assignee, acting on the OTHER board) can `done` it.
+    let ok = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": ta, "result": "settled"}),
+    );
+    assert_eq!(
+        ok["event"], "done",
+        "a row's own assignee must settle it across boards: {ok}"
+    );
+
+    // The pure-cancellation exception on `update` works the same way.
+    let tb = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "B", "assignee": "devB"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ok = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": tb, "status": "cancelled"}),
+    );
+    assert_eq!(
+        ok["event"], "updated",
+        "a row's own assignee must cancel it across boards via update: {ok}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3511 negative control: the exception is EXACT-owner only. A third party who
+/// is neither the row's assignee nor acting on its board stays denied — for a
+/// row owned by someone else, and for an unassigned row (no owner ⇒ nothing to
+/// except ⇒ work can never be pulled across a boundary by a bystander).
+#[test]
+fn cross_board_third_party_still_denied_3511() {
+    let home = tmp_home("p3a-third-party-3511");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+  devC:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+  teamC:
+    members:
+      - devC
+    source_repo: /repos/orgC/projC
+"#,
+    )
+    .unwrap();
+
+    // Row on board A, owned by devB (not devC). devC is a bystander on a third
+    // board — not the owner, not acting on board A.
+    let owned = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "owned", "assignee": "devB"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let denied = handle(
+        &home,
+        "devC",
+        &serde_json::json!({"action": "done", "id": owned}),
+    );
+    assert!(
+        denied["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cross-board mutation denied"),
+        "a non-owner third party must stay denied: {denied}"
+    );
+
+    // Unassigned row on board A — no owner, so no exception can ever fire; devC
+    // stays denied too.
+    let unassigned = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "unassigned"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let denied = handle(
+        &home,
+        "devC",
+        &serde_json::json!({"action": "done", "id": unassigned}),
+    );
+    assert!(
+        denied["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cross-board mutation denied"),
+        "a bystander on an unassigned cross-board row must stay denied: {denied}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_unknown_instance_rejected() {
     let home = tmp_home("claim-unknown");
