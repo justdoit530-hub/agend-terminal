@@ -1,23 +1,272 @@
 use crate::agent_ops;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::time::Duration;
+use std::sync::{mpsc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-/// #1457: the old fixed compose-idle window. The notification-delivery guards
-/// no longer use it (replaced by the input-vs-submit `DraftState`); it now only
-/// backs `Pane::is_composing`, a test-only helper — hence `#[cfg(test)]`.
-#[cfg(test)]
-pub const COMPOSE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const COMPOSE_METADATA_KEY: &str = "last_input_epoch_ms";
 /// Sprint 54 P2-3: epoch-ms timestamp of the most recent submit-key
 /// keystroke (e.g. `\r` for claude). Distinct from
 /// `COMPOSE_METADATA_KEY` which records ANY input keystroke. Used by
 /// the daemon supervisor to detect "typed but not submitted" state.
 const SUBMIT_METADATA_KEY: &str = "last_submit_epoch_ms";
+/// Trailing coalesce window for keystroke metadata. The deadline is fixed
+/// at the first key of a burst (later keys update the timestamp but do not
+/// push it out) so continuous typing still lands at least once per window.
+/// 250ms is the short end of the 250ms–1s budget: long enough to collapse a
+/// burst into one fsync, short enough that the 1.5s typing-quiet window and
+/// the daemon's idle/stuck readers stay within their existing slack.
+const INPUT_ACTIVITY_DEBOUNCE: Duration = Duration::from_millis(250);
+
+type ActivityKey = (PathBuf, String);
+
+struct PendingSlot {
+    typed_ms: i64,
+    due: Instant,
+}
+
+enum WriterMsg {
+    Note {
+        home: PathBuf,
+        agent: String,
+        typed_ms: i64,
+        due: Instant,
+    },
+    /// Test barrier. Production never sends it; the arm stays so test and
+    /// release share one writer loop.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Flush(mpsc::Sender<()>),
+}
+
+/// Same-process view of the newest keystroke time. Published on the calling
+/// thread BEFORE the debounced disk write, so draft gating
+/// (`read_input_submit_timestamps`) does not wait for fsync. Never moves
+/// backwards. Cross-process readers (daemon supervisor) still see the file,
+/// which lands within one debounce window.
+static TYPED_CACHE: LazyLock<Mutex<HashMap<ActivityKey, i64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WRITER_TX: OnceLock<Option<mpsc::Sender<WriterMsg>>> = OnceLock::new();
+
+fn cache_lock() -> std::sync::MutexGuard<'static, HashMap<ActivityKey, i64>> {
+    TYPED_CACHE.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn remember_typed(home: &Path, agent: &str, typed_ms: i64) {
+    let mut guard = cache_lock();
+    let entry = guard
+        .entry((home.to_path_buf(), agent.to_string()))
+        .or_insert(i64::MIN);
+    if typed_ms > *entry {
+        *entry = typed_ms;
+    }
+}
+
+fn cached_typed_ms(home: &Path, agent: &str) -> Option<i64> {
+    let guard = cache_lock();
+    guard
+        .get(&(home.to_path_buf(), agent.to_string()))
+        .copied()
+        .filter(|ts| *ts != i64::MIN)
+}
+
+fn writer_tx() -> Option<&'static mpsc::Sender<WriterMsg>> {
+    WRITER_TX
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            // fire-and-forget: process-lifetime debounced activity writer.
+            // Exits when every sender drops at process teardown; the TUI
+            // event loop does not join it.
+            match std::thread::Builder::new()
+                .name("input-activity-writer".into())
+                .spawn(move || input_activity_writer_loop(rx))
+            {
+                Ok(_handle) => Some(tx),
+                Err(err) => {
+                    tracing::error!(%err, "failed to spawn input-activity writer");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn enqueue_note(
+    pending: &mut HashMap<ActivityKey, PendingSlot>,
+    last_written: &HashMap<ActivityKey, i64>,
+    home: PathBuf,
+    agent: String,
+    typed_ms: i64,
+    due: Instant,
+) {
+    let key = (home, agent);
+    if last_written.get(&key).is_some_and(|prev| typed_ms < *prev) {
+        return;
+    }
+    match pending.get_mut(&key) {
+        Some(slot) => {
+            if typed_ms >= slot.typed_ms {
+                slot.typed_ms = typed_ms;
+            }
+        }
+        None => {
+            pending.insert(key, PendingSlot { typed_ms, due });
+        }
+    }
+}
+
+fn persist_slots(batch: Vec<(ActivityKey, i64)>, last_written: &mut HashMap<ActivityKey, i64>) {
+    for (key, typed_ms) in batch {
+        if last_written.get(&key).is_some_and(|prev| typed_ms < *prev) {
+            continue;
+        }
+        agent_ops::save_metadata(&key.0, &key.1, COMPOSE_METADATA_KEY, json!(typed_ms));
+        last_written.insert(key, typed_ms);
+    }
+}
+
+fn persist_due(
+    pending: &mut HashMap<ActivityKey, PendingSlot>,
+    last_written: &mut HashMap<ActivityKey, i64>,
+) {
+    let now = Instant::now();
+    let due_keys: Vec<ActivityKey> = pending
+        .iter()
+        .filter(|(_, slot)| slot.due <= now)
+        .map(|(key, _)| key.clone())
+        .collect();
+    let batch = due_keys
+        .into_iter()
+        .filter_map(|key| pending.remove(&key).map(|slot| (key, slot.typed_ms)))
+        .collect();
+    persist_slots(batch, last_written);
+}
+
+fn persist_all(
+    pending: &mut HashMap<ActivityKey, PendingSlot>,
+    last_written: &mut HashMap<ActivityKey, i64>,
+) {
+    let batch = pending
+        .drain()
+        .map(|(key, slot)| (key, slot.typed_ms))
+        .collect();
+    persist_slots(batch, last_written);
+}
+
+fn next_debounce_wait(pending: &HashMap<ActivityKey, PendingSlot>) -> Option<Duration> {
+    let now = Instant::now();
+    pending
+        .values()
+        .map(|slot| slot.due.saturating_duration_since(now))
+        .min()
+}
+
+fn input_activity_writer_loop(rx: mpsc::Receiver<WriterMsg>) {
+    let mut pending: HashMap<ActivityKey, PendingSlot> = HashMap::new();
+    let mut last_written: HashMap<ActivityKey, i64> = HashMap::new();
+    loop {
+        let msg = if let Some(wait) = next_debounce_wait(&pending) {
+            match rx.recv_timeout(wait) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    persist_due(&mut pending, &mut last_written);
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    persist_all(&mut pending, &mut last_written);
+                    break;
+                }
+            }
+        } else {
+            match rx.recv() {
+                Ok(msg) => msg,
+                Err(_) => {
+                    persist_all(&mut pending, &mut last_written);
+                    break;
+                }
+            }
+        };
+        match msg {
+            WriterMsg::Note {
+                home,
+                agent,
+                typed_ms,
+                due,
+            } => enqueue_note(&mut pending, &last_written, home, agent, typed_ms, due),
+            WriterMsg::Flush(ack) => {
+                persist_all(&mut pending, &mut last_written);
+                let _ = ack.send(());
+            }
+        }
+    }
+}
+
+fn schedule_input_activity(home: &Path, agent: &str, typed_ms: i64, due: Instant) {
+    remember_typed(home, agent, typed_ms);
+    let note = WriterMsg::Note {
+        home: home.to_path_buf(),
+        agent: agent.to_string(),
+        typed_ms,
+        due,
+    };
+    match writer_tx() {
+        Some(tx) => {
+            let _ = tx.send(note);
+        }
+        None => {
+            agent_ops::save_metadata(home, agent, COMPOSE_METADATA_KEY, json!(typed_ms));
+        }
+    }
+}
+
+#[cfg(test)]
+static TEST_FLUSH_GATE: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn test_flush_gate() -> std::sync::MutexGuard<'static, ()> {
+    TEST_FLUSH_GATE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn schedule_input_activity_for_test(home: &Path, agent: &str, typed_ms: i64) {
+    schedule_input_activity(
+        home,
+        agent,
+        typed_ms,
+        Instant::now() + Duration::from_secs(3600),
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn flush_pending_input_activity_locked() {
+    let (ack_tx, ack_rx) = mpsc::channel();
+    if let Some(tx) = writer_tx() {
+        let _ = tx.send(WriterMsg::Flush(ack_tx));
+        let _ = ack_rx.recv_timeout(Duration::from_secs(5));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn flush_pending_input_activity() {
+    let _gate = test_flush_gate();
+    flush_pending_input_activity_locked();
+}
+
+#[cfg(test)]
+pub(crate) fn forget_cached_input_activity(home: &Path, agent: &str) {
+    cache_lock().remove(&(home.to_path_buf(), agent.to_string()));
+}
+
+/// #1457: the old fixed compose-idle window. The notification-delivery guards
+/// no longer use it (replaced by the input-vs-submit `DraftState`); it now only
+/// backs `Pane::is_composing`, a test-only helper — hence `#[cfg(test)]`.
+#[cfg(test)]
+pub const COMPOSE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedNotification {
@@ -49,12 +298,17 @@ fn draining_path(home: &Path, agent_name: &str) -> PathBuf {
     queue_path(home, agent_name).with_extension("draining")
 }
 
+/// Record a composing keystroke. The timestamp is the keystroke's own
+/// clock time (not the later flush time). The calling thread only updates
+/// an in-memory cache and enqueues a coalesced write; it does not fsync.
+/// Disk persistence is one write per [`INPUT_ACTIVITY_DEBOUNCE`] burst,
+/// carrying the newest timestamp in that burst, and never an older one.
 pub fn record_input_activity(home: &Path, agent_name: &str) {
-    agent_ops::save_metadata(
+    schedule_input_activity(
         home,
         agent_name,
-        COMPOSE_METADATA_KEY,
-        json!(chrono::Utc::now().timestamp_millis()),
+        chrono::Utc::now().timestamp_millis(),
+        Instant::now() + INPUT_ACTIVITY_DEBOUNCE,
     );
 }
 
@@ -78,7 +332,8 @@ pub fn record_submit_activity(home: &Path, agent_name: &str) {
 /// (legacy data, agent never typed, or non-submit-detected backend).
 /// Used by the daemon supervisor tick for typed-but-not-submitted
 /// detection — keeps the read inline-cheap (single file read, single
-/// JSON parse) so per-tick overhead stays bounded.
+/// JSON parse) so per-tick overhead stays bounded. Same-process callers
+/// also see a keystroke that is still waiting on the debounced disk flush.
 pub fn read_input_submit_timestamps(home: &Path, agent_name: &str) -> (i64, i64) {
     // #1680: resolve via the SAME path resolver the write side uses
     // (`save_metadata` → `metadata_path_resolved`). The previous hand-coded
@@ -86,14 +341,24 @@ pub fn read_input_submit_timestamps(home: &Path, agent_name: &str) -> (i64, i64)
     // landed on `metadata/<uuid>.json`, so `draft_state` was permanently stale
     // (`None`) and the inject path force-submitted the operator's unsent draft.
     let meta_path = agent_ops::metadata_path_resolved(home, agent_name);
-    let Ok(content) = std::fs::read_to_string(meta_path) else {
-        return (0, 0);
+    let (disk_typed, submit_ms) = match std::fs::read_to_string(meta_path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(value) => (
+                value[COMPOSE_METADATA_KEY].as_i64().unwrap_or(0),
+                value[SUBMIT_METADATA_KEY].as_i64().unwrap_or(0),
+            ),
+            Err(_) => (0, 0),
+        },
+        Err(_) => (0, 0),
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return (0, 0);
+    // Same-process overlay: the debounced disk write has not landed yet, but
+    // this process already observed the keystroke. Take the newer of the two
+    // so a slow flush cannot hide a live draft, and a stale cache cannot
+    // rewind a newer file written by another path.
+    let typed_ms = match cached_typed_ms(home, agent_name) {
+        Some(cached) if cached > disk_typed => cached,
+        _ => disk_typed,
     };
-    let typed_ms = value[COMPOSE_METADATA_KEY].as_i64().unwrap_or(0);
-    let submit_ms = value[SUBMIT_METADATA_KEY].as_i64().unwrap_or(0);
     (typed_ms, submit_ms)
 }
 
@@ -1397,6 +1662,10 @@ mod tests {
 
         // WRITE a compose keystroke (no submit) → `<uuid>.json` via the resolver.
         record_input_activity(&home, "fixup-x");
+        // The hot path defers the fsync. This pin is about the on-disk path,
+        // so flush and drop the same-process cache before reading.
+        flush_pending_input_activity();
+        forget_cached_input_activity(&home, "fixup-x");
 
         // READ must see it through the SAME resolver. Pre-fix this reads the
         // never-written `<name>.json` and returns 0 → assert fails (RED).
@@ -1432,6 +1701,80 @@ mod tests {
             submit, 0,
             "submit must stay 0 until record_submit_activity is called"
         );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// A burst collapses to one disk write of the newest keystroke time.
+    /// An older timestamp that arrives later must not rewind the file.
+    #[test]
+    fn debounced_write_keeps_newest_keystroke_time() {
+        let home = tmp_home("debounce_newest");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        // Hold the flush gate so a sibling test's barrier cannot persist
+        // this key before we observe that the debounce has not landed.
+        let _gate = test_flush_gate();
+        let oldest = 1_700_000_000_000;
+        let middle = oldest + 40;
+        let newest = oldest + 80;
+        schedule_input_activity_for_test(&home, "agent1", oldest);
+        schedule_input_activity_for_test(&home, "agent1", newest);
+        schedule_input_activity_for_test(&home, "agent1", middle);
+
+        let (cached, _) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(
+            cached, newest,
+            "same-process read sees the newest key before flush"
+        );
+
+        forget_cached_input_activity(&home, "agent1");
+        let (before_flush, _) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(
+            before_flush, 0,
+            "disk must still be untouched while the debounce window is open"
+        );
+
+        flush_pending_input_activity_locked();
+        forget_cached_input_activity(&home, "agent1");
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(
+            typed, newest,
+            "flush persists the newest keystroke, not flush-time"
+        );
+        assert_eq!(submit, 0);
+
+        schedule_input_activity_for_test(&home, "agent1", oldest);
+        flush_pending_input_activity_locked();
+        forget_cached_input_activity(&home, "agent1");
+        let (after_stale, _) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(
+            after_stale, newest,
+            "a late older timestamp must not rewind disk"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// The keystroke caller returns without waiting out a metadata fsync.
+    #[test]
+    fn record_input_activity_returns_without_disk_round_trip() {
+        let home = tmp_home("debounce_hot");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        let started = std::time::Instant::now();
+        for _ in 0..80 {
+            record_input_activity(&home, "agent1");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "80 keystrokes took {elapsed:?}; a per-key fsync would dominate"
+        );
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            typed > 0,
+            "overlay publishes the keystroke before disk flush"
+        );
+        assert_eq!(submit, 0);
         std::fs::remove_dir_all(home).ok();
     }
 
