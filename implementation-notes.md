@@ -80,3 +80,27 @@ from clearing the screen. It does not change the inbox redraw path, because
 that path never called `terminal.clear()`. If the photographed ghosts continue
 after inbox bursts, the next place to look is a spurious `Event::Resize` on
 the crossterm reader, which clears inline and is outside this task.
+
+# Event::Resize dimension dedup
+
+## `last_resize_dims` initial value
+
+`AppState::new()` sets the field to `crossterm::terminal::size().unwrap_or((0, 0))`.
+
+The primary seed is the terminal size at startup, not a hardcoded `(0, 0)`. On Unix, crossterm turns `SIGWINCH` into `Event::Resize`. A tmux/screen pane change, or dragging a window edge, delivers events whose size did not change. A `(0, 0)` seed would treat the first of those as a change and still `resize_panes` + `terminal.clear()`. Seeding the live size skips that first duplicate.
+
+`(0, 0)` is only the fallback when `crossterm::terminal::size()` fails (no TTY, ioctl error). It is not a usable terminal size, so the first real `Resize` still counts as a change and the #1140 clear still runs. That path does not drop the first real resize.
+
+## Why the first real resize is not skipped
+
+The arm compares `(cols, rows) != last_resize_dims`.
+
+- Ioctl succeeded at startup and the size later changed: the event differs from the seed, so the arm runs `resize_panes` and `terminal.clear()`, then stores the new size. The #1140 wide-char ghost clear stays.
+- Ioctl succeeded and the event size matches: the whole arm is skipped, including `resize_panes`.
+- Ioctl failed and the seed is `(0, 0)`: the first non-zero event differs, so it still clears.
+
+`apply_pending_resize` (`needs_resize`) is unchanged. It clears from its own `crossterm::terminal::size()` read at the top of the loop. If that read differs from the seed, a later `Event::Resize` of the new size still clears, because it does not match the seed. That is an extra clear, not a missed real resize.
+
+## Out of scope
+
+No debounce or coalescing timer. A drag that changes the size on every event still clears each time. This change only drops events whose size is the same as the last one applied.
