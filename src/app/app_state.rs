@@ -548,6 +548,7 @@ impl AppState {
         } = *deps;
         self.dirty = true;
         if let Ok(event) = ev {
+            let changes_layout = tui_events::tui_event_changes_layout(&event);
             if let TuiEvent::ScreenshotRequest(tx) = event {
                 let svg = {
                     let size = terminal.size().unwrap_or_default();
@@ -582,7 +583,9 @@ impl AppState {
             } else {
                 tui_events::handle_tui_event(event, &mut self.ui.layout, registry, wakeup_tx);
             }
-            self.needs_resize = true;
+            if changes_layout {
+                self.needs_resize = true;
+            }
         }
     }
 

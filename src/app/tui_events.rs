@@ -130,6 +130,24 @@ impl crate::api::ApiNotifier for TuiNotifier {
     }
 }
 
+/// Whether `event` changes pane geometry.
+///
+/// `true` means the caller must set `needs_resize` so the next frame runs
+/// `resize_panes` and `terminal.clear()` (#1140 wide-char ghost clear).
+/// `false` means a throttled `dirty` redraw is enough — clearing the whole
+/// terminal would flash the screen for an event that did not move a pane.
+///
+/// Inbox and badge updates are not `TuiEvent`s. They update pane fields in
+/// `sync_notification_state` and wake the loop through the pane forwarder,
+/// which only sets `dirty`.
+pub(super) fn tui_event_changes_layout(event: &TuiEvent) -> bool {
+    // Reproduction stub: production still treats every variant as a resize.
+    // `screenshot_request_does_not_change_layout` pins the contract this
+    // violates; the following commit replaces the body.
+    let _ = event;
+    true
+}
+
 /// Handle a TuiEvent from the API server (auto-create/remove tabs/panes).
 pub(super) fn handle_tui_event(
     event: TuiEvent,
@@ -869,5 +887,50 @@ mod tests {
     fn take_removed_pane_none_for_unrecorded_agent() {
         let mut layout = Layout::new();
         assert!(layout.take_removed_pane("never-seen").is_none());
+    }
+
+    #[test]
+    fn screenshot_request_does_not_change_layout() {
+        let (tx, _rx) = tokio::sync::oneshot::channel::<String>();
+        let event = TuiEvent::ScreenshotRequest(tx);
+        assert!(
+            !tui_event_changes_layout(&event),
+            "ScreenshotRequest snapshots a side terminal and must not set \
+             needs_resize (that path calls terminal.clear())"
+        );
+    }
+
+    #[test]
+    fn layout_mutation_events_change_layout() {
+        use crate::layout::SplitDir;
+        let events = [
+            TuiEvent::InstanceCreated {
+                name: "a".into(),
+                layout: LayoutHint::Tab,
+                spawner: None,
+                target_pane: None,
+            },
+            TuiEvent::InstanceDeleted { name: "a".into() },
+            TuiEvent::TeamCreated {
+                name: "t".into(),
+                members: vec!["a".into()],
+            },
+            TuiEvent::TeamMembersChanged {
+                name: "t".into(),
+                added: vec!["b".into()],
+                removed: vec![],
+            },
+            TuiEvent::PaneMoved {
+                agent: "a".into(),
+                target_tab: "other".into(),
+                split_dir: SplitDir::Horizontal,
+            },
+        ];
+        for event in events {
+            assert!(
+                tui_event_changes_layout(&event),
+                "{event:?} changes pane geometry and must keep needs_resize"
+            );
+        }
     }
 }
