@@ -141,11 +141,18 @@ impl crate::api::ApiNotifier for TuiNotifier {
 /// `sync_notification_state` and wake the loop through the pane forwarder,
 /// which only sets `dirty`.
 pub(super) fn tui_event_changes_layout(event: &TuiEvent) -> bool {
-    // Reproduction stub: production still treats every variant as a resize.
-    // `screenshot_request_does_not_change_layout` pins the contract this
-    // violates; the following commit replaces the body.
-    let _ = event;
-    true
+    match event {
+        // These variants add, remove, or relocate panes. The new geometry is
+        // wrong until resize_panes runs, and the width change is the wide-char
+        // ghost case #1140 clears with terminal.clear().
+        TuiEvent::InstanceCreated { .. }
+        | TuiEvent::InstanceDeleted { .. }
+        | TuiEvent::TeamCreated { .. }
+        | TuiEvent::TeamMembersChanged { .. }
+        | TuiEvent::PaneMoved { .. } => true,
+        // Renders into a throwaway TestBackend. The live grid does not change.
+        TuiEvent::ScreenshotRequest(_) => false,
+    }
 }
 
 /// Handle a TuiEvent from the API server (auto-create/remove tabs/panes).

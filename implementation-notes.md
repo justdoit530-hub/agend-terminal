@@ -25,3 +25,58 @@ The cache and the writer both ignore an older timestamp, so a coalesced or reord
 - `write_to_pane` shares `record_input_activity`, so mouse-forwarded composing input takes the same path as `write_to_focused`.
 - `store.rs` and the metadata schema are unchanged.
 - The #1680 regression test flushes and drops the cache before it reads, so it still pins the on-disk UUID path rather than the in-memory overlay.
+
+# TuiEvent resize gate
+
+`AppState::handle_tui_event` used to set `needs_resize = true` for every
+successful `TuiEvent`. The next loop then ran `apply_pending_resize`, which
+calls `resize_panes` and `terminal.clear()`.
+
+## Variant classification
+
+| Variant | needs_resize | Why |
+| --- | --- | --- |
+| `InstanceCreated` | yes | Adds a tab or splits a pane. Geometry is wrong until `resize_panes`. |
+| `InstanceDeleted` | yes | Closes a pane or a tab. Remaining panes must be reflowed. |
+| `TeamCreated` | yes | Opens a team tab and attaches member panes. |
+| `TeamMembersChanged` | yes | Moves members into or out of the team tab. |
+| `PaneMoved` | yes | Relocates a pane across tabs (split or new tab). |
+| `ScreenshotRequest` | no | Draws into a throwaway `TestBackend` and returns SVG. The live grid is unchanged. |
+
+`Event::Resize` (real terminal window drag) is not a `TuiEvent`. It stays in
+`handle_crossterm_event`, which already calls `resize_panes` and
+`terminal.clear()` inline. This change does not touch that arm.
+
+A new `TuiEvent` variant fails to compile until it is listed in
+`tui_event_changes_layout`, so the next author has to classify it.
+
+## Assumptions
+
+- `InstanceDeleted` / `PaneMoved` can no-op when the agent is not on screen.
+  Those events are operator or API actions, not the notification flood. They
+  still request a resize. One extra clear on a rare no-op is cheaper than
+  missing a real reflow. The handler does not report whether it mutated the
+  layout, and this change does not thread a new return value through it.
+- Every non-layout event still sets `dirty = true` before the match, so the
+  existing 33ms frame throttle still repaints badges and pane output.
+
+## Inbox notifications are not TuiEvents
+
+The report that tied screen flash to inbox traffic assumed inbox delivery
+arrived as a `TuiEvent`. It does not. `TuiEvent` is only the API lifecycle
+channel (`Instance*` / `Team*` / `PaneMoved` / `ScreenshotRequest`), produced
+by `TuiNotifier` from `ApiEvent`.
+
+Inbox and badge updates take two other paths, both of which already avoid
+`terminal.clear()`:
+
+- `pre_select` → `sync_badges` → `sync_notification_state` rewrites
+  `pending_notification_count`. No `needs_resize`.
+- Queued text is injected into the pane PTY. The forwarder wakes the loop via
+  `handle_wakeup`, which only sets `dirty = true`.
+
+So this gate stops `ScreenshotRequest` (and any future non-layout variant)
+from clearing the screen. It does not change the inbox redraw path, because
+that path never called `terminal.clear()`. If the photographed ghosts continue
+after inbox bursts, the next place to look is a spurious `Event::Resize` on
+the crossterm reader, which clears inline and is outside this task.
