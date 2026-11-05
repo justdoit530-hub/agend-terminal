@@ -27,6 +27,14 @@ pub(super) struct AppState {
     pub(super) known_remote_agents: std::collections::HashSet<String>,
     pub(super) pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>>,
     pub(super) needs_resize: bool,
+    /// Last `(cols, rows)` applied by `Event::Resize`.
+    ///
+    /// Seeded from the live terminal size so a `SIGWINCH` that reports the
+    /// size we already have does not `terminal.clear()` (#1140 still runs
+    /// when the size actually changes). `(0, 0)` is only the fallback when
+    /// `crossterm::terminal::size()` fails; it is not a real size, so that
+    /// first event still clears.
+    pub(super) last_resize_dims: (u16, u16),
     pub(super) last_remote_sync: std::time::Instant,
     pub(super) last_session_save: std::time::Instant,
     pub(super) last_session_json: Option<String>,
@@ -86,6 +94,10 @@ impl AppState {
             known_remote_agents: std::collections::HashSet::new(),
             pending_fwd: HashMap::new(),
             needs_resize: true,
+            // Live size, not (0, 0): a startup SIGWINCH that echoes the
+            // current size must not look like a change. (0, 0) only if the
+            // ioctl fails, which cannot collide with a real resize.
+            last_resize_dims: crossterm::terminal::size().unwrap_or((0, 0)),
             last_remote_sync: std::time::Instant::now(),
             last_session_save: std::time::Instant::now(),
             last_session_json: None,
@@ -416,10 +428,10 @@ impl AppState {
         }
     }
 
-    pub(super) fn handle_crossterm_event(
+    pub(super) fn handle_crossterm_event<B: ratatui::backend::Backend>(
         &mut self,
         ev: Result<Event, crossbeam_channel::RecvError>,
-        terminal: &mut DefaultTerminal,
+        terminal: &mut ratatui::Terminal<B>,
         deps: &AppDeps<'_>,
     ) -> LoopFlow {
         let AppDeps {
@@ -497,6 +509,7 @@ impl AppState {
                 let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
                 crate::layout::resize_panes(pane_area, &mut self.ui.layout, registry);
                 let _ = terminal.clear();
+                self.last_resize_dims = (cols, rows);
                 LoopFlow::Continue
             }
             _ => LoopFlow::Continue,
@@ -683,5 +696,192 @@ impl AppState {
             }
             self.last_remote_sync = std::time::Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::pane::PaneSource;
+    use ratatui::backend::Backend;
+    use crate::layout::Tab;
+    use crate::vterm::VTerm;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    fn leaf(id: usize) -> crate::layout::Pane {
+        crate::layout::Pane {
+            agent_name: "pane".into(),
+            instance_id: crate::types::InstanceId::default(),
+            vterm: VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: None,
+            last_input_at: None,
+            pending_notification_count: 0,
+            selection: None,
+            source: PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        }
+    }
+
+    struct Fixture {
+        home: std::path::PathBuf,
+        fleet_path: std::path::PathBuf,
+        registry: AgentRegistry,
+        wakeup_tx: crossbeam_channel::Sender<usize>,
+        daemon_binary_stale: Arc<AtomicBool>,
+        telegram_state: Option<Arc<dyn crate::channel::Channel>>,
+        attached_run_dir: Option<std::path::PathBuf>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+            Self {
+                home: std::path::PathBuf::from("/tmp"),
+                fleet_path: std::path::PathBuf::from("/tmp/fleet.yaml"),
+                registry: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+                wakeup_tx,
+                daemon_binary_stale: Arc::new(AtomicBool::new(false)),
+                telegram_state: None,
+                attached_run_dir: None,
+            }
+        }
+
+        fn deps(&self) -> AppDeps<'_> {
+            AppDeps {
+                home: &self.home,
+                fleet_path: &self.fleet_path,
+                registry: &self.registry,
+                wakeup_tx: &self.wakeup_tx,
+                daemon_binary_stale: &self.daemon_binary_stale,
+                telegram_status: TelegramStatus::NotConfigured,
+                telegram_state: &self.telegram_state,
+                attached_run_dir: &self.attached_run_dir,
+                attached_mode: false,
+                size_debug: false,
+            }
+        }
+    }
+
+    fn state_with_pane(last_dims: (u16, u16)) -> AppState {
+        let mut state = AppState::new();
+        state.last_resize_dims = last_dims;
+        state.ui.layout.add_tab(Tab::new("t".to_string(), leaf(1)));
+        state
+    }
+
+    fn test_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        ratatui::Terminal::new(backend).expect("TestBackend terminal")
+    }
+
+    fn paint_marker(terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>) {
+        let cell = ratatui::buffer::Cell::new("X");
+        terminal
+            .backend_mut()
+            .draw(std::iter::once((0, 0, &cell)))
+            .expect("paint marker");
+    }
+
+    fn marker_intact(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> bool {
+        terminal.backend().to_string().contains('X')
+    }
+
+    fn pane_dims(state: &AppState) -> (u16, u16) {
+        let pane = state
+            .ui
+            .layout
+            .tabs
+            .first()
+            .expect("tab")
+            .root()
+            .find_pane(1)
+            .expect("pane");
+        (pane.vterm.cols(), pane.vterm.rows())
+    }
+
+    fn send_resize<B: ratatui::backend::Backend>(
+        state: &mut AppState,
+        terminal: &mut ratatui::Terminal<B>,
+        deps: &AppDeps<'_>,
+        cols: u16,
+        rows: u16,
+    ) {
+        let flow = state.handle_crossterm_event(Ok(Event::Resize(cols, rows)), terminal, deps);
+        assert_eq!(flow, LoopFlow::Continue);
+    }
+
+    /// Startup seed is the live terminal size. `(0, 0)` only when the ioctl fails,
+    /// so the first real resize is never dropped on that path.
+    #[test]
+    fn new_seeds_last_resize_dims_from_live_terminal_size() {
+        let state = AppState::new();
+        let expected = crossterm::terminal::size().unwrap_or((0, 0));
+        assert_eq!(state.last_resize_dims, expected);
+    }
+
+    /// Two Resize events with the size we already know must not clear or reflow.
+    /// A stale 10×10 pane stays 10×10, which proves `resize_panes` did not run
+    /// (it would have rewritten the vterm to the event's content rect).
+    #[test]
+    fn duplicate_resize_same_dims_skips_clear_and_resize_panes() {
+        let fix = Fixture::new();
+        let deps = fix.deps();
+        let mut state = state_with_pane((100, 40));
+        let mut terminal = test_terminal();
+        paint_marker(&mut terminal);
+
+        send_resize(&mut state, &mut terminal, &deps, 100, 40);
+        send_resize(&mut state, &mut terminal, &deps, 100, 40);
+
+        assert!(
+            marker_intact(&terminal),
+            "identical Resize must not terminal.clear()"
+        );
+        assert_eq!(
+            pane_dims(&state),
+            (10, 10),
+            "identical Resize must not call resize_panes"
+        );
+        assert_eq!(state.last_resize_dims, (100, 40));
+    }
+
+    /// A real size change still clears and reflows (#1140). The following
+    /// duplicate of that new size does not.
+    #[test]
+    fn resize_with_new_dims_clears_and_resizes_then_duplicate_does_not() {
+        let fix = Fixture::new();
+        let deps = fix.deps();
+        let mut state = state_with_pane((80, 24));
+        let mut terminal = test_terminal();
+        paint_marker(&mut terminal);
+
+        send_resize(&mut state, &mut terminal, &deps, 100, 40);
+
+        assert!(
+            !marker_intact(&terminal),
+            "a real size change must terminal.clear() (#1140)"
+        );
+        // pane area is (cols, rows-2); leaf content subtracts the 1-cell border.
+        // (100, 40) → (98, 36)
+        assert_eq!(pane_dims(&state), (98, 36));
+        assert_eq!(state.last_resize_dims, (100, 40));
+
+        paint_marker(&mut terminal);
+        send_resize(&mut state, &mut terminal, &deps, 100, 40);
+
+        assert!(
+            marker_intact(&terminal),
+            "the second Resize at the new size must not clear again"
+        );
+        assert_eq!(pane_dims(&state), (98, 36));
     }
 }
