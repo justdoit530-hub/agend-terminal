@@ -506,10 +506,15 @@ impl AppState {
                 LoopFlow::Continue
             }
             Event::Resize(cols, rows) => {
-                let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
-                crate::layout::resize_panes(pane_area, &mut self.ui.layout, registry);
-                let _ = terminal.clear();
-                self.last_resize_dims = (cols, rows);
+                // SIGWINCH is not a size change. Skip the whole arm when the
+                // reported size matches the last one we applied, including the
+                // #1140 clear. A real change still clears below.
+                if (cols, rows) != self.last_resize_dims {
+                    let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
+                    crate::layout::resize_panes(pane_area, &mut self.ui.layout, registry);
+                    let _ = terminal.clear();
+                    self.last_resize_dims = (cols, rows);
+                }
                 LoopFlow::Continue
             }
             _ => LoopFlow::Continue,
@@ -703,9 +708,9 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::layout::pane::PaneSource;
-    use ratatui::backend::Backend;
     use crate::layout::Tab;
     use crate::vterm::VTerm;
+    use ratatui::backend::Backend;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
