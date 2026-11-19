@@ -1976,6 +1976,60 @@ fn typed_inject_submit_error_latches_before_later_payload_3175() {
         "the submit-error latch must reject before writing any later byte"
     );
 }
+
+/// Oversized typed injects must spill the original payload to a file and type
+/// a short path instruction. A payload at the byte threshold stays inline and
+/// creates no file. This fails while `typed_inject_text_for_delivery_in` is
+/// still a pass-through.
+#[test]
+fn typed_inject_over_threshold_spills_file_and_under_threshold_stays_inline() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-inject-fallback-{}-size-check",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir spill dir");
+
+    let under = "u".repeat(TYPED_INJECT_FILE_FALLBACK_BYTES);
+    let under_out =
+        typed_inject_text_for_delivery_in(&dir, &under).expect("under-threshold delivery");
+    assert_eq!(
+        under_out, under,
+        "a payload at the byte threshold is typed inline"
+    );
+    assert!(
+        std::fs::read_dir(&dir)
+            .expect("read spill dir")
+            .next()
+            .is_none(),
+        "an at-threshold payload must not create a spill file"
+    );
+
+    let over = "y".repeat(TYPED_INJECT_FILE_FALLBACK_BYTES + 1);
+    let over_out = typed_inject_text_for_delivery_in(&dir, &over).expect("over-threshold delivery");
+    assert_ne!(
+        over_out, over,
+        "an over-threshold payload must not be typed inline"
+    );
+    assert!(
+        over_out.len() <= TYPED_INJECT_FILE_FALLBACK_BYTES,
+        "the file instruction must stay within the threshold, got {} bytes",
+        over_out.len()
+    );
+    assert!(
+        !over_out.contains(&over),
+        "the typed instruction must not embed the original payload"
+    );
+    let path = over_out
+        .split("Path: ")
+        .nth(1)
+        .expect("instruction names the spill path")
+        .trim();
+    let body = std::fs::read_to_string(path).expect("spill file readable");
+    assert_eq!(body, over, "the spill file holds the original payload");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// #1144: pty_read_loop error path must trigger handle_pty_close cleanup.
 /// Previously, `Err(e)` broke out of the loop without calling
 /// handle_pty_close, leaving the agent as a zombie in the registry.

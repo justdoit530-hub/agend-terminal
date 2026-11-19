@@ -31,7 +31,10 @@ mod write_actor;
 
 mod typed_inject;
 #[cfg(test)]
-use typed_inject::{inject_sentinel, observe_post_submit_with, readback_confirm_typed_with};
+use typed_inject::{
+    inject_sentinel, observe_post_submit_with, readback_confirm_typed_with,
+    typed_inject_text_for_delivery_in, TYPED_INJECT_FILE_FALLBACK_BYTES,
+};
 use typed_inject::{observe_post_submit, readback_confirm_typed};
 
 pub use env_isolation::{env_isolation_enabled, is_sensitive_env_key, resolve_child_env};

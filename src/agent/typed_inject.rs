@@ -87,6 +87,34 @@ pub(super) fn readback_confirm_typed_with(
     }
 }
 
+/// Byte length above which a typed inject is spilled to a temp file and the
+/// PTY receives a short "read this path" instruction instead of the payload.
+///
+/// 2048 is a starting point from the multi-KB spec injects that latched
+/// `typed_inject_contaminated`. The readback window cannot cover a multi-KB
+/// chunked type-in. Retune from measurement; this is not a protocol constant.
+/// A payload of exactly this many bytes stays inline — only a greater length
+/// spills.
+pub(super) const TYPED_INJECT_FILE_FALLBACK_BYTES: usize = 2048;
+
+/// Pre-flight size check used by `inject_with_target` before a typed inject.
+///
+/// Test-first stub: returns the payload unchanged so the spill test fails
+/// until the file fallback is implemented.
+pub(super) fn typed_inject_text_for_delivery(payload: &str) -> std::io::Result<String> {
+    typed_inject_text_for_delivery_in(std::path::Path::new(""), payload)
+}
+
+/// Same as [`typed_inject_text_for_delivery`], but the spill directory is
+/// injectable so the unit test does not share the process temp dir.
+pub(super) fn typed_inject_text_for_delivery_in(
+    dir: &std::path::Path,
+    payload: &str,
+) -> std::io::Result<String> {
+    let _ = (dir, TYPED_INJECT_FILE_FALLBACK_BYTES);
+    Ok(payload.to_string())
+}
+
 /// #1912: post-submit observability (no retry). A successful submit clears the
 /// input line / grows the transcript, so the rendered tail CHANGES; returns `true`
 /// the moment it does. If it stays byte-identical for `POSTSUBMIT_WINDOW`, the
