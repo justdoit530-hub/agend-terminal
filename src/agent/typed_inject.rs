@@ -97,12 +97,25 @@ pub(super) fn readback_confirm_typed_with(
 /// spills.
 pub(super) const TYPED_INJECT_FILE_FALLBACK_BYTES: usize = 2048;
 
+/// Temp-file prefix. Same system-temp convention as `image_paste`'s
+/// `agend_paste_` files — no new storage root.
+const TYPED_INJECT_FILE_PREFIX: &str = "agend_inject_";
+
+/// How long a spilled payload stays in the temp dir. The agent reads it within
+/// seconds; this only bounds leftover files from later spills.
+const TYPED_INJECT_FILE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// One line, so readback-confirm's last-line sentinel still applies. `{path}`
+/// is the absolute spill path.
+const TYPED_INJECT_FILE_INSTRUCTION: &str = "[AGEND-INJECT-FILE] Read this file and carry out the full message inside it. Do not ask for a paste. Path: {path}";
+
+static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Pre-flight size check used by `inject_with_target` before a typed inject.
-///
-/// Test-first stub: returns the payload unchanged so the spill test fails
-/// until the file fallback is implemented.
+/// Payloads at or under the threshold are returned unchanged. Larger payloads
+/// are written under the system temp dir and replaced with a short instruction.
 pub(super) fn typed_inject_text_for_delivery(payload: &str) -> std::io::Result<String> {
-    typed_inject_text_for_delivery_in(std::path::Path::new(""), payload)
+    typed_inject_text_for_delivery_in(&std::env::temp_dir(), payload)
 }
 
 /// Same as [`typed_inject_text_for_delivery`], but the spill directory is
@@ -111,8 +124,69 @@ pub(super) fn typed_inject_text_for_delivery_in(
     dir: &std::path::Path,
     payload: &str,
 ) -> std::io::Result<String> {
-    let _ = (dir, TYPED_INJECT_FILE_FALLBACK_BYTES);
-    Ok(payload.to_string())
+    if payload.len() <= TYPED_INJECT_FILE_FALLBACK_BYTES {
+        return Ok(payload.to_string());
+    }
+    let path = spill_typed_payload(dir, payload)?;
+    let instruction = file_fallback_instruction(&path);
+    if instruction.len() > TYPED_INJECT_FILE_FALLBACK_BYTES {
+        let _ = std::fs::remove_file(&path);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "typed-inject file fallback instruction exceeded the size threshold",
+        ));
+    }
+    Ok(instruction)
+}
+
+fn file_fallback_instruction(path: &std::path::Path) -> String {
+    TYPED_INJECT_FILE_INSTRUCTION.replace("{path}", &path.display().to_string())
+}
+
+fn spill_typed_payload(
+    dir: &std::path::Path,
+    payload: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    sweep_stale_inject_files(dir);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = SPILL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!(
+        "{TYPED_INJECT_FILE_PREFIX}{}_{seq}_{nanos}.txt",
+        std::process::id()
+    ));
+    std::fs::write(&path, payload)?;
+    Ok(path)
+}
+
+/// Best-effort. A temp-dir sweep must not fail the inject.
+fn sweep_stale_inject_files(dir: &std::path::Path) {
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(TYPED_INJECT_FILE_PREFIX) && name.ends_with(".txt")) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let stale = now
+            .duration_since(modified)
+            .map(|age| age > TYPED_INJECT_FILE_TTL)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// #1912: post-submit observability (no retry). A successful submit clears the

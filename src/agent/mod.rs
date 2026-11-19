@@ -2814,11 +2814,18 @@ fn inject_with_target(target: &InjectTarget, text: &[u8]) -> crate::error::Resul
     // #3175: the cursor anchor must observe exactly the same logical tail that was
     // written. Trailing whitespace has no notification semantics, but retaining it
     // would put the cursor after bytes that inject_sentinel intentionally trims.
-    let stripped = if target.typed_inject {
-        stripped_owned.trim_end()
+    // Oversized typed payloads spill to a temp file before the chunked write, so
+    // the PTY only sees the short instruction. A spill I/O error is not an
+    // unconfirmed draft — leave the contamination latch alone.
+    let delivery_owned = if target.typed_inject {
+        match typed_inject::typed_inject_text_for_delivery(stripped_owned.trim_end()) {
+            Ok(text) => Some(text),
+            Err(error) => return Err(crate::error::AgendError::PtyWrite(error)),
+        }
     } else {
-        stripped_owned.as_str()
+        None
     };
+    let stripped = delivery_owned.as_deref().unwrap_or(stripped_owned.as_str());
     let text_bytes = stripped.as_bytes();
 
     if target.typed_inject {
