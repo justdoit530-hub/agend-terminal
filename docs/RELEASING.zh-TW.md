@@ -37,7 +37,7 @@ gate ──► build (5 targets) ──┐
 1. **gate** — 在任何 artifact 開始建置之前，遇到以下情況就讓這次發布失敗：
    - `Cargo.toml version` ≠ tag（去掉 `v`），
    - `CHANGELOG.md` 沒有 `## [X.Y.Z]` 這個 section，
-   - crate 在宣告的 MSRV（`rust-version = "1.88"`）上已無法編譯。
+   - crate 在宣告的 MSRV（`rust-version = "1.89"`）上已無法編譯。
    - `cargo-semver-checks` 也會在這裡執行，但在 pre-1.0 階段是 **soft-fail**：
      它會印出 breaking-change 報告供人判斷，但不會擋住流程。
      等 1.0 上線後再把它升級成 hard-fail。
@@ -94,6 +94,6 @@ cargo yank --version X.Y.Z --undo     # if yanked by mistake
 
 ## MSRV bumps
 
-`Cargo.toml` 裡的 `rust-version` 是唯一的真實來源；gate 的 `cargo +1.88 check`
-pin 必須在同一個做 bump 的 PR 裡一起更新（在 release.yml 裡 grep `1.88`）。把一次
+`Cargo.toml` 裡的 `rust-version` 是唯一的真實來源；gate 的 `cargo +1.89 check`
+pin 必須在同一個做 bump 的 PR 裡一起更新（在 release.yml 裡 grep `1.89`）。把一次
 MSRV bump 當成一個 minor-version 事件來看待，並在 changelog 中特別點出來。

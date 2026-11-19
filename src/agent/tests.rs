@@ -1976,6 +1976,130 @@ fn typed_inject_submit_error_latches_before_later_payload_3175() {
         "the submit-error latch must reject before writing any later byte"
     );
 }
+
+/// Oversized typed injects must spill the original payload to a file and type
+/// a short path instruction. A payload at the byte threshold stays inline and
+/// creates no file. This fails while `typed_inject_text_for_delivery_in` is
+/// still a pass-through.
+#[test]
+fn typed_inject_over_threshold_spills_file_and_under_threshold_stays_inline() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-inject-fallback-{}-size-check",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir spill dir");
+
+    let under = "u".repeat(TYPED_INJECT_FILE_FALLBACK_BYTES);
+    let under_out =
+        typed_inject_text_for_delivery_in(&dir, &under).expect("under-threshold delivery");
+    assert_eq!(
+        under_out, under,
+        "a payload at the byte threshold is typed inline"
+    );
+    assert!(
+        std::fs::read_dir(&dir)
+            .expect("read spill dir")
+            .next()
+            .is_none(),
+        "an at-threshold payload must not create a spill file"
+    );
+
+    let over = "y".repeat(TYPED_INJECT_FILE_FALLBACK_BYTES + 1);
+    let over_out = typed_inject_text_for_delivery_in(&dir, &over).expect("over-threshold delivery");
+    assert_ne!(
+        over_out, over,
+        "an over-threshold payload must not be typed inline"
+    );
+    assert!(
+        over_out.len() <= TYPED_INJECT_FILE_FALLBACK_BYTES,
+        "the file instruction must stay within the threshold, got {} bytes",
+        over_out.len()
+    );
+    assert!(
+        !over_out.contains(&over),
+        "the typed instruction must not embed the original payload"
+    );
+    let path = over_out
+        .split("Path: ")
+        .nth(1)
+        .expect("instruction names the spill path")
+        .trim();
+    let body = std::fs::read_to_string(path).expect("spill file readable");
+    assert_eq!(body, over, "the spill file holds the original payload");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+struct SpillEchoWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    core: Arc<CoreMutex<AgentCore>>,
+}
+
+impl std::io::Write for SpillEchoWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().extend_from_slice(buf);
+        if buf == b"\r" {
+            self.core.lock().vterm.process(b"\r\n");
+        } else {
+            self.core.lock().vterm.process(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The real inject entry must type the short instruction, not the payload, and
+/// still pass readback-confirm on that instruction.
+#[test]
+fn typed_inject_large_payload_types_file_instruction_not_payload() {
+    let payload = "P".repeat(TYPED_INJECT_FILE_FALLBACK_BYTES + 64);
+    let core = readback_test_core(b"");
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(SpillEchoWriter {
+        bytes: Arc::clone(&bytes),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    inject_with_target(&target, payload.as_bytes())
+        .expect("short file instruction must readback-confirm");
+
+    let written = String::from_utf8(bytes.lock().clone()).expect("typed bytes are utf-8");
+    assert!(
+        !written.contains(&payload),
+        "the PTY must not receive the original payload"
+    );
+    assert!(
+        written.contains("[AGEND-INJECT-FILE]"),
+        "the PTY must receive the file instruction, got {written}"
+    );
+    let path = written
+        .split("Path: ")
+        .nth(1)
+        .expect("instruction names the spill path")
+        .trim();
+    let body = std::fs::read_to_string(path).expect("spill file readable");
+    assert_eq!(body, payload, "the spill file holds the original payload");
+    let _ = std::fs::remove_file(path);
+    assert!(
+        !target
+            .typed_inject_contaminated
+            .load(std::sync::atomic::Ordering::Acquire),
+        "a confirmed file instruction must not latch contamination"
+    );
+}
+
 /// #1144: pty_read_loop error path must trigger handle_pty_close cleanup.
 /// Previously, `Err(e)` broke out of the loop without calling
 /// handle_pty_close, leaving the agent as a zombie in the registry.

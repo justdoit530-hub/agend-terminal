@@ -104,3 +104,41 @@ The arm compares `(cols, rows) != last_resize_dims`.
 ## Out of scope
 
 No debounce or coalescing timer. A drag that changes the size on every event still clears each time. This change only drops events whose size is the same as the last one applied.
+
+# typed-inject large-payload file fallback
+
+Task: `t-20261104082809734341-20435-1`
+
+## Deviations
+
+- The pre-flight check runs only when `InjectTarget.typed_inject` is true, inside `inject_with_target` after ANSI strip and `trim_end`. The bulk path is unchanged. It does not chunk per byte and it does not latch `typed_inject_contaminated`, so spilling those payloads would change Claude's fast path without hitting the bug this fixes.
+- "Over threshold" is `len() > 2048` bytes of that stripped text, not chars and not the raw pre-strip buffer. A payload of exactly 2048 bytes stays inline.
+- Spill files go to `std::env::temp_dir()` with the prefix `agend_inject_`. That matches `image_paste`'s system-temp convention (`agend_paste_`). This repo has no inject scratchpad directory to reuse.
+- The typed line is `[AGEND-INJECT-FILE] ... Path: <abs>`. It does not keep a leading `[AGEND-MSG]` or `[from:]` header. Those headers are inside the file. Keeping them on the typed line would put the short instruction through the system-header atomic-write path and would not match the "replace the inline text" contract.
+- A spill I/O error, or a generated instruction that is itself over 2048 bytes, returns `PtyWrite` and does not latch contamination and does not type the original payload.
+
+## Edge Cases
+
+- Deferred injects (`inject_with_target_gated`) still enqueue the original text. The spill happens when the flush calls `inject_with_target`, so the file exists at the moment the agent is told to read it.
+- Invalid UTF-8 is lossy-converted before the size check, same as the existing typed path.
+- Each spill uses pid + atomic sequence + nanoseconds. Files older than one hour and named `agend_inject_*.txt` are removed best-effort on the next spill in that directory.
+- The short instruction stays on one line so `inject_sentinel` / readback-confirm keep working. `READBACK_TIMEOUT`, chunking, `inject_sentinel`, and `observe_post_submit` are untouched.
+- `src/agent/mod.rs` is grandfathered at 3205 lines. This change leaves it at 3164.
+
+## Blocked
+
+- None.
+
+# CI: audit advisories and macOS spawn path
+
+PR #119 run 44455147810 failed audit, then Check (macos-latest).
+
+## Audit
+
+- `RUSTSEC-2026-0459` is `libsqlite3-sys` 0.28.0 (C SQLite CVE-2026-119375), patched in `>= 0.39.0`. `rusqlite` 0.41.1 is the first release that depends on that line. It declares rustc 1.89, so `rust-version` and the CI and release MSRV gates move from 1.88 to 1.89. `default-features = false` keeps 0.41's `ffi-sqlite-wasm-rs` default off; `bundled` stays on.
+- `RUSTSEC-2026-0538` is `quinn-udp` 0.5.14 via `reqwest` → `quinn` 0.11.9, patched in `>= 0.5.16, < 0.6.0`. quinn requires `^0.5`, so the lockfile moves to 0.5.16 and quinn stays 0.11.9.
+- Those IDs are not added to the audit ignore list. The CI job still fails closed on vulnerability-class advisories, and both have a patched release.
+
+## macOS
+
+`tests/integration.rs` found the daemon by walking `current_exe()` out of `deps/`. Nextest 0.9.152 ran that test binary from a temp copy, `Command::spawn` returned ENOENT, and fail-fast stopped the suite on `bridge_rejects_malformed_mcp_json` and `daemon_shutdown_cleans_up_three_agents`. The path is now `CARGO_BIN_EXE_agend-terminal`, which the harness tests already use.

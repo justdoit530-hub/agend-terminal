@@ -14,6 +14,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 - **`waiting_on` stale alerts no longer repeat or misroute** — the alert is delivered to the instance's configured name (so it reaches the agent's inbox and its team orchestrator) instead of an id-named file nothing reads, it respects the 30-minute re-alert interval instead of firing every 5-minute scan, and metadata left behind by an instance the fleet no longer runs is skipped (#3077).
 ### Changed
 
+- **MSRV is 1.89** — `rusqlite` 0.41.1 pulls `libsqlite3-sys` ≥ 0.39 (RUSTSEC-2026-0459, C SQLite CVE-2026-119375) and declares rustc 1.89. `quinn-udp` 0.5.16 clears RUSTSEC-2026-0538. The CI and release MSRV gates follow `Cargo.toml` `rust-version`.
 - **Expired environment aliases removed** — watchdog topology now reads only the `fleet.yaml` `watchdog:` block, worktree archive fallback reads only `AGEND_WORKTREE_ARCHIVE_FALLBACK`, and decisions retention reads only `AGEND_RETENTION_DECISIONS_CUTOVER`.
 - **Hot paths repeat less work** — notification, dispatch, branch-sweep, watchdog, checkout, merge, and messaging paths now reuse a scan, client, or metadata read they previously repeated per item or per call (#2967, #2975–#2979, #2990, #2991, #2999, #3001, #3005, #3022, #3023, #3026, #3031).
 
