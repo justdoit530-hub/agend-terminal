@@ -28,12 +28,11 @@ const SHELL_BIN: &str = "cmd.exe";
 const SHELL_BIN: &str = "/bin/bash";
 
 fn binary() -> PathBuf {
-    // Use debug build
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop(); // remove test binary name
-    path.pop(); // remove deps/
-    path.push("agend-terminal");
-    path
+    // `CARGO_BIN_EXE_*` is resolved at compile time, so nextest builds this
+    // binary and the path stays valid when the test exe itself is a temp copy.
+    // Walking `current_exe()` up out of `deps/` (or a nextest temp dir) spawned
+    // a path that does not exist: macOS CI failed with ENOENT at this Command.
+    PathBuf::from(env!("CARGO_BIN_EXE_agend-terminal"))
 }
 
 struct TestDaemon {
