@@ -104,3 +104,27 @@ The arm compares `(cols, rows) != last_resize_dims`.
 ## Out of scope
 
 No debounce or coalescing timer. A drag that changes the size on every event still clears each time. This change only drops events whose size is the same as the last one applied.
+
+# typed-inject large-payload file fallback
+
+Task: `t-20261104082809734341-20435-1`
+
+## Deviations
+
+- The pre-flight check runs only when `InjectTarget.typed_inject` is true, inside `inject_with_target` after ANSI strip and `trim_end`. The bulk path is unchanged. It does not chunk per byte and it does not latch `typed_inject_contaminated`, so spilling those payloads would change Claude's fast path without hitting the bug this fixes.
+- "Over threshold" is `len() > 2048` bytes of that stripped text, not chars and not the raw pre-strip buffer. A payload of exactly 2048 bytes stays inline.
+- Spill files go to `std::env::temp_dir()` with the prefix `agend_inject_`. That matches `image_paste`'s system-temp convention (`agend_paste_`). This repo has no inject scratchpad directory to reuse.
+- The typed line is `[AGEND-INJECT-FILE] ... Path: <abs>`. It does not keep a leading `[AGEND-MSG]` or `[from:]` header. Those headers are inside the file. Keeping them on the typed line would put the short instruction through the system-header atomic-write path and would not match the "replace the inline text" contract.
+- A spill I/O error, or a generated instruction that is itself over 2048 bytes, returns `PtyWrite` and does not latch contamination and does not type the original payload.
+
+## Edge Cases
+
+- Deferred injects (`inject_with_target_gated`) still enqueue the original text. The spill happens when the flush calls `inject_with_target`, so the file exists at the moment the agent is told to read it.
+- Invalid UTF-8 is lossy-converted before the size check, same as the existing typed path.
+- Each spill uses pid + atomic sequence + nanoseconds. Files older than one hour and named `agend_inject_*.txt` are removed best-effort on the next spill in that directory.
+- The short instruction stays on one line so `inject_sentinel` / readback-confirm keep working. `READBACK_TIMEOUT`, chunking, `inject_sentinel`, and `observe_post_submit` are untouched.
+- `src/agent/mod.rs` is grandfathered at 3205 lines. This change leaves it at 3164.
+
+## Blocked
+
+- None.
