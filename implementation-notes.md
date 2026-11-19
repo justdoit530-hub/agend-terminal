@@ -128,3 +128,17 @@ Task: `t-20261104082809734341-20435-1`
 ## Blocked
 
 - None.
+
+# CI: audit advisories and macOS spawn path
+
+PR #119 run 44455147810 failed audit, then Check (macos-latest).
+
+## Audit
+
+- `RUSTSEC-2026-0459` is `libsqlite3-sys` 0.28.0 (C SQLite CVE-2026-119375), patched in `>= 0.39.0`. `rusqlite` 0.41.1 is the first release that depends on that line. It declares rustc 1.89, so `rust-version` and the CI and release MSRV gates move from 1.88 to 1.89. `default-features = false` keeps 0.41's `ffi-sqlite-wasm-rs` default off; `bundled` stays on.
+- `RUSTSEC-2026-0538` is `quinn-udp` 0.5.14 via `reqwest` → `quinn` 0.11.9, patched in `>= 0.5.16, < 0.6.0`. quinn requires `^0.5`, so the lockfile moves to 0.5.16 and quinn stays 0.11.9.
+- Those IDs are not added to the audit ignore list. The CI job still fails closed on vulnerability-class advisories, and both have a patched release.
+
+## macOS
+
+`tests/integration.rs` found the daemon by walking `current_exe()` out of `deps/`. Nextest 0.9.152 ran that test binary from a temp copy, `Command::spawn` returned ENOENT, and fail-fast stopped the suite on `bridge_rejects_malformed_mcp_json` and `daemon_shutdown_cleans_up_three_agents`. The path is now `CARGO_BIN_EXE_agend-terminal`, which the harness tests already use.
